@@ -1,0 +1,86 @@
+//! Process supervision for the mysqld subprocess.
+//!
+//! Adapted from redis-ha's `process_manager::supervise`, which supervises two
+//! colocated processes (redis-server + redis-sentinel). Group Replication
+//! runs inside mysqld itself — there is no second process to colocate — so
+//! this is the single-child form: spawn, forward signals, and exit the
+//! container with the child's own exit code if it dies, letting Railway's
+//! restart policy handle recovery.
+
+use anyhow::{Context, Result};
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
+use tokio::process::{Child, Command};
+use tokio::signal::unix::{signal, SignalKind};
+use tracing::{error, info, warn};
+
+/// Spawn the upstream entrypoint, passing through any CLI args this process
+/// was itself invoked with — mirrors `docker-entrypoint.sh mysqld [args...]`.
+///
+/// TODO: this execs mysqld with whatever config already exists in the image
+/// (or the caller's --defaults-extra-file, if any) — nothing here renders a
+/// Group Replication my.cnf yet. See the TODOs in main.rs.
+pub async fn spawn_mysqld(args: &[String]) -> Result<Child> {
+    info!(?args, "starting docker-entrypoint.sh mysqld");
+
+    Command::new("docker-entrypoint.sh")
+        .arg("mysqld")
+        .args(args)
+        .kill_on_drop(false)
+        .spawn()
+        .context("failed to spawn docker-entrypoint.sh mysqld")
+}
+
+/// Supervise the mysqld child: forward SIGTERM/SIGINT and wait for a graceful
+/// exit, or exit the container immediately (with the child's own code) if it
+/// dies on its own.
+pub async fn supervise(mut child: Child) -> Result<()> {
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    let pid = child.id().map(|id| Pid::from_raw(id as i32));
+
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                let code = match status {
+                    Ok(s) => {
+                        error!(code = s.code(), "mysqld exited unexpectedly");
+                        s.code().unwrap_or(1)
+                    }
+                    Err(e) => {
+                        error!(error = %e, "mysqld wait error");
+                        1
+                    }
+                };
+                std::process::exit(code);
+            }
+
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down");
+                graceful_shutdown(pid, &mut child).await;
+                std::process::exit(0);
+            }
+
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down");
+                graceful_shutdown(pid, &mut child).await;
+                std::process::exit(0);
+            }
+        }
+    }
+}
+
+async fn graceful_shutdown(pid: Option<Pid>, child: &mut Child) {
+    if let Some(pid) = pid {
+        info!("sending SIGTERM to mysqld");
+        let _ = signal::kill(pid, Signal::SIGTERM);
+        tokio::select! {
+            _ = child.wait() => {}
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
+                warn!("mysqld did not exit in time, killing");
+                let _ = child.kill().await;
+            }
+        }
+    }
+}

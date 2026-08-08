@@ -1,0 +1,43 @@
+use anyhow::{Context, Result};
+use common::ConfigExt;
+
+pub struct Config {
+    /// Comma-separated "hostname:port" list of MySQL backends.
+    /// Example: "mysql-1.railway.internal:3306,mysql-2.railway.internal:3306"
+    pub mysql_nodes: String,
+    /// Port where mysql-wrapper's health server listens on each backend node.
+    pub health_port: u16,
+    pub mysql_port: u16,
+    pub max_conn: String,
+    pub timeout_connect: String,
+    pub timeout_client: String,
+    pub timeout_server: String,
+    pub timeout_check: String,
+    pub check_interval: String,
+    pub check_fastinter: String,
+    pub check_downinter: String,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self> {
+        let mysql_nodes = String::env_required("MYSQL_NODES").context(
+            "MYSQL_NODES is required.\n\
+             Format: hostname:port,...\n\
+             Example: mysql-1.railway.internal:3306,mysql-2.railway.internal:3306",
+        )?;
+
+        Ok(Self {
+            mysql_nodes,
+            health_port: u16::env_parse("HEALTH_CHECK_PORT", 8080),
+            mysql_port: u16::env_parse("MYSQL_PORT", 3306),
+            max_conn: String::env_or("HAPROXY_MAX_CONN", "10000"),
+            timeout_connect: String::env_or("HAPROXY_TIMEOUT_CONNECT", "10s"),
+            timeout_client: String::env_or("HAPROXY_TIMEOUT_CLIENT", "30m"),
+            timeout_server: String::env_or("HAPROXY_TIMEOUT_SERVER", "30m"),
+            timeout_check: String::env_or("HAPROXY_TIMEOUT_CHECK", "3s"),
+            check_interval: String::env_or("HAPROXY_CHECK_INTERVAL", "3s"),
+            check_fastinter: String::env_or("HAPROXY_CHECK_FASTINTER", "500ms"),
+            check_downinter: String::env_or("HAPROXY_CHECK_DOWNINTER", "500ms"),
+        })
+    }
+}
