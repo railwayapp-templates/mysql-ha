@@ -96,6 +96,8 @@ online_members() {
   sql "$1" "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE='ONLINE'" || echo 0
 }
 
+has_n_online() { [ "$(online_members "$1" | tr -d '[:space:]')" = "$2" ]; }
+
 # wait_until <timeout-s> <description> <command...>
 wait_until() {
   local timeout="$1" desc="$2"; shift 2
@@ -110,7 +112,7 @@ wait_until() {
   done
 }
 
-group_is_fully_online() { [ "$(online_members "$1" | tr -d '[:space:]')" = "3" ]; }
+group_is_fully_online() { has_n_online "$1" 3; }
 
 # current_primary — prints the node name (mysql-N) whose /role answers 200,
 # probing from mysql-2 (any live node works as probe origin).
@@ -286,9 +288,85 @@ t_conversion_adopts_standalone_volume() {
   fi
 }
 
+t_scale_up_to_five() {
+  log "t_scale_up_to_five (reuses the converted trio — new nodes must clone)"
+  has_n_online mysql-1 3 || { bad "no 3-node group to scale"; return; }
+
+  # New nodes get the SAME template-stamped seed list (the original trio) —
+  # matching Railway's scale flow, where existing nodes are not re-stamped.
+  start_node 4
+  start_node 5
+
+  wait_until 420 "5 ONLINE members" has_n_online mysql-1 5 \
+    || { bad "scale-up never reached 5 ONLINE"; return; }
+  ok "scaled 3 → 5 (fresh nodes provisioned by clone)"
+
+  local v
+  v="$(sql mysql-4 "SELECT v FROM railway.legacy WHERE id=1")"
+  if [ "$v" = "pre-conversion" ]; then
+    ok "never-binlogged base data present on scale-up node"
+  else
+    bad "scale-up node missing base data (got: '$v')"
+  fi
+
+  sql mysql-1 "INSERT INTO railway.legacy VALUES (3, 'post-scale') ON DUPLICATE KEY UPDATE v='post-scale';"
+  wait_until 60 "write replicated to node 5" \
+    bash -c '[ "$(docker exec mysql-5 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM railway.legacy WHERE id=3" 2>/dev/null)" = "post-scale" ]' \
+    || { bad "write did not reach node 5"; return; }
+  ok "writes replicate across all 5"
+}
+
+t_minority_partition_write_fence() {
+  log "t_minority_partition_write_fence (reuses the 5-node group)"
+  has_n_online mysql-1 5 || { bad "no 5-node group to partition"; return; }
+
+  # Isolate the current primary: 1 vs 4 — the isolated side must fence.
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3 mysql-4 mysql-5)"
+  [ -n "$primary" ] || { bad "no primary found pre-partition"; return; }
+  log "partitioning primary $primary away from the group"
+  docker network disconnect "$NET" "$primary"
+
+  # The isolated ex-primary must fail its own /role (fence) — probed from
+  # inside itself, since the network path to it is gone.
+  wait_until 120 "isolated primary fences itself" \
+    bash -c '! docker exec '"$primary"' wget -q -O /dev/null http://localhost:8080/role 2>/dev/null' \
+    || { bad "isolated primary still answers /role 200 (split-brain window)"; docker network connect "$NET" "$primary"; return; }
+  ok "isolated primary fenced (/role 503 on itself)"
+
+  # The majority side must elect a replacement.
+  local survivors=()
+  for n in mysql-1 mysql-2 mysql-3 mysql-4 mysql-5; do
+    [ "$n" = "$primary" ] || survivors+=("$n")
+  done
+  wait_until 120 "majority side elects a new primary" \
+    bash -c 'for n in '"${survivors[*]}"'; do docker exec '"${survivors[0]}"' wget -q -O /dev/null "http://$n:8080/role" 2>/dev/null && exit 0; done; exit 1' \
+    || { bad "majority side never elected a primary"; docker network connect "$NET" "$primary"; return; }
+  local new_primary
+  new_primary="$(current_primary "${survivors[0]}" "${survivors[@]}")"
+  ok "majority elected new primary: $new_primary"
+
+  sql "$new_primary" "INSERT INTO railway.legacy VALUES (4, 'during-partition') ON DUPLICATE KEY UPDATE v='during-partition';" \
+    && ok "majority side accepts writes during the partition" \
+    || bad "majority side refused a write during the partition"
+
+  # Heal: reconnect + restart (Railway-style) — the ex-primary must come back
+  # as a secondary with the partition-era write present.
+  docker network connect "$NET" "$primary"
+  docker restart "$primary" >/dev/null
+  wait_until 420 "partitioned node rejoined (5 ONLINE)" has_n_online "$new_primary" 5 \
+    || { bad "partitioned ex-primary did not rejoin"; return; }
+  ok "partitioned ex-primary rejoined"
+
+  wait_until 60 "partition-era write visible on rejoined node" \
+    bash -c '[ "$(docker exec '"$primary"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM railway.legacy WHERE id=4" 2>/dev/null)" = "during-partition" ]' \
+    || { bad "rejoined node missing partition-era write"; return; }
+  ok "rejoined node caught up on partition-era writes"
+}
+
 # ---------------------------------------------------------------------------
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence)
 
 main() {
   ensure_image
