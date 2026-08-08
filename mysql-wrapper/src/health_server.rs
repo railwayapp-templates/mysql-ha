@@ -1,47 +1,75 @@
 //! HTTP health server embedded in each MySQL node.
 //!
-//! v0 scope: BOTH endpoints fail closed (503, body "not implemented"). This
-//! is deliberate, not an oversight — the platform contract is that HAProxy's
-//! write frontend only routes to a node whose `/role` returns 200, so until
-//! this wrapper can actually confirm Group Replication state, failing closed
-//! is the only safe answer. A stub that returned 200 unconditionally would
-//! let HAProxy route writes to every node simultaneously.
+//! Three endpoints, all fail-closed (any error, timeout, or uncertain read
+//! answers 503):
 //!
-//! TODO(/health): return 200 once MySQL answers a liveness probe (e.g.
-//! `SELECT 1` or `mysqladmin ping`), 503 otherwise.
-//!
-//! TODO(/role): return 200 iff BOTH conditions hold, mirroring redis-ha's
-//! Sentinel-confirmed /role fence:
-//!   1. `performance_schema.replication_group_members` shows this node's own
-//!      `MEMBER_ID` with `MEMBER_STATE = 'ONLINE'` and `MEMBER_ROLE = 'PRIMARY'`.
-//!   2. The group currently has quorum (a majority of declared members are
-//!      ONLINE) — the split-brain fence. A primary that has lost contact
-//!      with the rest of the group must not keep accepting writes just
-//!      because MySQL still thinks it's the primary locally.
-//! Any error, timeout, or uncertain read must be treated as "not primary" —
-//! fail-closed, the same rule /health follows.
+//!   GET /health — liveness: 200 iff mysqld answers `SELECT 1`.
+//!   GET /role   — write-routing fence: 200 iff this node is the writable
+//!                 Group Replication primary AND its view of the group has a
+//!                 reachable majority (see sql::role_is_writable_primary).
+//!                 HAProxy's write frontend routes exclusively on this.
+//!                 In standalone mode (no GR_SEEDS) it degrades to liveness:
+//!                 a lone node is trivially its own primary.
+//!   GET /gr/state — peer exchange (JSON, see peers::GrState): group
+//!                 membership + executed-GTID set, consumed by peers'
+//!                 bootstrap guards. 503 until mysqld answers, so a peer
+//!                 mid-boot reads as "not ready", never as "empty dataset".
 
-use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
+use crate::gr::local_gr_state;
+use crate::sql::{role_is_writable_primary, Sql};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing::info;
 
-const NOT_IMPLEMENTED: &str = "not implemented";
-
-async fn health() -> impl IntoResponse {
-    // TODO: replace with a real liveness probe against MySQL.
-    (StatusCode::SERVICE_UNAVAILABLE, NOT_IMPLEMENTED)
+pub struct AppState {
+    pub sql: Sql,
+    pub standalone: bool,
 }
 
-async fn role() -> impl IntoResponse {
-    // TODO: replace with the replication_group_members + quorum check
-    // described above. Fail-closed until then.
-    (StatusCode::SERVICE_UNAVAILABLE, NOT_IMPLEMENTED)
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.sql.ping().await {
+        Ok(()) => (StatusCode::OK, "ok"),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "mysqld not answering"),
+    }
 }
 
-pub async fn run_health_server(health_port: u16) {
+async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.standalone {
+        // No group to fence against — alive means writable.
+        return match state.sql.ping().await {
+            Ok(()) => (StatusCode::OK, "primary (standalone)"),
+            Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "mysqld not answering"),
+        };
+    }
+
+    let verdict = async {
+        let self_uuid = state.sql.server_uuid().await?;
+        let members = state.sql.group_members().await?;
+        anyhow::Ok(role_is_writable_primary(&members, &self_uuid))
+    }
+    .await;
+
+    match verdict {
+        Ok(true) => (StatusCode::OK, "primary"),
+        Ok(false) => (StatusCode::SERVICE_UNAVAILABLE, "not primary"),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "state unavailable"),
+    }
+}
+
+async fn gr_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match local_gr_state(&state.sql).await {
+        Ok(s) => (StatusCode::OK, Json(s)).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "state unavailable").into_response(),
+    }
+}
+
+pub async fn run_health_server(health_port: u16, state: Arc<AppState>) {
     let app = Router::new()
         .route("/health", get(health))
-        .route("/role", get(role));
+        .route("/role", get(role))
+        .route("/gr/state", get(gr_state))
+        .with_state(state);
 
     // Bind the IPv6 unspecified address rather than 0.0.0.0: Railway's private
     // network is IPv6 (fd12::... hostnames), and an IPv4-only listener refuses
@@ -49,7 +77,7 @@ pub async fn run_health_server(health_port: u16) {
     // sockets accept IPv4-mapped connections on the same listener by default.
     // (Carried over from redis-ha's health_server, where this was load-bearing.)
     let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], health_port));
-    info!(port = health_port, "health server listening (stub — fails closed on /health and /role)");
+    info!(port = health_port, "health server listening");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

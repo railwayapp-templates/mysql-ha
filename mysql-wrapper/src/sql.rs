@@ -1,0 +1,294 @@
+//! Local MySQL access for the wrapper — root connection over the unix socket.
+//!
+//! Every query the wrapper issues goes through here. Short reads carry a
+//! 2s timeout so a hung mysqld degrades the health endpoints to fail-closed
+//! 503s instead of hanging them; group-membership operations (START GROUP
+//! REPLICATION with a clone in flight can run for minutes) are deliberately
+//! un-timed.
+
+use anyhow::{anyhow, Context, Result};
+use mysql_async::prelude::*;
+use mysql_async::{Opts, OptsBuilder, Pool};
+use std::time::Duration;
+
+const SHORT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberRow {
+    pub member_id: String,
+    pub host: String,
+    pub state: String,
+    pub role: String,
+}
+
+#[derive(Clone)]
+pub struct Sql {
+    pool: Pool,
+}
+
+impl Sql {
+    pub fn connect_root_over_socket(socket_path: &str, root_password: &str) -> Self {
+        let opts: Opts = OptsBuilder::default()
+            .socket(Some(socket_path))
+            .user(Some("root"))
+            .pass(Some(root_password))
+            .into();
+        Self {
+            pool: Pool::new(opts),
+        }
+    }
+
+    async fn short<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::time::timeout(SHORT_QUERY_TIMEOUT, fut)
+            .await
+            .map_err(|_| anyhow!("query timed out after {SHORT_QUERY_TIMEOUT:?}"))?
+    }
+
+    pub async fn ping(&self) -> Result<()> {
+        self.short(async {
+            let mut conn = self.pool.get_conn().await?;
+            conn.query_drop("SELECT 1").await?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn server_uuid(&self) -> Result<String> {
+        self.short(async {
+            let mut conn = self.pool.get_conn().await?;
+            let uuid: Option<String> = conn.query_first("SELECT @@server_uuid").await?;
+            uuid.context("@@server_uuid returned no row")
+        })
+        .await
+    }
+
+    /// Every member in this node's current view of the group. Empty when
+    /// Group Replication has never been started on this node.
+    pub async fn group_members(&self) -> Result<Vec<MemberRow>> {
+        self.short(async {
+            let mut conn = self.pool.get_conn().await?;
+            let rows: Vec<(String, Option<String>, String, String)> = conn
+                .query(
+                    "SELECT MEMBER_ID, MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE \
+                     FROM performance_schema.replication_group_members",
+                )
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|(member_id, host, state, role)| MemberRow {
+                    member_id,
+                    host: host.unwrap_or_default(),
+                    state,
+                    role,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// This node's executed GTID set, whitespace-normalized (the server
+    /// pretty-prints it with newlines).
+    pub async fn executed_gtid_set(&self) -> Result<String> {
+        self.short(async {
+            let mut conn = self.pool.get_conn().await?;
+            let set: Option<String> = conn.query_first("SELECT @@GLOBAL.gtid_executed").await?;
+            Ok(set
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<String>())
+        })
+        .await
+    }
+
+    /// True iff `candidate` ⊆ `reference` — evaluated by mysqld itself, which
+    /// is the only component that parses GTID sets correctly.
+    pub async fn gtid_subset(&self, candidate: &str, reference: &str) -> Result<bool> {
+        self.short(async {
+            let mut conn = self.pool.get_conn().await?;
+            let subset: Option<i64> = conn
+                .exec_first(
+                    "SELECT GTID_SUBSET(?, ?)",
+                    (candidate, reference),
+                )
+                .await?;
+            Ok(subset == Some(1))
+        })
+        .await
+    }
+
+    /// Create/converge the distributed-recovery user and its grants. Runs on
+    /// the freshly-bootstrapped primary (writable); the statements replicate
+    /// to every future joiner through recovery itself.
+    pub async fn ensure_recovery_user(&self, user: &str, password: &str) -> Result<()> {
+        let user_lit = sql_string_literal(user);
+        let pass_lit = sql_string_literal(password);
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop(format!(
+            "CREATE USER IF NOT EXISTS {user_lit}@'%' IDENTIFIED BY {pass_lit}"
+        ))
+        .await?;
+        // Converge the password for pre-existing users (e.g. a re-run after a
+        // crashed first boot with a since-rotated secret).
+        conn.query_drop(format!(
+            "ALTER USER {user_lit}@'%' IDENTIFIED BY {pass_lit}"
+        ))
+        .await?;
+        conn.query_drop(format!(
+            "GRANT REPLICATION SLAVE, CONNECTION_ADMIN, BACKUP_ADMIN, \
+             GROUP_REPLICATION_STREAM ON *.* TO {user_lit}@'%'"
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Point the distributed-recovery channel at the shared credentials.
+    /// Local metadata only — allowed under super_read_only, needed on every
+    /// node before it can join or be rejoined.
+    pub async fn configure_recovery_channel(&self, user: &str, password: &str) -> Result<()> {
+        let user_lit = sql_string_literal(user);
+        let pass_lit = sql_string_literal(password);
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop(format!(
+            "CHANGE REPLICATION SOURCE TO SOURCE_USER = {user_lit}, \
+             SOURCE_PASSWORD = {pass_lit} FOR CHANNEL 'group_replication_recovery'"
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Bootstrap a brand-new group from this node. Only the orchestrator's
+    /// guarded path calls this.
+    pub async fn bootstrap_group(&self) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop("SET GLOBAL group_replication_bootstrap_group = ON")
+            .await?;
+        let start = conn.query_drop("START GROUP_REPLICATION").await;
+        // Always clear the flag, even if START failed — a lingering ON is a
+        // standing invitation to split-brain on the next START.
+        conn.query_drop("SET GLOBAL group_replication_bootstrap_group = OFF")
+            .await?;
+        start?;
+        Ok(())
+    }
+
+    /// Join an existing group. Blocks while distributed recovery runs; a
+    /// clone-based recovery shuts the server down mid-way (no monitor process
+    /// in-container to restart it), which surfaces here as an error while the
+    /// supervisor exits the container — the next boot comes up with the
+    /// cloned datadir and joins cleanly. Expected, documented behavior.
+    pub async fn start_group_replication(&self) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop("START GROUP_REPLICATION").await?;
+        Ok(())
+    }
+}
+
+/// Quote a string as a MySQL literal (single-quoted, backslash-escaped).
+/// DDL doesn't take placeholders, so CREATE USER / CHANGE REPLICATION SOURCE
+/// go through this.
+pub fn sql_string_literal(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
+}
+
+/// The /role fence, as a pure function (unit-tested; the health server calls
+/// it with live rows).
+///
+/// 200 iff BOTH:
+///   1. this node's own row is ONLINE + PRIMARY, and
+///   2. a strict majority of the members in this node's current view are
+///      reachable (state != UNREACHABLE).
+///
+/// Rule 2 is the split-brain fence: a primary partitioned into the minority
+/// keeps reporting itself ONLINE/PRIMARY while it sees the majority as
+/// UNREACHABLE — Group Replication blocks its writes, and this makes HAProxy
+/// stop routing to it within one probe interval instead of piling up hung
+/// connections.
+pub fn role_is_writable_primary(members: &[MemberRow], self_uuid: &str) -> bool {
+    if members.is_empty() {
+        return false;
+    }
+    let total = members.len();
+    let reachable = members.iter().filter(|m| m.state != "UNREACHABLE").count();
+    if reachable * 2 <= total {
+        return false;
+    }
+    members
+        .iter()
+        .find(|m| m.member_id.eq_ignore_ascii_case(self_uuid))
+        .is_some_and(|m| m.state == "ONLINE" && m.role == "PRIMARY")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(id: &str, state: &str, role: &str) -> MemberRow {
+        MemberRow {
+            member_id: id.to_string(),
+            host: format!("{id}.railway.internal"),
+            state: state.to_string(),
+            role: role.to_string(),
+        }
+    }
+
+    #[test]
+    fn healthy_primary_passes() {
+        let members = vec![
+            member("a", "ONLINE", "PRIMARY"),
+            member("b", "ONLINE", "SECONDARY"),
+            member("c", "ONLINE", "SECONDARY"),
+        ];
+        assert!(role_is_writable_primary(&members, "a"));
+        assert!(!role_is_writable_primary(&members, "b"));
+    }
+
+    #[test]
+    fn minority_partitioned_primary_is_fenced() {
+        // This node still believes it is the primary, but sees the other two
+        // members as UNREACHABLE: 1 reachable of 3 is not a strict majority.
+        let members = vec![
+            member("a", "ONLINE", "PRIMARY"),
+            member("b", "UNREACHABLE", "SECONDARY"),
+            member("c", "UNREACHABLE", "SECONDARY"),
+        ];
+        assert!(!role_is_writable_primary(&members, "a"));
+    }
+
+    #[test]
+    fn majority_side_with_one_unreachable_still_serves() {
+        let members = vec![
+            member("a", "ONLINE", "PRIMARY"),
+            member("b", "ONLINE", "SECONDARY"),
+            member("c", "UNREACHABLE", "SECONDARY"),
+        ];
+        assert!(role_is_writable_primary(&members, "a"));
+    }
+
+    #[test]
+    fn recovering_or_offline_self_is_not_primary() {
+        let members = vec![
+            member("a", "RECOVERING", "SECONDARY"),
+            member("b", "ONLINE", "PRIMARY"),
+        ];
+        assert!(!role_is_writable_primary(&members, "a"));
+        // Empty view (GR never started) fails closed.
+        assert!(!role_is_writable_primary(&[], "a"));
+    }
+
+    #[test]
+    fn single_node_group_is_its_own_majority() {
+        let members = vec![member("a", "ONLINE", "PRIMARY")];
+        assert!(role_is_writable_primary(&members, "a"));
+    }
+
+    #[test]
+    fn literal_escaping() {
+        assert_eq!(sql_string_literal("plain"), "'plain'");
+        assert_eq!(sql_string_literal("o'brien"), "'o\\'brien'");
+        assert_eq!(sql_string_literal("back\\slash"), "'back\\\\slash'");
+    }
+}
