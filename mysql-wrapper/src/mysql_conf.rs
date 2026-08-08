@@ -113,9 +113,11 @@ innodb_buffer_pool_size = {buffer_pool}
 plugin-load-add = group_replication.so
 plugin-load-add = mysql_clone.so
 
-# Not writable until Group Replication decides this node's role. GR lifts
-# read_only on the elected primary automatically.
-super_read_only = ON
+# super_read_only is deliberately NOT set here: docker-entrypoint's
+# first-boot initialization runs its setup SQL against a temp server that
+# reads this file, and would fail read-only. The orchestrator sets
+# super_read_only=ON the moment the final server answers, before any
+# join/bootstrap decision; Group Replication lifts it on the elected primary.
 
 group_replication_group_name = {group_name}
 group_replication_start_on_boot = OFF
@@ -186,7 +188,6 @@ mod tests {
             "enforce_gtid_consistency = ON",
             "log_bin = binlog",
             "performance_schema = ON",
-            "super_read_only = ON",
             "group_replication_start_on_boot = OFF",
             "group_replication_single_primary_mode = ON",
             "group_replication_communication_stack = MYSQL",

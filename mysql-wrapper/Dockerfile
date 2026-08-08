@@ -44,10 +44,10 @@ COPY --from=rust-binaries --chmod=755 /mysql-wrapper /usr/local/bin/mysql-wrappe
 
 VOLUME ["/var/lib/mysql"]
 
-# 3306   = MySQL client port (write traffic in front of HAProxy)
-# 33061  = Group Replication's own communication port (xcom)
-# 8080   = wrapper health server (/health, /role)
-EXPOSE 3306 33061 8080
+# 3306   = MySQL client port — also carries Group Replication traffic
+#          (group_replication_communication_stack = MYSQL; no XCom port)
+# 8080   = wrapper health server (/health, /role, /gr/state)
+EXPOSE 3306 8080
 
 HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8080/health || exit 1

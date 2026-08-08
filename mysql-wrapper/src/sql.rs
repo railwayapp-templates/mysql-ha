@@ -56,6 +56,32 @@ impl Sql {
         .await
     }
 
+    /// True while the server is docker-entrypoint's init-phase temp instance
+    /// (`--skip-networking`). The orchestrator must not touch that instance:
+    /// its socket is live, but the entrypoint is still running setup SQL
+    /// against it.
+    pub async fn is_init_temp_server(&self) -> Result<bool> {
+        self.short(async {
+            let mut conn = self.pool.get_conn().await?;
+            let skip: Option<i64> = conn.query_first("SELECT @@skip_networking").await?;
+            Ok(skip == Some(1))
+        })
+        .await
+    }
+
+    /// Fence writes until Group Replication decides this node's role.
+    /// Deliberately a runtime action, not a my.cnf directive — the rendered
+    /// config is also read by docker-entrypoint's first-boot init, whose
+    /// setup SQL must stay writable.
+    pub async fn set_super_read_only(&self) -> Result<()> {
+        self.short(async {
+            let mut conn = self.pool.get_conn().await?;
+            conn.query_drop("SET GLOBAL super_read_only = ON").await?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn server_uuid(&self) -> Result<String> {
         self.short(async {
             let mut conn = self.pool.get_conn().await?;

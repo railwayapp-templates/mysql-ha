@@ -156,18 +156,41 @@ pub async fn orchestrate(
     telemetry: Arc<Telemetry>,
     group_name: String,
 ) {
-    // 1. Wait for mysqld. docker-entrypoint's first-boot initialization can
-    //    take a while; there is no timeout here — the supervisor exits the
-    //    container if mysqld dies.
+    // 1. Wait for the FINAL mysqld. docker-entrypoint's first-boot
+    //    initialization runs setup SQL against a temp server whose socket is
+    //    already live (`--skip-networking`) — touching it would corrupt the
+    //    init, so wait until networking is on. No timeout: the supervisor
+    //    exits the container if mysqld dies.
     let mut attempts = 0u32;
-    while let Err(e) = sql.ping().await {
-        attempts += 1;
-        if attempts % 30 == 0 {
-            info!(attempts, error = %e, "still waiting for mysqld");
+    loop {
+        match sql.is_init_temp_server().await {
+            Ok(false) => break,
+            Ok(true) => {
+                if attempts % 30 == 0 {
+                    info!("waiting out docker-entrypoint's init temp server");
+                }
+            }
+            Err(e) => {
+                if attempts % 30 == 0 {
+                    info!(attempts, error = %e, "still waiting for mysqld");
+                }
+            }
         }
+        attempts += 1;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     info!("mysqld is answering");
+
+    // 2. Fence writes immediately: nothing may write to this node until the
+    //    group decides its role. GR lifts this on the elected primary.
+    if let Err(e) = sql.set_super_read_only().await {
+        warn!(error = %e, "could not set super_read_only");
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "mysql-wrapper".to_string(),
+            error: e.to_string(),
+            context: "set_super_read_only".to_string(),
+        });
+    }
 
     if let Err(e) = persist_group_name(&config, &group_name) {
         warn!(error = %e, "could not persist group name marker");
@@ -178,7 +201,7 @@ pub async fn orchestrate(
         });
     }
 
-    // 2. Recovery channel credentials — local metadata, needed before any
+    // 3. Recovery channel credentials — local metadata, needed before any
     //    join, allowed under super_read_only, idempotent.
     let recovery_password = config
         .gr_replication_password
