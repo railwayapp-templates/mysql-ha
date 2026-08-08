@@ -630,6 +630,7 @@ mod tests {
             mysql_port: 3306,
             server_id: None,
             gr_seeds: Some("mysql-1.railway.internal:3306".to_string()),
+            gr_enabled_flag: true,
             gr_group_name: None,
             gr_replication_password: Some("rp".to_string()),
             health_port: 8080,

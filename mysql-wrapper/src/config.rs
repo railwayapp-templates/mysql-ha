@@ -21,6 +21,10 @@ pub struct Config {
     /// Group Replication server_id. Every node needs a distinct one; when
     /// unset it is derived from the node's private domain (FNV-1a, never 0).
     pub server_id: Option<u32>,
+    /// Declarative HA switch (default true). The template stamps
+    /// GR_ENABLED=true as its `haActiveVariable`; the revert flow strips it
+    /// together with GR_SEEDS — either alone is enough to boot standalone.
+    pub gr_enabled_flag: bool,
     /// Comma-separated "host:port" list of ALL group members (self included),
     /// in template order — the first entry is the bootstrap candidate. Ports
     /// are the SQL port (3306): the group uses the MYSQL communication stack,
@@ -64,6 +68,8 @@ impl Config {
             mysql_root_password,
             mysql_port: u16::env_parse("MYSQL_PORT", 3306),
             server_id: non_empty(std::env::var("SERVER_ID").ok()).and_then(|v| v.parse().ok()),
+            // Only a literal "false" disables — absence means "follow GR_SEEDS".
+            gr_enabled_flag: std::env::var("GR_ENABLED").map_or(true, |v| v != "false"),
             gr_seeds: non_empty(std::env::var("GR_SEEDS").ok()),
             gr_group_name: non_empty(std::env::var("GR_GROUP_NAME").ok()),
             gr_replication_password: non_empty(std::env::var("GR_REPLICATION_PASSWORD").ok()),
@@ -86,7 +92,7 @@ impl Config {
     }
 
     pub fn gr_enabled(&self) -> bool {
-        self.gr_seeds.is_some()
+        self.gr_enabled_flag && self.gr_seeds.is_some()
     }
 
     /// The bare hostnames from GR_SEEDS, in declared order.
@@ -142,6 +148,7 @@ mod tests {
             "MYSQL_ROOT_PASSWORD",
             "MYSQL_PORT",
             "SERVER_ID",
+            "GR_ENABLED",
             "GR_SEEDS",
             "GR_GROUP_NAME",
             "GR_REPLICATION_PASSWORD",
@@ -222,6 +229,23 @@ mod tests {
             config.peer_hosts(),
             vec!["mysql-2.railway.internal", "mysql-3.railway.internal"]
         );
+    }
+
+    #[test]
+    fn gr_enabled_false_forces_standalone_even_with_seeds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        env::set_var("GR_SEEDS", "mysql-1.railway.internal:3306");
+        env::set_var("GR_REPLICATION_PASSWORD", "rp");
+        env::set_var("GR_ENABLED", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.gr_enabled());
+
+        // Anything other than the literal "false" keeps HA on.
+        env::set_var("GR_ENABLED", "true");
+        assert!(Config::from_env().unwrap().gr_enabled());
+        env::remove_var("GR_ENABLED");
+        assert!(Config::from_env().unwrap().gr_enabled());
     }
 
     #[test]
