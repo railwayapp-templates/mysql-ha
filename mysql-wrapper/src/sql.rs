@@ -82,6 +82,27 @@ impl Sql {
         .await
     }
 
+    /// Purge this instance's local binlog/GTID history. ONLY safe on a
+    /// provably-fresh instance (the datadir was empty when this boot
+    /// started): docker-entrypoint's first-boot init runs with binlog+GTID
+    /// on, so every node is born with a few local-only GTIDs under its own
+    /// server_uuid. Left in place, those wedge the whole topology — the
+    /// bootstrap guard reads them as "peer holds transactions I lack" in
+    /// every direction, and Group Replication refuses joiners whose local
+    /// GTID set isn't a subset of the group's. The same reset is what
+    /// InnoDB Cluster's own provisioning (dba.configureInstance) does.
+    pub async fn reset_fresh_instance_gtid_history(&self) -> Result<()> {
+        self.short(async {
+            let mut conn = self.pool.get_conn().await?;
+            // 8.4+/9.x syntax first; RESET MASTER for anything older.
+            if conn.query_drop("RESET BINARY LOGS AND GTIDS").await.is_err() {
+                conn.query_drop("RESET MASTER").await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn server_uuid(&self) -> Result<String> {
         self.short(async {
             let mut conn = self.pool.get_conn().await?;
@@ -145,13 +166,23 @@ impl Sql {
         .await
     }
 
-    /// Create/converge the distributed-recovery user and its grants. Runs on
-    /// the freshly-bootstrapped primary (writable); the statements replicate
-    /// to every future joiner through recovery itself.
+    /// Create/converge the distributed-recovery user and its grants, WITHOUT
+    /// binlogging (`sql_log_bin = 0`, session-scoped).
+    ///
+    /// Runs on EVERY node before the write fence and before any START GROUP
+    /// REPLICATION: with the MYSQL communication stack, each member
+    /// authenticates INCOMING group connections against this user locally —
+    /// the plugin's own local connectivity self-test fails without it, on the
+    /// bootstrap node included. Unlogged because a joiner minting binlogged
+    /// GTIDs of its own pre-join would be refused by the group (local set no
+    /// longer a subset of the group's). This is the documented provisioning
+    /// order for InnoDB Cluster / MYSQL-stack Group Replication.
     pub async fn ensure_recovery_user(&self, user: &str, password: &str) -> Result<()> {
         let user_lit = sql_string_literal(user);
         let pass_lit = sql_string_literal(password);
+        // All statements on ONE connection: sql_log_bin is session-scoped.
         let mut conn = self.pool.get_conn().await?;
+        conn.query_drop("SET SESSION sql_log_bin = 0").await?;
         conn.query_drop(format!(
             "CREATE USER IF NOT EXISTS {user_lit}@'%' IDENTIFIED BY {pass_lit}"
         ))
@@ -167,6 +198,7 @@ impl Sql {
              GROUP_REPLICATION_STREAM ON *.* TO {user_lit}@'%'"
         ))
         .await?;
+        conn.query_drop("SET SESSION sql_log_bin = 1").await?;
         Ok(())
     }
 

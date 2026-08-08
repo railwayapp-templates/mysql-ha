@@ -119,17 +119,21 @@ plugin-load-add = mysql_clone.so
 # super_read_only=ON the moment the final server answers, before any
 # join/bootstrap decision; Group Replication lifts it on the elected primary.
 
-group_replication_group_name = {group_name}
-group_replication_start_on_boot = OFF
-group_replication_single_primary_mode = ON
-group_replication_enforce_update_everywhere_checks = OFF
-group_replication_communication_stack = MYSQL
-group_replication_local_address = {private_domain}:{mysql_port}
-group_replication_group_seeds = {gr_seeds}
-group_replication_paxos_single_leader = ON
+# Every group_replication_* variable is loose-prefixed: `mysqld --initialize`
+# ignores plugin-load-add and would otherwise abort on "unknown variable"
+# before the plugin exists. loose- turns that into a warning during init and
+# applies the values once the plugin loads at real boot.
+loose-group_replication_group_name = {group_name}
+loose-group_replication_start_on_boot = OFF
+loose-group_replication_single_primary_mode = ON
+loose-group_replication_enforce_update_everywhere_checks = OFF
+loose-group_replication_communication_stack = MYSQL
+loose-group_replication_local_address = {private_domain}:{mysql_port}
+loose-group_replication_group_seeds = {gr_seeds}
+loose-group_replication_paxos_single_leader = ON
 # caching_sha2_password without client-side TLS certs needs RSA key exchange
 # on the recovery channel.
-group_replication_recovery_get_public_key = ON
+loose-group_replication_recovery_get_public_key = ON
 "#,
         server_id = input.server_id,
         private_domain = input.private_domain,
@@ -188,12 +192,12 @@ mod tests {
             "enforce_gtid_consistency = ON",
             "log_bin = binlog",
             "performance_schema = ON",
-            "group_replication_start_on_boot = OFF",
-            "group_replication_single_primary_mode = ON",
-            "group_replication_communication_stack = MYSQL",
-            "group_replication_group_name = aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "group_replication_local_address = mysql-1.railway.internal:3306",
-            "group_replication_group_seeds = mysql-1.railway.internal:3306,mysql-2.railway.internal:3306",
+            "loose-group_replication_start_on_boot = OFF",
+            "loose-group_replication_single_primary_mode = ON",
+            "loose-group_replication_communication_stack = MYSQL",
+            "loose-group_replication_group_name = aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "loose-group_replication_local_address = mysql-1.railway.internal:3306",
+            "loose-group_replication_group_seeds = mysql-1.railway.internal:3306,mysql-2.railway.internal:3306",
             "plugin-load-add = group_replication.so",
             "plugin-load-add = mysql_clone.so",
             "innodb_buffer_pool_size = 536870912",

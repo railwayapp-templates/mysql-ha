@@ -150,11 +150,16 @@ async fn classify_round(
 
 /// The main orchestration loop. Returns once this node is an active group
 /// member (the health server takes over from there).
+///
+/// `fresh_datadir` — true when the datadir was EMPTY at wrapper start, i.e.
+/// docker-entrypoint initialized this instance during this very boot. Gates
+/// the local GTID-history reset (see reset_fresh_instance_gtid_history).
 pub async fn orchestrate(
     config: Arc<Config>,
     sql: Sql,
     telemetry: Arc<Telemetry>,
     group_name: String,
+    fresh_datadir: bool,
 ) {
     // 1. Wait for the FINAL mysqld. docker-entrypoint's first-boot
     //    initialization runs setup SQL against a temp server whose socket is
@@ -181,8 +186,48 @@ pub async fn orchestrate(
     }
     info!("mysqld is answering");
 
-    // 2. Fence writes immediately: nothing may write to this node until the
-    //    group decides its role. GR lifts this on the elected primary.
+    // 2a. Fresh instance: purge the GTIDs docker-entrypoint's own init SQL
+    //     just minted (they're local-only noise under this node's uuid, and
+    //     they wedge both the bootstrap guard and Group Replication joins).
+    //     Must happen before the write fence — RESET needs a writable server.
+    if fresh_datadir {
+        match sql.reset_fresh_instance_gtid_history().await {
+            Ok(()) => info!("fresh instance: local init GTID history reset"),
+            Err(e) => {
+                error!(error = %e, "could not reset fresh-instance GTID history");
+                telemetry.send(TelemetryEvent::ComponentError {
+                    component: "mysql-wrapper".to_string(),
+                    error: e.to_string(),
+                    context: "reset_fresh_instance_gtid_history".to_string(),
+                });
+            }
+        }
+    }
+
+    // 2b. Recovery user, on EVERY node, unlogged, BEFORE the write fence:
+    //     the MYSQL communication stack authenticates inbound group
+    //     connections against this user locally — the plugin's own local
+    //     connectivity self-test fails without it, bootstrap node included.
+    //     Must precede super_read_only (CREATE USER is a write, even
+    //     unlogged).
+    let recovery_password = config
+        .gr_replication_password
+        .clone()
+        .expect("HA mode requires GR_REPLICATION_PASSWORD (validated in Config::from_env)");
+    if let Err(e) = sql
+        .ensure_recovery_user(RECOVERY_USER, &recovery_password)
+        .await
+    {
+        error!(error = %e, "failed to ensure recovery user");
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "mysql-wrapper".to_string(),
+            error: e.to_string(),
+            context: "ensure_recovery_user".to_string(),
+        });
+    }
+
+    // 2c. Fence writes: nothing may write to this node until the group
+    //    decides its role. GR lifts this on the elected primary.
     if let Err(e) = sql.set_super_read_only().await {
         warn!(error = %e, "could not set super_read_only");
         telemetry.send(TelemetryEvent::ComponentError {
@@ -203,10 +248,6 @@ pub async fn orchestrate(
 
     // 3. Recovery channel credentials — local metadata, needed before any
     //    join, allowed under super_read_only, idempotent.
-    let recovery_password = config
-        .gr_replication_password
-        .clone()
-        .expect("HA mode requires GR_REPLICATION_PASSWORD (validated in Config::from_env)");
     if let Err(e) = sql
         .configure_recovery_channel(RECOVERY_USER, &recovery_password)
         .await
@@ -327,7 +368,7 @@ pub async fn orchestrate(
                     info!(?held, "bootstrapping a new group");
                     match sql.bootstrap_group().await {
                         Ok(()) => {
-                            if let Err(e) = post_bootstrap(&sql, &recovery_password).await {
+                            if let Err(e) = post_bootstrap(&sql).await {
                                 error!(error = %e, "post-bootstrap setup failed");
                                 telemetry.send(TelemetryEvent::ComponentError {
                                     component: "mysql-wrapper".to_string(),
@@ -359,16 +400,19 @@ pub async fn orchestrate(
                 // declared candidate, so nothing will bootstrap without
                 // operator/monitor action. Say so loudly and keep watching:
                 // if it catches up the other way (or an operator intervenes),
-                // the loop converges.
-                wait_log_once(
+                // the loop converges. Telemetry only on the transition — this
+                // loop runs every few seconds.
+                let changed = wait_log_once(
                     &mut last_wait_reason,
                     &format!("peer {host} holds transactions this node lacks; refusing to bootstrap over it"),
                 );
-                telemetry.send(TelemetryEvent::ComponentError {
-                    component: "mysql-wrapper".to_string(),
-                    error: format!("peer {host} is more advanced than the bootstrap candidate"),
-                    context: "bootstrap_guard".to_string(),
-                });
+                if changed {
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "mysql-wrapper".to_string(),
+                        error: format!("peer {host} is more advanced than the bootstrap candidate"),
+                        context: "bootstrap_guard".to_string(),
+                    });
+                }
             }
             Ok(BootstrapVerdict::Undecidable) => {
                 safe_since = None;
@@ -392,35 +436,36 @@ pub async fn orchestrate(
     }
 }
 
-/// After a successful bootstrap this node is the writable primary: create
-/// the recovery user (replicates to every future joiner) and re-point the
-/// local recovery channel at it.
-async fn post_bootstrap(sql: &Sql, recovery_password: &str) -> Result<()> {
-    // Wait for the promotion to land (GR lifts read_only asynchronously).
+/// After a successful bootstrap, wait for the promotion to land (GR lifts
+/// read_only asynchronously) so the RoleChanged event reports reality. The
+/// recovery user already exists everywhere — every member creates its own,
+/// unlogged, pre-fence (step 2b).
+async fn post_bootstrap(sql: &Sql) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let self_uuid = sql.server_uuid().await?;
         let members = sql.group_members().await?;
         if role_is_writable_primary(&members, &self_uuid) {
-            break;
+            return Ok(());
         }
         if Instant::now() > deadline {
             anyhow::bail!("bootstrapped node did not become writable primary within 60s");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    sql.ensure_recovery_user(RECOVERY_USER, recovery_password)
-        .await?;
-    Ok(())
 }
 
 /// Log a wait reason only when it changes — these loops run every few
-/// seconds and would otherwise flood the logs with the same line.
-fn wait_log_once(last: &mut String, reason: &str) {
+/// seconds and would otherwise flood the logs with the same line. Returns
+/// true on a transition, so callers can rate-limit side effects (telemetry)
+/// the same way.
+fn wait_log_once(last: &mut String, reason: &str) -> bool {
     if last != reason {
         info!("{reason}");
         *last = reason.to_string();
+        return true;
     }
+    false
 }
 
 /// Tiny join_all so we don't pull the futures crate in for one call site.

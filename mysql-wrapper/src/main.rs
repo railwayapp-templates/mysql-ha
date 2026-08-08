@@ -61,6 +61,12 @@ async fn main() -> Result<()> {
         info!(group_name = %group_name, server_id, "rendering group replication config");
         mysql_conf::write_gr_conf(&config, &group_name, server_id)?;
 
+        // Same uninitialized-instance test docker-entrypoint.sh uses: no
+        // `mysql` system schema directory in the datadir. Checked BEFORE the
+        // entrypoint spawns — it decides whether this boot's local GTID
+        // history is init noise that must be purged (see gr::orchestrate).
+        let fresh_datadir = !std::path::Path::new(&config.data_dir).join("mysql").is_dir();
+
         tokio::spawn(health_server::run_health_server(
             config.health_port,
             Arc::new(AppState {
@@ -74,6 +80,7 @@ async fn main() -> Result<()> {
             sql.clone(),
             telemetry.clone(),
             group_name,
+            fresh_datadir,
         ));
     } else {
         info!("GR_SEEDS not set — standalone passthrough mode");
