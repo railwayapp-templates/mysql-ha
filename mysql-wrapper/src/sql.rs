@@ -242,6 +242,81 @@ impl Sql {
         conn.query_drop("START GROUP_REPLICATION").await?;
         Ok(())
     }
+
+    /// Record group-level metadata: this group's dataset includes data that
+    /// predates its GTID history (adopted standalone volume). Written by the
+    /// adopting node once it is the writable primary; binlogged, so it
+    /// replicates to every member and survives clones and the eventual
+    /// deletion of the adopting node itself — unlike a file marker, which a
+    /// clone-recreated datadir loses.
+    pub async fn set_group_pre_gtid_flag(&self) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop("CREATE SCHEMA IF NOT EXISTS railway_ha").await?;
+        conn.query_drop(
+            "CREATE TABLE IF NOT EXISTS railway_ha.meta \
+             (k VARCHAR(64) PRIMARY KEY, v VARCHAR(255) NOT NULL)",
+        )
+        .await?;
+        conn.query_drop(
+            "INSERT INTO railway_ha.meta (k, v) VALUES ('pre_gtid_data', '1') \
+             ON DUPLICATE KEY UPDATE v = '1'",
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Read the group-level pre-GTID-data flag. False when the schema/table
+    /// doesn't exist (plain groups never create it).
+    pub async fn group_pre_gtid_flag(&self) -> bool {
+        self.short(async {
+            let mut conn = self.pool.get_conn().await?;
+            let v: Option<String> = conn
+                .query_first("SELECT v FROM railway_ha.meta WHERE k = 'pre_gtid_data'")
+                .await
+                .unwrap_or(None);
+            Ok(v.as_deref() == Some("1"))
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Explicitly clone this (empty) instance from a live group member.
+    /// Used instead of START GROUP_REPLICATION when the group carries
+    /// pre-GTID data (an adopted standalone volume): binlog-based recovery
+    /// would silently skip that data, because GTID-wise the fresh joiner
+    /// "already has" everything that was never binlogged.
+    ///
+    /// On success the server REPLACES its datadir and shuts itself down
+    /// (there is no in-container monitor for its self-restart), so the
+    /// expected outcome is a dropped connection followed by the supervisor
+    /// exiting the container; the restarted container boots on the cloned
+    /// data and joins through the normal path. REQUIRE SSL: the donor user
+    /// is caching_sha2 and MySQL auto-generates server certs, so SSL is the
+    /// reliable way for clone's internal client to authenticate.
+    pub async fn clone_from_donor(
+        &self,
+        donor_host: &str,
+        donor_port: u16,
+        user: &str,
+        password: &str,
+    ) -> Result<()> {
+        let donor = format!("{donor_host}:{donor_port}");
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop(format!(
+            "SET GLOBAL clone_valid_donor_list = {}",
+            sql_string_literal(&donor)
+        ))
+        .await?;
+        conn.query_drop(format!(
+            "CLONE INSTANCE FROM {}@{}:{} IDENTIFIED BY {} REQUIRE SSL",
+            sql_string_literal(user),
+            sql_string_literal(donor_host),
+            donor_port,
+            sql_string_literal(password),
+        ))
+        .await?;
+        Ok(())
+    }
 }
 
 /// Quote a string as a MySQL literal (single-quoted, backslash-escaped).

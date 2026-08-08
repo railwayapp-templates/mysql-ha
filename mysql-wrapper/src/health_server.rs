@@ -25,6 +25,8 @@ use tracing::info;
 pub struct AppState {
     pub sql: Sql,
     pub standalone: bool,
+    /// Datadir path — /gr/state reads the pre-GTID-data marker from it.
+    pub data_dir: String,
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -58,7 +60,7 @@ async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn gr_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match local_gr_state(&state.sql).await {
+    match local_gr_state(&state.sql, &state.data_dir).await {
         Ok(s) => (StatusCode::OK, Json(s)).into_response(),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "state unavailable").into_response(),
     }

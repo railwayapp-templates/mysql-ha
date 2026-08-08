@@ -34,10 +34,24 @@ use uuid::Uuid;
 
 pub const RECOVERY_USER: &str = "gr_recovery";
 const GROUP_NAME_MARKER: &str = ".railway_gr_group_name";
+const PRE_GTID_DATA_MARKER: &str = ".railway_pre_gtid_data";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 fn marker_path(config: &Config) -> PathBuf {
     Path::new(&config.data_dir).join(GROUP_NAME_MARKER)
+}
+
+fn pre_gtid_marker_path(data_dir: &str) -> PathBuf {
+    Path::new(data_dir).join(PRE_GTID_DATA_MARKER)
+}
+
+/// Does this node hold data that predates its GTID history? True for an
+/// adopted standalone volume (Railway's standalone template runs with binlog
+/// off). Persisted as a marker the moment it is detected, because the
+/// condition itself ("data present, GTID set empty") stops being observable
+/// once the group starts minting GTIDs.
+pub fn has_pre_gtid_data(data_dir: &str) -> bool {
+    pre_gtid_marker_path(data_dir).exists()
 }
 
 /// Resolve the group name: explicit env > marker persisted on the volume >
@@ -79,7 +93,7 @@ pub fn persist_group_name(config: &Config, group_name: &str) -> Result<()> {
 }
 
 /// This node's own Group Replication state, in the same shape peers report.
-pub async fn local_gr_state(sql: &Sql) -> Result<GrState> {
+pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
     let self_uuid = sql.server_uuid().await?;
     let members = sql.group_members().await?;
     let gtid = sql.executed_gtid_set().await?;
@@ -100,6 +114,10 @@ pub async fn local_gr_state(sql: &Sql) -> Result<GrState> {
         gtid_executed: Some(gtid),
         members_total: members.len(),
         members_reachable: members.iter().filter(|m| m.state != "UNREACHABLE").count(),
+        // File marker: the adopting node itself, detected pre-bootstrap.
+        // DB flag: replicated group-level truth — survives clones and the
+        // adopting node's deletion.
+        pre_gtid_data: has_pre_gtid_data(data_dir) || sql.group_pre_gtid_flag().await,
     })
 }
 
@@ -202,6 +220,25 @@ pub async fn orchestrate(
                 });
             }
         }
+    } else if !has_pre_gtid_data(&config.data_dir) {
+        // Adoption detection: a NON-fresh datadir with an EMPTY GTID set is
+        // pre-existing data that was never binlogged — an adopted standalone
+        // volume (Railway's standalone template runs --disable-log-bin).
+        // Persist the fact now: once the group starts minting GTIDs the
+        // condition becomes unobservable, and joiners need it forever to
+        // know that binlog-based recovery can never reconstruct this node's
+        // base data (see the clone path below).
+        match sql.executed_gtid_set().await {
+            Ok(set) if set.is_empty() => {
+                if let Err(e) = std::fs::write(pre_gtid_marker_path(&config.data_dir), "1\n") {
+                    warn!(error = %e, "could not persist pre-GTID data marker");
+                } else {
+                    info!("adopted volume detected (data present, no GTID history)");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "could not read GTID set for adoption detection"),
+        }
     }
 
     // 2b. Recovery user, on EVERY node, unlogged, BEFORE the write fence:
@@ -281,7 +318,7 @@ pub async fn orchestrate(
     loop {
         // Already an active member? (Covers both "join succeeded last
         // iteration" and "this node restarted while the group kept running".)
-        match local_gr_state(&sql).await {
+        match local_gr_state(&sql, &config.data_dir).await {
             Ok(state) if state.group_active => {
                 info!(
                     state = ?state.member_state,
@@ -323,6 +360,54 @@ pub async fn orchestrate(
 
         if group_seen {
             safe_since = None;
+
+            // Clone-first path: the group carries data that predates its
+            // GTID history (adopted standalone volume), and this node has no
+            // GTID history of its own to prove it holds that base data.
+            // Binlog-based recovery would join "successfully" while silently
+            // skipping everything that was never binlogged — clone instead.
+            let group_has_pre_gtid_data = answers
+                .iter()
+                .any(|(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active && s.pre_gtid_data));
+            let i_hold_pre_gtid_data = has_pre_gtid_data(&config.data_dir);
+            let my_gtid_is_empty = sql
+                .executed_gtid_set()
+                .await
+                .map(|s| s.is_empty())
+                .unwrap_or(false);
+
+            if group_has_pre_gtid_data && !i_hold_pre_gtid_data && my_gtid_is_empty {
+                let donor = answers
+                    .iter()
+                    .filter_map(|(host, a)| match a {
+                        PeerAnswer::State(s) if s.group_active => {
+                            Some((host.clone(), s.member_role.clone()))
+                        }
+                        _ => None,
+                    })
+                    .max_by_key(|(_, role)| role.as_deref() == Some("PRIMARY"))
+                    .map(|(host, _)| host);
+                if let Some(donor) = donor {
+                    info!(%donor, "group holds pre-GTID data — cloning instead of binlog recovery");
+                    match sql
+                        .clone_from_donor(&donor, config.mysql_port, RECOVERY_USER, &recovery_password)
+                        .await
+                    {
+                        // Either way the expected outcome is the same: the
+                        // recipient server replaces its datadir and shuts
+                        // down (no in-container monitor for self-restart),
+                        // the supervisor exits the container, and the next
+                        // boot joins on the cloned data. An Err here is
+                        // almost always the dropped connection of that
+                        // shutdown, not a failure.
+                        Ok(()) => info!("clone completed; server will shut down and rejoin on restart"),
+                        Err(e) => info!(error = %e, "clone initiated (connection drop on shutdown is expected)"),
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+            }
+
             info!("a live group exists — joining");
             match sql.start_group_replication().await {
                 Ok(()) => info!("START GROUP_REPLICATION succeeded"),
@@ -375,6 +460,19 @@ pub async fn orchestrate(
                                     error: e.to_string(),
                                     context: "post_bootstrap".to_string(),
                                 });
+                            } else if has_pre_gtid_data(&config.data_dir) {
+                                // Adopting root: replicate the group-level
+                                // "our dataset predates our GTIDs" fact so
+                                // every present and future member knows
+                                // joiners must clone (see the clone path).
+                                if let Err(e) = sql.set_group_pre_gtid_flag().await {
+                                    error!(error = %e, "failed to persist group pre-GTID flag");
+                                    telemetry.send(TelemetryEvent::ComponentError {
+                                        component: "mysql-wrapper".to_string(),
+                                        error: e.to_string(),
+                                        context: "set_group_pre_gtid_flag".to_string(),
+                                    });
+                                }
                             }
                             telemetry.send(TelemetryEvent::RoleChanged {
                                 node: config.private_domain.clone(),

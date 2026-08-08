@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: false,
+                data_dir: config.data_dir.clone(),
             }),
         ));
 
@@ -89,6 +90,7 @@ async fn main() -> Result<()> {
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: true,
+                data_dir: config.data_dir.clone(),
             }),
         ));
         telemetry.send(TelemetryEvent::NodeStarted {

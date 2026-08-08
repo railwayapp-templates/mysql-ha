@@ -52,7 +52,10 @@ ensure_network() {
 start_node() {
   local n="$1"; shift
   docker volume create --label "$LABEL" "mysql-ha-e2e-vol-$n" >/dev/null
-  docker run -d --label "$LABEL" \
+  # --restart unless-stopped mirrors Railway's restart policy — and the clone
+  # provisioning path DEPENDS on a restart: the clone recipient replaces its
+  # datadir and shuts down, expecting the platform to boot it back up.
+  docker run -d --label "$LABEL" --restart unless-stopped \
     --name "mysql-$n" --hostname "mysql-$n" \
     --network "$NET" --network-alias "mysql-$n" \
     -v "mysql-ha-e2e-vol-$n:/var/lib/mysql" \
@@ -226,9 +229,66 @@ t_cold_restart_preserves_group() {
   fi
 }
 
+t_conversion_adopts_standalone_volume() {
+  log "t_conversion_adopts_standalone_volume (fresh environment)"
+  teardown_trio
+
+  # Seed a volume the way Railway's standalone mysql template leaves it:
+  # official image, binlog disabled, performance_schema off — so the data has
+  # NO GTID history at all.
+  docker volume create --label "$LABEL" mysql-ha-e2e-vol-1 >/dev/null
+  docker run -d --label "$LABEL" --name seed-mysql --network "$NET" \
+    -v mysql-ha-e2e-vol-1:/var/lib/mysql \
+    -e MYSQL_ROOT_PASSWORD="$ROOT_PW" -e MYSQL_DATABASE=railway \
+    "mysql:${MYSQL_VERSION}" \
+    mysqld --disable-log-bin --performance_schema=0 >/dev/null
+
+  wait_until 240 "standalone seed mysqld up" \
+    bash -c 'docker exec seed-mysql mysql -uroot -p'"$ROOT_PW"' -e "SELECT 1" >/dev/null 2>&1' \
+    || { bad "standalone seed never came up"; return; }
+
+  docker exec seed-mysql mysql -uroot -p"$ROOT_PW" -e \
+    "CREATE TABLE railway.legacy (id INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO railway.legacy VALUES (1, 'pre-conversion');" 2>/dev/null
+  docker stop seed-mysql >/dev/null && docker rm seed-mysql >/dev/null
+  ok "standalone volume seeded (binlog off, 1 row of base data)"
+
+  # Convert: node 1 adopts the volume, nodes 2/3 are fresh. The fresh nodes
+  # must CLONE (binlog recovery cannot reconstruct never-binlogged data) —
+  # each clone shuts its server down and rides the restart policy back up.
+  start_node 1
+  start_node 2
+  start_node 3
+
+  wait_until 420 "converted group fully ONLINE" group_is_fully_online mysql-1 \
+    || { bad "converted group never reached 3 ONLINE"; return; }
+  ok "adopted volume bootstrapped a group; fresh nodes provisioned"
+
+  for n in mysql-2 mysql-3; do
+    local v
+    v="$(sql "$n" "SELECT v FROM railway.legacy WHERE id=1")"
+    if [ "$v" = "pre-conversion" ]; then
+      ok "base (never-binlogged) data present on $n"
+    else
+      bad "base data MISSING on $n (got: '$v') — clone path failed"
+    fi
+  done
+
+  sql mysql-1 "INSERT INTO railway.legacy VALUES (2, 'post-conversion');"
+  wait_until 60 "post-conversion write replicated" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM railway.legacy WHERE id=2" 2>/dev/null)" = "post-conversion" ]' \
+    || { bad "post-conversion write did not replicate"; return; }
+  ok "post-conversion writes replicate"
+
+  if [ "$(role_code mysql-2 mysql-1)" = "200" ]; then
+    ok "adopting node is the primary (/role 200)"
+  else
+    bad "adopting node is not the primary"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume)
 
 main() {
   ensure_image

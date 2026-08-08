@@ -25,6 +25,13 @@ pub struct GrState {
     pub gtid_executed: Option<String>,
     pub members_total: usize,
     pub members_reachable: usize,
+    /// True when this node holds data that predates its GTID history — an
+    /// adopted standalone volume (Railway's standalone template runs with
+    /// binlog disabled). Joiners MUST clone from such a group instead of
+    /// using binlog-based recovery: GTID-wise a fresh joiner "already has"
+    /// the un-GTID'd base data, so binlog recovery would silently skip it.
+    #[serde(default)]
+    pub pre_gtid_data: bool,
 }
 
 /// One peer's answer, or why there isn't one. The distinction matters: an
