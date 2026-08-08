@@ -302,6 +302,14 @@ impl Sql {
     ) -> Result<()> {
         let donor = format!("{donor_host}:{donor_port}");
         let mut conn = self.pool.get_conn().await?;
+        // CLONE INSTANCE replaces the datadir, so it is a write — the write
+        // fence (super_read_only, set at boot) blocks it with ERROR 1290.
+        // Lift it just for the clone. Safe: this node is not in the group and
+        // HAProxy fails its /role closed, so no external writes can land in
+        // the window; and the clone shuts the server down on success, with
+        // the fence re-applied by the orchestrator on the post-clone boot.
+        conn.query_drop("SET GLOBAL super_read_only = OFF").await?;
+        conn.query_drop("SET GLOBAL read_only = OFF").await?;
         conn.query_drop(format!(
             "SET GLOBAL clone_valid_donor_list = {}",
             sql_string_literal(&donor)
