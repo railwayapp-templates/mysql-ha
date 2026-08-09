@@ -53,10 +53,12 @@ routing decisions:
 
 HAProxy's write frontend (`mysql_primary_backend`) marks a node UP only while
 its `/role` returns 200 (`http-check send meth GET uri /role` / `http-check
-expect status 200`), with `default-server fall 1 rise 2 on-marked-down
-shutdown-sessions` — one failed check pulls a node out of rotation
-immediately, and `shutdown-sessions` forces every open client connection to
-reconnect and land on the new primary.
+expect status 200`), with `default-server fall 2 rise 2 on-marked-down
+shutdown-sessions` — the first failed check switches probing to the fast
+interval (500ms), so a real demotion pulls the node out ~500ms later, while a
+single slow check on a healthy primary no longer severs every client
+connection. `shutdown-sessions` forces every open client connection to
+reconnect and land on the new primary once a node is genuinely marked down.
 
 **This is the split-brain fence.** A primary that loses contact with the rest
 of the group must answer 503, not 200, even if MySQL locally still believes

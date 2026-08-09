@@ -17,9 +17,9 @@ use tracing::{error, info, warn};
 /// Spawn the upstream entrypoint, passing through any CLI args this process
 /// was itself invoked with — mirrors `docker-entrypoint.sh mysqld [args...]`.
 ///
-/// TODO: this execs mysqld with whatever config already exists in the image
-/// (or the caller's --defaults-extra-file, if any) — nothing here renders a
-/// Group Replication my.cnf yet. See the TODOs in main.rs.
+/// In HA mode the Group Replication my.cnf fragment is already on disk by
+/// the time this runs — main.rs renders it (mysql_conf::write_gr_conf)
+/// before spawning, so every phase of docker-entrypoint.sh reads it.
 pub async fn spawn_mysqld(args: &[String]) -> Result<Child> {
     info!(?args, "starting docker-entrypoint.sh mysqld");
 

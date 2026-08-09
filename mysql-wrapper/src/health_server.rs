@@ -17,10 +17,12 @@
 
 use crate::gr::local_gr_state;
 use crate::sql::{role_is_writable_primary, Sql};
+use anyhow::Context;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use common::{Telemetry, TelemetryEvent};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 
 pub struct AppState {
     pub sql: Sql,
@@ -66,7 +68,7 @@ async fn gr_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-pub async fn run_health_server(health_port: u16, state: Arc<AppState>) {
+async fn run_health_server(health_port: u16, state: Arc<AppState>) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/role", get(role))
@@ -79,13 +81,44 @@ pub async fn run_health_server(health_port: u16, state: Arc<AppState>) {
     // sockets accept IPv4-mapped connections on the same listener by default.
     // (Carried over from redis-ha's health_server, where this was load-bearing.)
     let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], health_port));
-    info!(port = health_port, "health server listening");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .expect("health server bind failed");
+        .context("health server bind failed")?;
+    info!(port = health_port, "health server listening");
 
     axum::serve(listener, app)
         .await
-        .expect("health server failed");
+        .context("health server exited")?;
+    Ok(())
+}
+
+/// Run the health server FOREVER, rebinding after any failure. This server is
+/// the node's entire external interface — HAProxy's routing probe and every
+/// peer's bootstrap-guard query go through it — so a dead server makes the
+/// node invisible (a primary drops out of write rotation with mysqld
+/// perfectly healthy, and peers read the node as unreachable, freezing
+/// bootstrap decisions). The previous shape (`expect(...)` inside a fire-and-
+/// forget `tokio::spawn`) panicked the task silently and left the node in
+/// exactly that state; mysqld's supervisor never noticed.
+pub async fn run_health_server_supervised(
+    health_port: u16,
+    state: Arc<AppState>,
+    telemetry: Arc<Telemetry>,
+) {
+    loop {
+        if let Err(e) = run_health_server(health_port, state.clone()).await {
+            error!(error = %e, "health server failed; restarting");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "mysql-wrapper".to_string(),
+                error: e.to_string(),
+                context: "health_server".to_string(),
+            });
+        } else {
+            // axum::serve only returns on error; an Ok return is unexpected
+            // but the answer is the same — put the server back up.
+            error!("health server returned unexpectedly; restarting");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
