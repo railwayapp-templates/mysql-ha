@@ -67,13 +67,14 @@ async fn main() -> Result<()> {
         // history is init noise that must be purged (see gr::orchestrate).
         let fresh_datadir = !std::path::Path::new(&config.data_dir).join("mysql").is_dir();
 
-        tokio::spawn(health_server::run_health_server(
+        tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: false,
                 data_dir: config.data_dir.clone(),
             }),
+            telemetry.clone(),
         ));
 
         tokio::spawn(gr::orchestrate(
@@ -85,13 +86,14 @@ async fn main() -> Result<()> {
         ));
     } else {
         info!("GR_SEEDS not set — standalone passthrough mode");
-        tokio::spawn(health_server::run_health_server(
+        tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: true,
                 data_dir: config.data_dir.clone(),
             }),
+            telemetry.clone(),
         ));
         telemetry.send(TelemetryEvent::NodeStarted {
             node: config.private_domain.clone(),

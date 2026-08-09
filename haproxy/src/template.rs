@@ -88,12 +88,17 @@ backend mysql_primary_backend
     option httpchk
     http-check send meth GET uri /role
     http-check expect status 200
-    # fall 1: one failed /role check is enough to pull a server out of
-    # rotation, minimising the window where a demoted/isolated primary can
-    # still receive writes through HAProxy. shutdown-sessions RSTs every open
-    # client connection the moment the server is marked down, forcing clients
-    # to reconnect and land on the new primary.
-    default-server fall 1 rise 2 on-marked-down shutdown-sessions
+    # fall 2 + fastinter 500ms: the first failed /role check switches the
+    # probe to the fast interval, so a real demotion is confirmed and the
+    # server pulled ~500ms after the first failure — but ONE slow or dropped
+    # check can no longer RST every client connection on a healthy primary.
+    # /role runs two SQL reads (2s timeout each) against `timeout check 3s`,
+    # so a single blip under load is expected, and with no secondary passing
+    # /role a false mark-down is a self-inflicted write outage until `rise 2`
+    # readmits the primary. shutdown-sessions RSTs every open client
+    # connection the moment the server is genuinely marked down, forcing
+    # clients to reconnect and land on the new primary.
+    default-server fall 2 rise 2 on-marked-down shutdown-sessions
 {servers}
 "#,
         max_conn = config.max_conn,
@@ -192,7 +197,10 @@ mod tests {
         let backend = section(&conf, "backend mysql_primary_backend");
         assert!(backend.contains("http-check send meth GET uri /role"));
         assert!(backend.contains("http-check expect status 200"));
-        assert!(backend.contains("default-server fall 1 rise 2 on-marked-down shutdown-sessions"));
+        // fall 2, not 1: one slow /role check on a healthy primary must not
+        // RST every client connection (fastinter re-probes 500ms later, so a
+        // real demotion is still confirmed almost immediately).
+        assert!(backend.contains("default-server fall 2 rise 2 on-marked-down shutdown-sessions"));
     }
 
     /// The resolvers block must be present with the same tunables redis-ha
