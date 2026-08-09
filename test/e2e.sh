@@ -48,9 +48,12 @@ ensure_network() {
 }
 
 # start_node <n> [extra docker args...] — boots mysql-N with the same env
-# shape the Railway template stamps.
+# shape the Railway template stamps. NODE_IMAGE overrides the image for this
+# one call (patch-skew scenarios boot members on different patch levels, the
+# way a redeploy re-pulling the moving :8.4 tag does in production).
 start_node() {
   local n="$1"; shift
+  local image="${NODE_IMAGE:-$IMAGE}"
   docker volume create --label "$LABEL" "mysql-ha-e2e-vol-$n" >/dev/null
   # --restart unless-stopped mirrors Railway's restart policy — and the clone
   # provisioning path DEPENDS on a restart: the clone recipient replaces its
@@ -67,7 +70,7 @@ start_node() {
     -e RAILWAY_VOLUME_MOUNT_PATH="/var/lib/mysql" \
     -e BOOTSTRAP_DWELL_SECONDS=5 \
     "$@" \
-    "$IMAGE" >/dev/null
+    "$image" >/dev/null
 }
 
 start_trio() { start_node 1; start_node 2; start_node 3; }
@@ -446,13 +449,95 @@ t_conversion_cross_version_upgrade() {
     || bad "post-upgrade write did not replicate"
 }
 
+t_patch_skew_on_redeploy() {
+  local old_image="mysql-ha-e2e:8.4.0"
+  log "t_patch_skew_on_redeploy (group on 8.4.0; one member redeploys onto $IMAGE)"
+  docker image inspect "$old_image" >/dev/null 2>&1 || {
+    log "building $old_image"
+    docker build -t "$old_image" -f mysql-wrapper/Dockerfile \
+      --build-arg MYSQL_VERSION=8.4.0 . || { bad "old-patch image build failed"; return; }
+  }
+  teardown_trio
+
+  # Production reality this reproduces: data nodes carry the moving :8.4 tag
+  # with NO auto-update, but ANY redeploy re-pulls the tag — a user redeploy,
+  # a scale-up node, or the fleet monitor's crashed-node deploy-latest
+  # self-heal — so one member lands on the newest patch while its siblings
+  # stay on whatever they pulled at deploy time.
+  NODE_IMAGE="$old_image" start_node 1
+  NODE_IMAGE="$old_image" start_node 2
+  NODE_IMAGE="$old_image" start_node 3
+
+  wait_until 300 "3 ONLINE on the old patch" group_is_fully_online mysql-1 \
+    || { bad "old-patch group never formed"; return; }
+  local before_ver
+  before_ver="$(sql mysql-1 "SELECT @@version")"
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'pre-skew') ON DUPLICATE KEY UPDATE v='pre-skew';"
+  ok "group formed on $before_ver with data"
+
+  # "Redeploy" mysql-2: same volume, image = the current tag. The datadir
+  # patch-upgrades in place, then the higher-patch member rejoins the group.
+  docker rm -f mysql-2 >/dev/null 2>&1
+  start_node 2
+
+  wait_until 300 "skewed member rejoined (3 ONLINE)" group_is_fully_online mysql-1 \
+    || { bad "higher-patch member did not rejoin a lower-patch group"; return; }
+  # Membership is observed from mysql-1; mysql-2's own SQL port lags ONLINE by
+  # a few seconds (clone/upgrade restart window), so poll it before asserting.
+  wait_until 120 "skewed member answers SQL locally" \
+    bash -c '[ -n "$(docker exec mysql-2 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT 1" 2>/dev/null)" ]' \
+    || { bad "rejoined member never accepted local SQL"; return; }
+  local v2_ver
+  v2_ver="$(sql mysql-2 "SELECT @@version")"
+  ok "mixed-patch group healthy: mysql-2 on $v2_ver, siblings on $before_ver"
+
+  local v
+  v="$(sql mysql-2 "SELECT v FROM t.kv WHERE k=1")"
+  [ "$v" = "pre-skew" ] \
+    && ok "data intact on the patch-upgraded member" \
+    || bad "data missing on patch-upgraded member (got '$v')"
+
+  sql mysql-1 "INSERT INTO t.kv VALUES (2,'during-skew') ON DUPLICATE KEY UPDATE v='during-skew';"
+  wait_until 60 "write replicates across the patch skew" \
+    bash -c '[ "$(docker exec mysql-2 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=2" 2>/dev/null)" = "during-skew" ]' \
+    && ok "writes replicate in the mixed-patch group" \
+    || bad "replication broken across patch skew"
+
+  # Rollback probe — the sharp edge of moving tags: a deployment ROLLBACK
+  # boots the older binary against the now-upgraded datadir. MySQL does not
+  # support downgrades (even patch-level), so this member must fail loudly
+  # while the group survives on the remaining majority. This documents the
+  # hazard rather than pretending it away.
+  docker rm -f mysql-2 >/dev/null 2>&1
+  NODE_IMAGE="$old_image" start_node 2
+  sleep 20
+  local online
+  online="$(online_members mysql-1 | tr -d '[:space:]')"
+  if [ "$online" = "2" ]; then
+    ok "rollback of a patch-upgraded member refuses to rejoin (2/3 survive) — downgrade unsupported, as documented"
+  elif [ "$online" = "3" ]; then
+    # If MySQL ever tolerates this it's strictly better than documented;
+    # record it rather than failing.
+    ok "rollback member unexpectedly rejoined (3/3) — better than MySQL's documented no-downgrade stance"
+  else
+    bad "group degraded past the rollback member (online=$online)"
+  fi
+
+  # Heal: put the member back on the current image; must rejoin.
+  docker rm -f mysql-2 >/dev/null 2>&1
+  start_node 2
+  wait_until 300 "healed member rejoined" group_is_fully_online mysql-1 \
+    && ok "re-redeploy onto the current patch heals the rolled-back member" \
+    || bad "member did not recover after returning to the current patch"
+}
+
 # ---------------------------------------------------------------------------
 
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
 # and seeds its own 'pre-upgrade' dataset, so it must not sit inside the
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
 # row.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image
