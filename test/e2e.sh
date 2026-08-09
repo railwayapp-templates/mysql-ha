@@ -531,13 +531,108 @@ t_patch_skew_on_redeploy() {
     || bad "member did not recover after returning to the current patch"
 }
 
+t_total_outage_after_failover() {
+  log "t_total_outage_after_failover (first seed is BEHIND at the outage; ex-primary must bootstrap)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'pre-failover') ON DUPLICATE KEY UPDATE v='pre-failover';"
+
+  # Fail over away from the first seed, then write — mysql-1 is now STRICTLY
+  # behind the surviving members.
+  docker stop mysql-1 >/dev/null
+  wait_until 120 "failover away from the first seed" \
+    bash -c 'docker exec mysql-2 wget -q -O /dev/null http://mysql-2:8080/role 2>/dev/null || docker exec mysql-2 wget -q -O /dev/null http://mysql-3:8080/role 2>/dev/null' \
+    || { bad "no failover after stopping the first seed"; return; }
+  local new_primary
+  new_primary="$(current_primary mysql-2 mysql-2 mysql-3)"
+  sql "$new_primary" "INSERT INTO t.kv VALUES (2,'post-failover') ON DUPLICATE KEY UPDATE v='post-failover';"
+  ok "failed over to $new_primary and wrote while the first seed was down"
+
+  # Total outage with that skew in place. With a FIXED bootstrap candidate
+  # this deadlocks on restart: only the first seed may bootstrap, but it
+  # refuses (its peers are ahead) — dynamic candidacy must let the
+  # most-advanced node bootstrap instead, with no operator action.
+  docker stop mysql-2 mysql-3 >/dev/null
+  docker start mysql-1 mysql-2 mysql-3 >/dev/null
+
+  wait_until 300 "group reformed with the first seed behind" group_is_fully_online mysql-2 \
+    || { bad "group did not re-form after a total outage with a behind first seed (bootstrap deadlock)"; return; }
+  ok "group re-formed without operator action"
+
+  wait_until 60 "post-failover write visible on the caught-up first seed" \
+    bash -c '[ "$(docker exec mysql-1 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=2" 2>/dev/null)" = "post-failover" ]' \
+    || { bad "first seed missing the post-failover write after recovery"; return; }
+  ok "first seed caught up on the writes it missed"
+
+  local codes
+  codes="$(role_code mysql-2 mysql-1)/$(role_code mysql-2 mysql-2)/$(role_code mysql-2 mysql-3)"
+  local twohundreds
+  twohundreds="$(echo "$codes" | tr '/' '\n' | grep -c 200)"
+  [ "$twohundreds" = "1" ] \
+    && ok "exactly one primary after recovery ($codes)" \
+    || bad "expected exactly one primary after recovery, got $codes"
+}
+
+t_first_seed_permanent_loss() {
+  log "t_first_seed_permanent_loss (volume destroyed; survivors re-form once a fresh node answers)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'survives-loss') ON DUPLICATE KEY UPDATE v='survives-loss';"
+  wait_until 60 "seed write replicated" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null)" = "survives-loss" ]' \
+    || { bad "seed write never replicated"; return; }
+
+  # Total outage during which the first seed's VOLUME is destroyed — the
+  # permanent-loss worst case: the survivors hold quorum and all the data,
+  # but with a fixed candidate nothing may ever bootstrap again.
+  docker stop mysql-2 mysql-3 >/dev/null
+  docker rm -f mysql-1 >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-1 >/dev/null 2>&1
+  docker start mysql-2 mysql-3 >/dev/null
+
+  # Fail-closed while the lost peer is unreachable: its dataset can't be
+  # compared, so nobody may bootstrap yet.
+  sleep 30
+  local codes
+  codes="$(role_code mysql-2 mysql-2)/$(role_code mysql-2 mysql-3)"
+  [ "$codes" = "503/503" ] \
+    && ok "survivors hold fail-closed while the lost peer is unreachable ($codes)" \
+    || bad "a survivor bootstrapped past an unreachable peer ($codes)"
+
+  # The platform (a redeploy, or the fleet monitor's crashed-node self-heal)
+  # brings a FRESH first seed back. It answers "empty dataset, no group" —
+  # now every peer is comparable and a data-holding survivor must bootstrap.
+  start_node 1
+  wait_until 420 "group re-formed around the surviving data" group_is_fully_online mysql-2 \
+    || { bad "survivors never re-formed after the fresh node answered (bootstrap deadlock)"; return; }
+  ok "survivors re-formed the group"
+
+  wait_until 120 "data recovered onto the fresh first seed" \
+    bash -c '[ "$(docker exec mysql-1 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null)" = "survives-loss" ]' \
+    || { bad "fresh first seed did not recover the surviving data"; return; }
+  ok "fresh first seed recovered the dataset"
+
+  local all_codes
+  all_codes="$(role_code mysql-2 mysql-1)/$(role_code mysql-2 mysql-2)/$(role_code mysql-2 mysql-3)"
+  local n200
+  n200="$(echo "$all_codes" | tr '/' '\n' | grep -c 200)"
+  [ "$n200" = "1" ] \
+    && ok "exactly one primary after the loss recovery ($all_codes)" \
+    || bad "expected exactly one primary, got $all_codes"
+}
+
 # ---------------------------------------------------------------------------
 
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
 # and seeds its own 'pre-upgrade' dataset, so it must not sit inside the
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
-# row.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_conversion_cross_version_upgrade)
+# row. The two outage-recovery tests teardown and seed their own trios, so
+# they sit safely between the chain and the cross-version finale.
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

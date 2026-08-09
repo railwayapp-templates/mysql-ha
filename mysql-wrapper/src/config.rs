@@ -26,7 +26,8 @@ pub struct Config {
     /// together with GR_SEEDS — either alone is enough to boot standalone.
     pub gr_enabled_flag: bool,
     /// Comma-separated "host:port" list of ALL group members (self included),
-    /// in template order — the first entry is the bootstrap candidate. Ports
+    /// in template order — the declared order is the seed-order tie-break for
+    /// bootstrap (candidacy itself is GTID-driven, see gr::decide). Ports
     /// are the SQL port (3306): the group uses the MYSQL communication stack,
     /// not a separate XCom port.
     pub gr_seeds: Option<String>,
@@ -116,14 +117,28 @@ impl Config {
             .collect()
     }
 
-    /// Deterministic bootstrap candidacy: the first host in the declared seed
-    /// list. Same convention as postgres-ha's etcd (alphabetically-first
-    /// bootstrap leader) — a name-order pact, not an election. Only matters
-    /// when no live group exists; the peer-query guard makes it safe.
+    /// Whether this node is the FIRST host in the declared seed list — the
+    /// node that wins the seed-order tie-break on a first deploy, where every
+    /// dataset is empty. Logging/diagnostics only: bootstrap candidacy itself
+    /// is dynamic (GTID-driven, see gr::decide), because a fixed candidate
+    /// deadlocks the group whenever it is behind or permanently gone.
     pub fn is_bootstrap_candidate(&self) -> bool {
+        self.my_seed_rank() == Some(0)
+    }
+
+    /// This host's 0-based position in the declared seed order — the final
+    /// tie-break when two nodes hold identical GTID sets. None when this node
+    /// isn't in its own seed list (misconfiguration); callers treat that as
+    /// lowest priority, so a correctly-listed peer always wins the tie.
+    pub fn my_seed_rank(&self) -> Option<usize> {
+        self.seed_rank(&self.private_domain)
+    }
+
+    /// A host's 0-based position in the declared seed order.
+    pub fn seed_rank(&self, host: &str) -> Option<usize> {
         self.seed_hosts()
-            .first()
-            .is_some_and(|h| h.eq_ignore_ascii_case(&self.private_domain))
+            .iter()
+            .position(|h| h.eq_ignore_ascii_case(host))
     }
 }
 
@@ -225,6 +240,9 @@ mod tests {
         // Candidacy is case-insensitive: Railway service names are
         // capitalized but DNS hostnames come back lowercased.
         assert!(config.is_bootstrap_candidate());
+        assert_eq!(config.my_seed_rank(), Some(0));
+        assert_eq!(config.seed_rank("mysql-3.railway.internal"), Some(2));
+        assert_eq!(config.seed_rank("not-in-the-list.railway.internal"), None);
         assert_eq!(
             config.peer_hosts(),
             vec!["mysql-2.railway.internal", "mysql-3.railway.internal"]

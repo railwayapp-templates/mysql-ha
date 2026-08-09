@@ -150,18 +150,23 @@ impl Sql {
         .await
     }
 
-    /// True iff `candidate` ⊆ `reference` — evaluated by mysqld itself, which
-    /// is the only component that parses GTID sets correctly.
-    pub async fn gtid_subset(&self, candidate: &str, reference: &str) -> Result<bool> {
+    /// Both subset directions in one round trip, evaluated by mysqld itself —
+    /// the only component that parses GTID sets correctly. Returns
+    /// `(peer ⊆ mine, mine ⊆ peer)`: both true means identical sets, both
+    /// false means diverged histories (each side holds transactions the other
+    /// lacks). Empty sets need no special-casing — GTID_SUBSET('', X) is 1.
+    pub async fn gtid_compare(&self, mine: &str, peer: &str) -> Result<(bool, bool)> {
         self.short(async {
             let mut conn = self.pool.get_conn().await?;
-            let subset: Option<i64> = conn
+            let row: Option<(i64, i64)> = conn
                 .exec_first(
-                    "SELECT GTID_SUBSET(?, ?)",
-                    (candidate, reference),
+                    "SELECT GTID_SUBSET(?, ?), GTID_SUBSET(?, ?)",
+                    (peer, mine, mine, peer),
                 )
                 .await?;
-            Ok(subset == Some(1))
+            let (peer_sub_mine, mine_sub_peer) =
+                row.context("GTID_SUBSET returned no row")?;
+            Ok((peer_sub_mine == 1, mine_sub_peer == 1))
         })
         .await
     }
