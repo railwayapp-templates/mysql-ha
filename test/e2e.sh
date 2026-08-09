@@ -364,9 +364,95 @@ t_minority_partition_write_fence() {
   ok "rejoined node caught up on partition-era writes"
 }
 
+# The LTS one step below the wrapper's series — the version a real customer's
+# standalone is likely to be on when they convert. Seeding with THIS and
+# booting the wrapper forces the cross-version InnoDB data-dictionary upgrade.
+seed_prev_version() {
+  case "$MYSQL_VERSION" in
+    8.4) echo "8.0" ;;
+    9.4) echo "8.4" ;;
+    *)   echo "8.0" ;;
+  esac
+}
+
+t_conversion_cross_version_upgrade() {
+  local prev; prev="$(seed_prev_version)"
+  log "t_conversion_cross_version_upgrade (seed mysql:$prev -> wrapper $MYSQL_VERSION)"
+  teardown_trio
+
+  # The failure mode this guards is the MySQL analogue of redis-ha's RDB
+  # discovery: persistence formats change across versions, and a single-
+  # version test never exercises the upgrade path. Railway's standalone
+  # template floats forward, but a customer converting from an OLDER series
+  # boots the (newer) HA wrapper against an older datadir — the adopting node
+  # must run the InnoDB data-dictionary upgrade on start, and the pre-upgrade
+  # data must survive it and clone-propagate to the fresh members.
+  docker volume create --label "$LABEL" mysql-ha-e2e-vol-1 >/dev/null
+  docker run -d --label "$LABEL" --name seed-mysql --network "$NET" \
+    -v mysql-ha-e2e-vol-1:/var/lib/mysql \
+    -e MYSQL_ROOT_PASSWORD="$ROOT_PW" -e MYSQL_DATABASE=railway \
+    "mysql:$prev" \
+    mysqld --disable-log-bin --performance_schema=0 >/dev/null
+
+  wait_until 240 "old-version seed mysqld up" \
+    bash -c 'docker exec seed-mysql mysql -uroot -p'"$ROOT_PW"' -e "SELECT 1" >/dev/null 2>&1' \
+    || { bad "old-version seed never came up"; return; }
+
+  local seeded_ver
+  seeded_ver="$(docker exec seed-mysql mysql -uroot -p"$ROOT_PW" --batch --skip-column-names -e "SELECT @@version" 2>/dev/null)"
+  docker exec seed-mysql mysql -uroot -p"$ROOT_PW" -e \
+    "CREATE TABLE railway.legacy (id INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO railway.legacy VALUES (1, 'pre-upgrade');" 2>/dev/null
+  docker stop seed-mysql >/dev/null && docker rm seed-mysql >/dev/null
+  ok "seeded a mysql:$prev standalone volume (server $seeded_ver)"
+
+  start_node 1
+  start_node 2
+  start_node 3
+
+  wait_until 480 "cross-version converted group fully ONLINE" group_is_fully_online mysql-1 \
+    || { bad "cross-version conversion never reached 3 ONLINE (data-dictionary upgrade may have wedged the adopting node)"; return; }
+  ok "old-version volume upgraded in place + bootstrapped a group"
+
+  # The upgrade must have actually run — the adopting node now reports the
+  # wrapper's series, not the seeded one.
+  local now_ver
+  now_ver="$(sql mysql-1 "SELECT @@version")"
+  if printf '%s' "$now_ver" | grep -q "^$MYSQL_VERSION"; then
+    ok "adopting node upgraded $seeded_ver -> $now_ver"
+  else
+    bad "adopting node did not upgrade (still $now_ver, expected $MYSQL_VERSION.x)"
+  fi
+
+  # The pre-upgrade row must survive the data-dictionary upgrade AND clone to
+  # the fresh members.
+  local v1
+  v1="$(sql mysql-1 "SELECT v FROM railway.legacy WHERE id=1")"
+  [ "$v1" = "pre-upgrade" ] \
+    && ok "pre-upgrade data survived the in-place upgrade on the primary" \
+    || bad "pre-upgrade data LOST on the primary (got: '$v1')"
+
+  for n in mysql-2 mysql-3; do
+    local v
+    v="$(sql "$n" "SELECT v FROM railway.legacy WHERE id=1")"
+    [ "$v" = "pre-upgrade" ] \
+      && ok "pre-upgrade data cloned to $n across the version bump" \
+      || bad "pre-upgrade data MISSING on $n (got: '$v')"
+  done
+
+  sql mysql-1 "INSERT INTO railway.legacy VALUES (2, 'post-upgrade');"
+  wait_until 60 "post-upgrade write replicated" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM railway.legacy WHERE id=2" 2>/dev/null)" = "post-upgrade" ]' \
+    && ok "writes replicate on the upgraded cluster" \
+    || bad "post-upgrade write did not replicate"
+}
+
 # ---------------------------------------------------------------------------
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence)
+# t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
+# and seeds its own 'pre-upgrade' dataset, so it must not sit inside the
+# adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
+# row.
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image
