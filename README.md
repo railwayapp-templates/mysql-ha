@@ -8,8 +8,11 @@ Rust wrapper around the upstream database image handles config rendering,
 process supervision, and health serving; HAProxy routes client traffic based
 on what those wrappers report.
 
-**Status: WIP scaffold.** See [Status](#status) before relying on anything
-here — most of the actual Group Replication behavior is not implemented yet.
+**Status: functional.** Group formation, failover, conversion of a standalone
+volume (clone-first provisioning), scale-up, partition fencing, cross-version
+conversion, patch-skew survival, and total-outage recovery are all implemented
+and covered by `test/e2e.sh`. See [Status](#status) for what remains scoped
+out of v1.
 
 ## Topology
 
@@ -33,8 +36,7 @@ MySQL Group Replication cluster
   node's `/role` endpoint so writes always land on whichever node is
   currently the GR primary.
 - **v1 has no read port.** This template version is scoped to failover for
-  the write path; a read-only load-balanced port (the `:6380` equivalent in
-  redis-ha) is a future addition, not part of this scaffold.
+  the write path; a read-only load-balanced port is a future addition.
 
 Minimum group size for Group Replication to tolerate a node loss is 3 —
 identical reasoning to redis-ha's Sentinel quorum: a 2-node group can't
@@ -67,7 +69,7 @@ non-primary answer.
 ## Wrapper responsibilities
 
 The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
-`redis-wrapper`. Its job, once fully implemented, is:
+`redis-wrapper`. Its job:
 
 - **Config rendering.** Render a my.cnf carrying Group Replication in
   single-primary mode, with `group_replication_start_on_boot=OFF` — GR is
@@ -84,22 +86,27 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
   dataset via MySQL's Clone plugin against a healthy group member, instead of
   requiring an operator to seed it manually — the GR equivalent of a Redis
   replica's full sync.
-- **Automated total-outage recovery.** If every declared peer is down at
-  once, nothing may unilaterally pick a dataset to resume from. Recovery
-  works by exchanging each candidate's executed-GTID set through their
-  `/health` servers; the node with the most-advanced set bootstraps after a
-  dwell period (giving slower-to-report nodes a chance to be seen), and the
-  number of automatic bootstrap attempts is capped so a flapping network
-  can't repeatedly re-elect different nodes as the source of truth.
+- **Automated total-outage recovery, with dynamic candidacy.** If every
+  declared peer is down at once, nothing may unilaterally pick a dataset to
+  resume from. Recovery works by exchanging each node's executed-GTID set
+  through the `/gr/state` health endpoints; a node bootstraps only when
+  every peer answers, none reports a live group, and every reported set is a
+  subset of its own — and only after that verdict holds through a dwell
+  period (giving slower-to-report nodes a window to contradict it). Any node
+  can be the one to bootstrap — candidacy follows the data, not a fixed seed
+  (a fixed candidate deadlocks the group whenever it is behind, as after any
+  failover, or permanently gone). Identical sets tie-break on pre-GTID data
+  (an adopted standalone volume outranks fresh nodes) and then declared seed
+  order, both of which every node computes identically.
 - **`super_read_only` on every secondary, always.** Secondaries never accept
   direct writes, independent of what HAProxy is doing — a second fence
   against a client that somehow bypasses the edge.
-- **Errant-GTID detection.** A node whose GTID set contains transactions the
-  rest of the group never saw (e.g. it took a local write while partitioned,
-  or was promoted-then-demoted in a way that left orphaned transactions)
-  cannot safely rejoin the group as-is; the wrapper needs to detect that
-  condition rather than let GR fail cryptically or, worse, admit a node
-  carrying diverged data.
+- **Diverged-history freeze.** When two nodes each hold transactions the
+  other never saw (e.g. one took writes while partitioned), no automatic
+  bootstrap choice is safe — picking a side would silently discard the other
+  side's committed writes. The wrapper detects the divergence at
+  bootstrap-decision time, refuses to proceed anywhere, and pages through
+  telemetry instead of letting GR fail cryptically.
 
 ## Conversion notes
 
@@ -159,29 +166,22 @@ cargo test --locked
 
 ## Status
 
-This repository is a **scaffold**, seeded from redis-ha's workspace shape.
-What's real:
+Implemented and e2e-covered (`test/e2e.sh`, one scenario each): group
+formation and replication with the write fence, failover with rejoin, cold
+restart, conversion of a never-binlogged standalone volume (clone-first),
+scale-up 3→5, minority-partition fencing, patch-skew on redeploy (including
+the rollback refusal), total-outage recovery with the first seed behind, loss
+of the first seed's volume, and cross-version conversion (previous LTS →
+wrapper series).
 
-- `common/` — engine-neutral config-parsing helpers, logging, and telemetry
-  transport. Copied from redis-ha as-is (it never mentioned Redis to begin
-  with, past the telemetry event set, which has been trimmed to
-  engine-neutral variants).
-- `haproxy/` — the config generator, node parsing, and monitoring loop are
-  fully adapted and tested: a single write frontend on `:3306` against
-  `mysql_primary_backend`, no read frontend/backend, stats on `:8404`.
-- `mysql-wrapper/` — **stub only.** Config parsing works
-  (`Config::from_env`), and the process supervision skeleton (spawn
-  `docker-entrypoint.sh mysqld`, forward signals, exit with the child's code)
-  is real. Everything Group-Replication-specific is not:
-  - `/health` and `/role` both unconditionally return 503 — fail-closed by
-    design, since a stub that answered 200 would tell HAProxy every node is
-    a valid write target simultaneously.
-  - No my.cnf rendering — the container currently boots mysqld with
-    whatever config the base image ships, not a Group Replication config.
-  - No bootstrap guard, no Clone-plugin provisioning, no total-outage
-    recovery, no errant-GTID detection.
+Deliberately out of scope for v1:
 
-  Search `mysql-wrapper/src` for `TODO` to find every specific gap.
-
-See `test/e2e.sh` for the planned end-to-end scenario list — none of it runs
-yet.
+- **No read port.** The edge exposes only the write frontend; a load-balanced
+  read port is a future addition.
+- **Rolling upgrades are not coordinated.** Data nodes carry a series tag
+  with no auto-update; any redeploy re-pulls the tag's current patch. Group
+  Replication tolerates the skew (higher-patch members join as read-only
+  secondaries), but patch upgrades are one-way — a rollback of an upgraded
+  member refuses to boot, and the e2e documents exactly that.
+- **Runs as root** — same posture (and same deferred fix) as redis-ha; see
+  the Dockerfile TODO.

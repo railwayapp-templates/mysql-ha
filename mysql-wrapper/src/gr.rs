@@ -15,7 +15,17 @@
 //!   - NEVER bootstrap unless every reachable peer's executed-GTID set is a
 //!     subset of this node's — after a full outage the most-advanced node
 //!     must be the one to bootstrap, and each node can verify that claim
-//!     about itself locally.
+//!     about itself locally. Candidacy is DYNAMIC: whichever node holds the
+//!     most complete dataset bootstraps, not a fixed seed — a fixed candidate
+//!     deadlocks the whole group the moment it is behind (any failover
+//!     followed by a full outage) or permanently gone.
+//!   - Identical datasets tie-break deterministically: a node holding
+//!     pre-GTID data (an adopted standalone volume, whose base data GTIDs
+//!     can't describe) outranks fresh nodes, then declared seed order
+//!     decides. Every node computes the same order, so exactly one wins.
+//!   - DIVERGED histories (two nodes each holding transactions the other
+//!     lacks) freeze bootstrap everywhere: picking a side automatically
+//!     would silently discard the other side's committed writes.
 //!   - The bootstrap decision must hold stable for a dwell period before it
 //!     is acted on, so a slow-starting peer gets a window to contradict it.
 //!   - Joining is the default: any peer reporting a live group means this
@@ -121,22 +131,55 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
     })
 }
 
-/// What the candidate concluded from one round of peer answers.
+/// How one peer's dataset relates to this node's, for the bootstrap decision.
+#[derive(Debug, Clone, PartialEq)]
+enum PeerRelation {
+    /// Strict subset of ours — the peer is behind; we outrank it.
+    Behind,
+    /// Identical executed-GTID set. Broken by pre-GTID data, then seed order.
+    Equal { pre_gtid_data: bool },
+    /// Strict superset of ours — the peer should bootstrap, not us.
+    Ahead,
+    /// Each side holds transactions the other lacks. No safe bootstrap
+    /// exists anywhere until an operator reconciles the histories.
+    Diverged,
+    /// Unreachable, not ready, or answered without a GTID set.
+    Unknown,
+}
+
+/// One peer's standing in a bootstrap round: who it is, where it sits in the
+/// declared seed order, and how its dataset compares to ours.
+#[derive(Debug)]
+struct PeerStanding {
+    host: String,
+    seed_rank: usize,
+    relation: PeerRelation,
+}
+
+/// What this node concluded from one round of peer answers.
 #[derive(Debug, PartialEq)]
 enum BootstrapVerdict {
     /// Some peer is in a live group — join it.
     JoinExistingGroup,
-    /// Every peer answered, none has a group, and all datasets are subsets
-    /// of ours — safe to bootstrap once the dwell passes.
+    /// Every peer answered, none has a group, every dataset is a subset of
+    /// ours, and we win every tie — safe to bootstrap once the dwell passes.
     SafeToBootstrap,
-    /// A peer holds transactions we don't — it should bootstrap, not us.
+    /// A peer holds transactions we don't — under dynamic candidacy it
+    /// reaches SafeToBootstrap itself; we wait for its group and join it.
     PeerIsMoreAdvanced(String),
+    /// A peer's dataset ties ours and it precedes us in the tie-break — it
+    /// bootstraps, we join its group.
+    DeferToPeer(String),
+    /// A peer's history has DIVERGED from ours — bootstrap is frozen
+    /// everywhere until an operator reconciles the datasets.
+    Diverged(String),
     /// At least one peer is unreachable/not-ready — no safe decision exists.
     Undecidable,
 }
 
 async fn classify_round(
     sql: &Sql,
+    config: &Config,
     my_gtid: &str,
     answers: &[(String, PeerAnswer)],
 ) -> Result<BootstrapVerdict> {
@@ -146,24 +189,82 @@ async fn classify_round(
     {
         return Ok(BootstrapVerdict::JoinExistingGroup);
     }
+
+    let mut peers = Vec::with_capacity(answers.len());
     for (host, answer) in answers {
-        match answer {
+        let relation = match answer {
             PeerAnswer::State(GrState {
                 gtid_executed: Some(peer_gtid),
+                pre_gtid_data,
                 ..
             }) => {
-                if !peer_gtid.is_empty() && !sql.gtid_subset(peer_gtid, my_gtid).await? {
-                    return Ok(BootstrapVerdict::PeerIsMoreAdvanced(host.clone()));
+                let (peer_sub_mine, mine_sub_peer) =
+                    sql.gtid_compare(my_gtid, peer_gtid).await?;
+                match (peer_sub_mine, mine_sub_peer) {
+                    (true, true) => PeerRelation::Equal {
+                        pre_gtid_data: *pre_gtid_data,
+                    },
+                    (true, false) => PeerRelation::Behind,
+                    (false, true) => PeerRelation::Ahead,
+                    (false, false) => PeerRelation::Diverged,
                 }
             }
             // A reachable peer that didn't report a GTID set is as
             // undecidable as an unreachable one.
             PeerAnswer::State(_) | PeerAnswer::NotReady | PeerAnswer::Unreachable => {
-                return Ok(BootstrapVerdict::Undecidable);
+                PeerRelation::Unknown
+            }
+        };
+        peers.push(PeerStanding {
+            host: host.clone(),
+            seed_rank: config.seed_rank(host).unwrap_or(usize::MAX),
+            relation,
+        });
+    }
+
+    Ok(decide(
+        has_pre_gtid_data(&config.data_dir),
+        config.my_seed_rank().unwrap_or(usize::MAX),
+        &peers,
+    ))
+}
+
+/// The pure bootstrap decision, given every peer's standing. Candidacy is
+/// dynamic: any node may bootstrap when it provably holds the most complete
+/// dataset. Blocking verdicts are checked in order of how definitive they
+/// are: an unanswered peer voids the whole round (its dataset can't be
+/// compared), divergence freezes everything, a strictly-ahead peer takes the
+/// job, and only exact ties fall through to the deterministic tie-break —
+/// pre-GTID data first (an adopted standalone volume must beat the fresh
+/// nodes its base data hasn't reached), then declared seed order. Both
+/// inputs of the tie-break are identical on every node, so all nodes agree
+/// on the single winner.
+fn decide(my_pre_gtid: bool, my_seed_rank: usize, peers: &[PeerStanding]) -> BootstrapVerdict {
+    if peers.iter().any(|p| p.relation == PeerRelation::Unknown) {
+        return BootstrapVerdict::Undecidable;
+    }
+    if let Some(p) = peers.iter().find(|p| p.relation == PeerRelation::Diverged) {
+        return BootstrapVerdict::Diverged(p.host.clone());
+    }
+    if let Some(p) = peers.iter().find(|p| p.relation == PeerRelation::Ahead) {
+        return BootstrapVerdict::PeerIsMoreAdvanced(p.host.clone());
+    }
+    for p in peers {
+        if let PeerRelation::Equal { pre_gtid_data } = p.relation {
+            let peer_wins = match (pre_gtid_data, my_pre_gtid) {
+                // An adopted volume's base data is invisible to GTID
+                // comparison — the holder MUST win the tie, or a fresh node
+                // would bootstrap an empty group over it.
+                (true, false) => true,
+                (false, true) => false,
+                _ => p.seed_rank < my_seed_rank,
+            };
+            if peer_wins {
+                return BootstrapVerdict::DeferToPeer(p.host.clone());
             }
         }
     }
-    Ok(BootstrapVerdict::SafeToBootstrap)
+    BootstrapVerdict::SafeToBootstrap
 }
 
 /// The main orchestration loop. Returns once this node is an active group
@@ -299,14 +400,13 @@ pub async fn orchestrate(
         });
     }
 
-    let is_candidate = config.is_bootstrap_candidate();
     let peer_hosts = config.peer_hosts();
     let peer_timeout = Duration::from_millis(config.peer_query_timeout_ms);
     let dwell = Duration::from_secs(config.bootstrap_dwell_seconds);
     let http = reqwest::Client::new();
 
     info!(
-        is_candidate,
+        first_seed = config.is_bootstrap_candidate(),
         ?peer_hosts,
         group_name = %group_name,
         "starting group replication orchestration"
@@ -423,14 +523,8 @@ pub async fn orchestrate(
             continue;
         }
 
-        if !is_candidate {
-            wait_log_once(&mut last_wait_reason, "no live group yet; waiting for the bootstrap candidate");
-            safe_since = None;
-            tokio::time::sleep(POLL_INTERVAL).await;
-            continue;
-        }
-
-        // Candidate path: decide whether bootstrapping is provably safe.
+        // No live group anywhere: decide whether bootstrapping HERE is
+        // provably safe. Every node runs this — candidacy is dynamic.
         let my_gtid = match sql.executed_gtid_set().await {
             Ok(g) => g,
             Err(e) => {
@@ -440,7 +534,7 @@ pub async fn orchestrate(
             }
         };
 
-        match classify_round(&sql, &my_gtid, &answers).await {
+        match classify_round(&sql, &config, &my_gtid, &answers).await {
             Ok(BootstrapVerdict::SafeToBootstrap) => {
                 let since = *safe_since.get_or_insert_with(Instant::now);
                 let held = since.elapsed();
@@ -465,7 +559,20 @@ pub async fn orchestrate(
                                 // "our dataset predates our GTIDs" fact so
                                 // every present and future member knows
                                 // joiners must clone (see the clone path).
-                                if let Err(e) = sql.set_group_pre_gtid_flag().await {
+                                // Retried: if this write is lost AND the
+                                // adopting node later disappears (taking its
+                                // file marker with it), future joiners would
+                                // binlog-recover past the base data — the
+                                // exact corruption the flag exists to stop.
+                                let mut flag_result = sql.set_group_pre_gtid_flag().await;
+                                for _ in 0..4 {
+                                    if flag_result.is_ok() {
+                                        break;
+                                    }
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    flag_result = sql.set_group_pre_gtid_flag().await;
+                                }
+                                if let Err(e) = flag_result {
                                     error!(error = %e, "failed to persist group pre-GTID flag");
                                     telemetry.send(TelemetryEvent::ComponentError {
                                         component: "mysql-wrapper".to_string(),
@@ -494,20 +601,36 @@ pub async fn orchestrate(
             }
             Ok(BootstrapVerdict::PeerIsMoreAdvanced(host)) => {
                 safe_since = None;
-                // That peer is the rightful bootstrapper — but it is not the
-                // declared candidate, so nothing will bootstrap without
-                // operator/monitor action. Say so loudly and keep watching:
-                // if it catches up the other way (or an operator intervenes),
-                // the loop converges. Telemetry only on the transition — this
-                // loop runs every few seconds.
+                // Under dynamic candidacy that peer reaches SafeToBootstrap
+                // itself — this node just waits for its group to appear and
+                // joins it. Normal operation after a failover followed by a
+                // full outage (the ex-primary is ahead), not an alert.
+                wait_log_once(
+                    &mut last_wait_reason,
+                    &format!("peer {host} holds transactions this node lacks; waiting for it to bootstrap"),
+                );
+            }
+            Ok(BootstrapVerdict::DeferToPeer(host)) => {
+                safe_since = None;
+                wait_log_once(
+                    &mut last_wait_reason,
+                    &format!("dataset ties peer {host}, which precedes this node in the tie-break; waiting for it to bootstrap"),
+                );
+            }
+            Ok(BootstrapVerdict::Diverged(host)) => {
+                safe_since = None;
+                // Committed transactions exist on both sides that the other
+                // never saw. Any automatic choice would silently discard one
+                // side's writes — freeze and page. Telemetry only on the
+                // transition; this loop runs every few seconds.
                 let changed = wait_log_once(
                     &mut last_wait_reason,
-                    &format!("peer {host} holds transactions this node lacks; refusing to bootstrap over it"),
+                    &format!("GTID history has DIVERGED from peer {host}; refusing to bootstrap anywhere — operator required"),
                 );
                 if changed {
                     telemetry.send(TelemetryEvent::ComponentError {
                         component: "mysql-wrapper".to_string(),
-                        error: format!("peer {host} is more advanced than the bootstrap candidate"),
+                        error: format!("diverged GTID history with peer {host}"),
                         context: "bootstrap_guard".to_string(),
                     });
                 }
@@ -579,10 +702,150 @@ async fn futures_join_all(futures: Vec<impl std::future::Future<Output = PeerAns
 mod tests {
     use super::*;
 
-    // classify_round needs a live Sql for GTID_SUBSET, so the pure part we
-    // can test here is the answer-shape handling with empty GTID sets (the
-    // first-deploy path, where no GTID comparison is needed).
-    // The full matrix is exercised in test/e2e.sh.
+    // The GTID comparisons themselves run inside mysqld (classify_round →
+    // Sql::gtid_compare, exercised in test/e2e.sh); decide() is the pure
+    // decision over those comparisons and is fully covered here.
+
+    fn standing(host: &str, seed_rank: usize, relation: PeerRelation) -> PeerStanding {
+        PeerStanding {
+            host: host.to_string(),
+            seed_rank,
+            relation,
+        }
+    }
+
+    fn equal(pre_gtid_data: bool) -> PeerRelation {
+        PeerRelation::Equal { pre_gtid_data }
+    }
+
+    #[test]
+    fn first_deploy_all_empty_first_seed_wins() {
+        // Every node is fresh: all GTID sets empty ⇒ all Equal. The first
+        // seed bootstraps; everyone else defers to it.
+        let peers = vec![
+            standing("mysql-2", 1, equal(false)),
+            standing("mysql-3", 2, equal(false)),
+        ];
+        assert_eq!(decide(false, 0, &peers), BootstrapVerdict::SafeToBootstrap);
+
+        let peers_of_second = vec![
+            standing("mysql-1", 0, equal(false)),
+            standing("mysql-3", 2, equal(false)),
+        ];
+        assert_eq!(
+            decide(false, 1, &peers_of_second),
+            BootstrapVerdict::DeferToPeer("mysql-1".to_string())
+        );
+    }
+
+    #[test]
+    fn most_advanced_node_bootstraps_regardless_of_seed_order() {
+        // The regression that motivated dynamic candidacy: after a failover
+        // followed by a full outage, the ex-primary (NOT the first seed)
+        // holds transactions the first seed lacks. It must bootstrap...
+        let peers_of_ex_primary = vec![
+            standing("mysql-1", 0, PeerRelation::Behind),
+            standing("mysql-3", 2, equal(false)),
+        ];
+        assert_eq!(
+            decide(false, 1, &peers_of_ex_primary),
+            BootstrapVerdict::SafeToBootstrap
+        );
+
+        // ...while the behind first seed waits for it instead of deadlocking.
+        let peers_of_first_seed = vec![
+            standing("mysql-2", 1, PeerRelation::Ahead),
+            standing("mysql-3", 2, PeerRelation::Ahead),
+        ];
+        assert_eq!(
+            decide(false, 0, &peers_of_first_seed),
+            BootstrapVerdict::PeerIsMoreAdvanced("mysql-2".to_string())
+        );
+    }
+
+    #[test]
+    fn fresh_replacement_of_a_lost_seed_never_outranks_data_holders() {
+        // First seed's volume was destroyed and it came back empty: both
+        // peers are Ahead ⇒ it waits, no matter that it is seed[0].
+        let peers = vec![
+            standing("mysql-2", 1, PeerRelation::Ahead),
+            standing("mysql-3", 2, PeerRelation::Ahead),
+        ];
+        assert_eq!(
+            decide(false, 0, &peers),
+            BootstrapVerdict::PeerIsMoreAdvanced("mysql-2".to_string())
+        );
+
+        // And the surviving data holders tie among themselves — the earliest
+        // surviving seed bootstraps even with the fresh node answering.
+        let peers_of_survivor = vec![
+            standing("mysql-1", 0, PeerRelation::Behind),
+            standing("mysql-3", 2, equal(false)),
+        ];
+        assert_eq!(
+            decide(false, 1, &peers_of_survivor),
+            BootstrapVerdict::SafeToBootstrap
+        );
+    }
+
+    #[test]
+    fn adopted_volume_outranks_fresh_equal_nodes() {
+        // Conversion: the adopting root's base data is invisible to GTID
+        // comparison (empty set, like the fresh replicas). The pre-GTID
+        // holder must win the tie even from the LAST seed slot...
+        let peers = vec![
+            standing("mysql-2", 0, equal(false)),
+            standing("mysql-3", 1, equal(false)),
+        ];
+        assert_eq!(decide(true, 2, &peers), BootstrapVerdict::SafeToBootstrap);
+
+        // ...and a fresh first seed must defer to it.
+        let peers_of_fresh = vec![
+            standing("mysql-adopting", 2, equal(true)),
+            standing("mysql-3", 1, equal(false)),
+        ];
+        assert_eq!(
+            decide(false, 0, &peers_of_fresh),
+            BootstrapVerdict::DeferToPeer("mysql-adopting".to_string())
+        );
+    }
+
+    #[test]
+    fn diverged_history_freezes_bootstrap() {
+        let peers = vec![
+            standing("mysql-2", 1, PeerRelation::Diverged),
+            standing("mysql-3", 2, PeerRelation::Behind),
+        ];
+        assert_eq!(
+            decide(false, 0, &peers),
+            BootstrapVerdict::Diverged("mysql-2".to_string())
+        );
+    }
+
+    #[test]
+    fn any_unknown_peer_voids_the_round() {
+        // Unknown outranks every other relation — even a peer we know is
+        // ahead can't make the round decidable, because the silent peer
+        // might be further ahead still.
+        let peers = vec![
+            standing("mysql-2", 1, PeerRelation::Unknown),
+            standing("mysql-3", 2, PeerRelation::Ahead),
+        ];
+        assert_eq!(decide(false, 0, &peers), BootstrapVerdict::Undecidable);
+    }
+
+    #[test]
+    fn behind_peers_alone_do_not_block() {
+        let peers = vec![
+            standing("mysql-2", 1, PeerRelation::Behind),
+            standing("mysql-3", 2, PeerRelation::Behind),
+        ];
+        // Rank is irrelevant when strictly ahead of everyone.
+        assert_eq!(
+            decide(false, usize::MAX, &peers),
+            BootstrapVerdict::SafeToBootstrap
+        );
+    }
 
     #[test]
     fn group_name_derivation_is_deterministic() {
