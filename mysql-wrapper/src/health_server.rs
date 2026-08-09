@@ -93,32 +93,76 @@ async fn run_health_server(health_port: u16, state: Arc<AppState>) -> anyhow::Re
     Ok(())
 }
 
+// A run that stayed up at least this long was healthy in between — the next
+// failure is a new incident, not a continuation of the same crash loop, and
+// earns its own telemetry event. Same thresholds as redis-ha's supervisor.
+const HEALTHY_RUN_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(60);
+const RESPAWN_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Run the health server FOREVER, rebinding after any failure. This server is
 /// the node's entire external interface — HAProxy's routing probe and every
 /// peer's bootstrap-guard query go through it — so a dead server makes the
 /// node invisible (a primary drops out of write rotation with mysqld
 /// perfectly healthy, and peers read the node as unreachable, freezing
-/// bootstrap decisions). The previous shape (`expect(...)` inside a fire-and-
+/// bootstrap decisions). The original shape (`expect(...)` inside a fire-and-
 /// forget `tokio::spawn`) panicked the task silently and left the node in
 /// exactly that state; mysqld's supervisor never noticed.
+///
+/// Mirrors redis-ha's supervisor: each attempt runs in its own spawned task
+/// so a PANIC surfaces as a caught JoinError instead of killing this
+/// supervision loop (which would silently recreate the original bug), and
+/// telemetry is deduped per incident via HEALTHY_RUN_THRESHOLD so a crash
+/// loop emits one ComponentError, not one every respawn.
 pub async fn run_health_server_supervised(
     health_port: u16,
     state: Arc<AppState>,
     telemetry: Arc<Telemetry>,
 ) {
+    let mut alerted_for_current_incident = false;
+
     loop {
-        if let Err(e) = run_health_server(health_port, state.clone()).await {
-            error!(error = %e, "health server failed; restarting");
+        let attempt_state = state.clone();
+        let started_at = std::time::Instant::now();
+        let handle =
+            tokio::task::spawn(
+                async move { run_health_server(health_port, attempt_state).await },
+            );
+        let outcome = handle.await;
+        let ran_for = started_at.elapsed();
+
+        let failure = match outcome {
+            Ok(Ok(())) => {
+                // axum::serve only returns on a graceful-shutdown signal we
+                // never send — unexpected, but the answer is the same.
+                error!("health server returned unexpectedly; restarting");
+                "run loop returned cleanly".to_string()
+            }
+            Ok(Err(e)) => {
+                error!(error = %e, "health server failed; restarting");
+                format!("bind/serve failed: {e:#}")
+            }
+            Err(e) if e.is_panic() => {
+                error!(panic = ?e, "health server panicked; restarting");
+                "task panicked".to_string()
+            }
+            Err(e) => {
+                error!(error = %e, "health server task was cancelled; restarting");
+                "task cancelled".to_string()
+            }
+        };
+
+        if ran_for >= HEALTHY_RUN_THRESHOLD {
+            alerted_for_current_incident = false;
+        }
+        if !alerted_for_current_incident {
+            alerted_for_current_incident = true;
             telemetry.send(TelemetryEvent::ComponentError {
                 component: "mysql-wrapper".to_string(),
-                error: e.to_string(),
+                error: failure,
                 context: "health_server".to_string(),
             });
-        } else {
-            // axum::serve only returns on error; an Ok return is unexpected
-            // but the answer is the same — put the server back up.
-            error!("health server returned unexpectedly; restarting");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        tokio::time::sleep(RESPAWN_DELAY).await;
     }
 }
