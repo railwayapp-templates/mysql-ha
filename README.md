@@ -180,10 +180,14 @@ Deliberately out of scope for v1:
 
 - **No read port.** The edge exposes only the write frontend; a load-balanced
   read port is a future addition.
-- **Rolling upgrades are not coordinated.** Data nodes carry a series tag
-  with no auto-update; any redeploy re-pulls the tag's current patch. Group
-  Replication tolerates the skew (higher-patch members join as read-only
-  secondaries), but patch upgrades are one-way — a rollback of an upgraded
-  member refuses to boot, and the e2e documents exactly that.
+- **Rolling upgrades are not coordinated — and don't need to be, within a
+  series.** Data nodes carry a series tag with no auto-update; any redeploy
+  re-pulls the tag's current patch. This is safe by the LTS model: Group
+  Replication tolerates the skew, clone works across patch releases of the
+  same series, and a rollback of an upgraded member performs MySQL's
+  automatic in-place downgrade on boot ("Server downgrade from X to Y") and
+  rejoins with its data — the e2e locks both directions. Cross-SERIES moves
+  (8.4 → 9.x) remain one-way (dump/reload only), which is exactly why the
+  tags pin the series and conversions match the source's major.
 - **Runs as root** — same posture (and same deferred fix) as redis-ha; see
   the Dockerfile TODO.
