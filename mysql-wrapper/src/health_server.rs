@@ -1,7 +1,7 @@
 //! HTTP health server embedded in each MySQL node.
 //!
-//! Three endpoints, all fail-closed (any error, timeout, or uncertain read
-//! answers 503):
+//! Three probe endpoints, all fail-closed (any error, timeout, or uncertain
+//! read answers 503), plus one action endpoint the Railway dashboard drives:
 //!
 //!   GET /health — liveness: 200 iff mysqld answers `SELECT 1`.
 //!   GET /role   — write-routing fence: 200 iff this node is the writable
@@ -14,15 +14,28 @@
 //!                 membership + executed-GTID set, consumed by peers'
 //!                 bootstrap guards. 503 until mysqld answers, so a peer
 //!                 mid-boot reads as "not ready", never as "empty dataset".
+//!   POST /switchover — ask THIS node to become the primary (the generic
+//!                 clusterWiring.dataNodeSwitchover contract). Runs Group
+//!                 Replication's own planned-handoff primitive,
+//!                 group_replication_set_as_primary, against this node's own
+//!                 uuid — synchronous through the group's consensus, so 200
+//!                 means the switch completed (which /role then reflects);
+//!                 503 carries the group's own refusal as the reason.
 
 use crate::gr::local_gr_state;
 use crate::sql::{role_is_writable_primary, Sql};
 use anyhow::Context;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use common::{Telemetry, TelemetryEvent};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct AppState {
     pub sql: Sql,
@@ -68,11 +81,71 @@ async fn gr_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+/// How long group_replication_set_as_primary waits for the outgoing
+/// primary's in-flight transactions to drain before the switch forces
+/// through — enforced server-side by the function's own timeout argument,
+/// so the handler's outer deadline only needs to sit above it.
+const SET_PRIMARY_DRAIN_TIMEOUT_SECS: u32 = 15;
+const SWITCHOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Promote this node via Group Replication's own primitive. Unlike Sentinel
+/// (redis-ha's equivalent endpoint biases an election), GR ships a direct
+/// "make member X primary" function that runs the whole handoff through the
+/// group's consensus and blocks until it completes — no bias/restore dance,
+/// no background settling, and concurrent group-configuration actions are
+/// refused by the group itself with a clear error rather than racing.
+async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.standalone {
+        // No group — a lone node is trivially its own primary.
+        return match state.sql.ping().await {
+            Ok(()) => (StatusCode::OK, "already primary (standalone)".to_string()),
+            Err(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mysqld not answering".to_string(),
+            ),
+        };
+    }
+
+    let outcome = tokio::time::timeout(SWITCHOVER_DEADLINE, async {
+        let self_uuid = state.sql.server_uuid().await?;
+        let members = state.sql.group_members().await?;
+        if role_is_writable_primary(&members, &self_uuid) {
+            return anyhow::Ok(true);
+        }
+        state
+            .sql
+            .set_as_primary(&self_uuid, SET_PRIMARY_DRAIN_TIMEOUT_SECS)
+            .await?;
+        anyhow::Ok(false)
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(true)) => (StatusCode::OK, "already primary".to_string()),
+        Ok(Ok(false)) => {
+            info!("switchover complete: this node is now the primary");
+            (StatusCode::OK, "switchover complete".to_string())
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "switchover refused");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("switchover refused: {e:#}"),
+            )
+        }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("switchover timed out after {SWITCHOVER_DEADLINE:?}"),
+        ),
+    }
+}
+
 async fn run_health_server(health_port: u16, state: Arc<AppState>) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/role", get(role))
         .route("/gr/state", get(gr_state))
+        .route("/switchover", post(switchover))
         .with_state(state);
 
     // Bind the IPv6 unspecified address rather than 0.0.0.0: Railway's private
