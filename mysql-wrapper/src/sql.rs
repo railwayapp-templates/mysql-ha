@@ -248,6 +248,23 @@ impl Sql {
         Ok(())
     }
 
+    /// Hand the group's primary role to the member named by `uuid` — Group
+    /// Replication's own planned-switchover primitive, run through the
+    /// group's consensus. Blocks while the outgoing primary's in-flight
+    /// transactions drain (bounded by `timeout_secs`, which the function
+    /// enforces server-side), so this is deliberately NOT wrapped in
+    /// `short()` — the caller owns the deadline, like
+    /// `start_group_replication`.
+    pub async fn set_as_primary(&self, uuid: &str, timeout_secs: u32) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.query_drop(format!(
+            "SELECT group_replication_set_as_primary({}, {timeout_secs})",
+            sql_string_literal(uuid)
+        ))
+        .await?;
+        Ok(())
+    }
+
     /// Record group-level metadata: this group's dataset includes data that
     /// predates its GTID history (adopted standalone volume). Written by the
     /// adopting node once it is the writable primary; binlogged, so it
