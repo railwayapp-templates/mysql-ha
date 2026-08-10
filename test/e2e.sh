@@ -503,31 +503,52 @@ t_patch_skew_on_redeploy() {
     && ok "writes replicate in the mixed-patch group" \
     || bad "replication broken across patch skew"
 
-  # Rollback probe — the sharp edge of moving tags: a deployment ROLLBACK
-  # boots the older binary against the now-upgraded datadir. MySQL does not
-  # support downgrades (even patch-level), so this member must fail loudly
-  # while the group survives on the remaining majority. This documents the
-  # hazard rather than pretending it away.
+  # Rollback probe — a deployment ROLLBACK boots the older binary against
+  # the now-upgraded datadir. Within an LTS series this is SUPPORTED: the
+  # server performs an automatic in-place downgrade on boot ("[MY-014064]
+  # Server downgrade from X to Y"), rejoins, and keeps its data — verified
+  # 2026-08-10 for both clean-shutdown and kill (rm -f, crash-recovery)
+  # paths. An earlier revision of this probe waited only 20s, read the
+  # mid-downgrade member as a refusal, and "documented" a hazard that does
+  # not exist in the LTS model — this locks the REAL behavior instead.
+  # (Cross-SERIES moves remain one-way — dump/reload only — but the image
+  # tags pin the series, so no redeploy ever crosses that boundary.)
   docker rm -f mysql-2 >/dev/null 2>&1
   NODE_IMAGE="$old_image" start_node 2
-  sleep 20
-  local online
-  online="$(online_members mysql-1 | tr -d '[:space:]')"
-  if [ "$online" = "2" ]; then
-    ok "rollback of a patch-upgraded member refuses to rejoin (2/3 survive) — downgrade unsupported, as documented"
-  elif [ "$online" = "3" ]; then
-    # If MySQL ever tolerates this it's strictly better than documented;
-    # record it rather than failing.
-    ok "rollback member unexpectedly rejoined (3/3) — better than MySQL's documented no-downgrade stance"
+  # Order matters: check mysql-2's OWN socket first, not mysql-1's group
+  # view. group_is_fully_online reads mysql-1's membership table, which can
+  # read stale-ONLINE for an instant right after `docker rm -f` — GR's
+  # failure detection on mysql-1 hasn't necessarily flagged the removed peer
+  # UNREACHABLE yet, so `wait_until`'s un-slept first check can pass before
+  # mysql-2 has even started booting, let alone reached the downgrade step.
+  # Waiting on mysql-2 answering SQL directly is real: it can only happen
+  # after mysqld finishes init (downgrade included).
+  wait_until 120 "rolled-back member answers SQL locally" \
+    bash -c '[ -n "$(docker exec mysql-2 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT 1" 2>/dev/null)" ]' \
+    || { bad "rolled-back member never booted (automatic in-place downgrade may have failed)"; return; }
+  if docker logs mysql-2 2>&1 | grep -q "Server downgrade from"; then
+    ok "server performed the automatic in-place downgrade on boot"
   else
-    bad "group degraded past the rollback member (online=$online)"
+    bad "member booted but no 'Server downgrade' log line — behavior changed, investigate"
   fi
+  wait_until 300 "rolled-back member rejoined the group (3 ONLINE)" group_is_fully_online mysql-1 \
+    || { bad "rolled-back member did not rejoin the group"; return; }
+  local back_ver
+  back_ver="$(sql mysql-2 "SELECT @@version")"
+  printf '%s' "$back_ver" | grep -q "^8.4.0" \
+    && ok "member is back on the rolled-back patch ($back_ver)" \
+    || bad "expected 8.4.0 after rollback, got '$back_ver'"
+  local v
+  v="$(sql mysql-2 "SELECT v FROM t.kv WHERE k=2")"
+  [ "$v" = "during-skew" ] \
+    && ok "data intact across upgrade + rollback" \
+    || bad "data missing after rollback (got '$v')"
 
-  # Heal: put the member back on the current image; must rejoin.
+  # And rolling forward again onto the current tag must also work.
   docker rm -f mysql-2 >/dev/null 2>&1
   start_node 2
-  wait_until 300 "healed member rejoined" group_is_fully_online mysql-1 \
-    && ok "re-redeploy onto the current patch heals the rolled-back member" \
+  wait_until 300 "member re-upgraded onto the current patch" group_is_fully_online mysql-1 \
+    && ok "re-redeploy onto the current patch works after a rollback" \
     || bad "member did not recover after returning to the current patch"
 }
 
