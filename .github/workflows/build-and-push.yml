@@ -89,7 +89,9 @@ jobs:
               echo "more than 50 pages of Docker Hub tags; refusing to loop forever" >&2
               exit 1
             fi
-            resp=$(curl -fsSL --retry 3 "$page")
+            # --retry-all-errors: Docker Hub rate-limits shared runner IPs
+            # with transient 403/429s, which plain --retry does not retry.
+            resp=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$page")
             echo "$resp" | jq -r '.results[].name' >> /tmp/hub-tags.txt
             page=$(echo "$resp" | jq -r '.next')
             pages=$((pages + 1))
