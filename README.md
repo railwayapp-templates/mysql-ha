@@ -136,12 +136,20 @@ only the config change above.
 
 | Image | GHCR path | Base |
 |---|---|---|
-| `mysql-wrapper` | `ghcr.io/railwayapp-templates/mysql-ha/mysql-wrapper:8.4` | `mysql:8.4` |
-| `mysql-wrapper` | `ghcr.io/railwayapp-templates/mysql-ha/mysql-wrapper:9.4` | `mysql:9.4` |
+| `mysql-wrapper` | `ghcr.io/railwayapp-templates/mysql-ha/mysql-wrapper:<major.minor>` (every `X.Y` series Docker Hub publishes for majors 8 and 9) | `mysql:<major.minor>` |
 | `haproxy` | `ghcr.io/railwayapp-templates/mysql-ha/haproxy:3.2` | `haproxy:3.2-alpine` |
 
 No image carries a floating `:latest` tag — every published tag pins an
 exact MySQL/HAProxy version or commit SHA.
+
+Every `major.minor` tag is a real, continuously rebuilt build line (daily +
+on every wrapper change), not a frozen alias: a MySQL data dir cannot be
+downgraded and series upgrades are one-way, so the platform's HA conversion
+pins a converted service to its own series, and that pin must keep receiving
+upstream patch, base-image and wrapper updates for its whole life. The
+series list is discovered from Docker Hub on every run;
+`MYSQL_SUPPORTED_MAJORS` in `.github/workflows/build-and-push.yml` is the
+only policy knob.
 
 ## Development
 

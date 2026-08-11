@@ -1,9 +1,13 @@
 name: Build and Push Docker Images
 
 on:
-  # Run weekly on Mondays at midnight UTC
+  # Run daily at midnight UTC. Daily (not weekly) keeps the window between an
+  # upstream series release and our first per-series build short: HA
+  # conversion pins the source's own series, so a brand-new upstream series
+  # is convertible only once discover-mysql-series has seen it and this
+  # workflow has published its image.
   schedule:
-    - cron: '0 0 * * 1'
+    - cron: '0 0 * * *'
   # Allow manual trigger
   workflow_dispatch:
   # Build on push to main
@@ -22,6 +26,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository }}
   HAPROXY_VERSION: "3.2"
+  # The single policy knob for which MySQL majors get per-series builds —
+  # mirrors the template's supportedImageMajorVersions. The `X.Y` series
+  # within each major are discovered from Docker Hub on every run, never
+  # hardcoded here.
+  MYSQL_SUPPORTED_MAJORS: "8 9"
   # No suffix - publish to regular tags
   BETA_SUFFIX: ''
 
@@ -50,6 +59,88 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.github/workflows/build-and-push.yml'
+
+  # Enumerate every `X.Y` series tag Docker Hub publishes for the supported
+  # MySQL majors. The list is discovered per run instead of hardcoded so a
+  # new upstream series (LTS or innovation) starts building the day Docker
+  # Hub carries it — the platform's HA conversion pins the adopted service's
+  # own `major.minor` series, so a series with no published image is a
+  # series whose users cannot convert. EOL innovation series stay in the set
+  # for the same reason: building a series a user already runs is strictly
+  # better than stranding their conversion.
+  discover-mysql-series:
+    needs: changes
+    if: ${{ needs.changes.outputs['mysql-wrapper'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    outputs:
+      series: ${{ steps.discover.outputs.series }}
+
+    steps:
+      - name: Discover MySQL series tags on Docker Hub
+        id: discover
+        run: |
+          page="https://hub.docker.com/v2/repositories/library/mysql/tags?page_size=100"
+          : > /tmp/hub-tags.txt
+          pages=0
+          while [ -n "$page" ] && [ "$page" != "null" ]; do
+            if [ "$pages" -ge 50 ]; then
+              echo "more than 50 pages of Docker Hub tags; refusing to loop forever" >&2
+              exit 1
+            fi
+            resp=$(curl -fsSL --retry 3 "$page")
+            echo "$resp" | jq -r '.results[].name' >> /tmp/hub-tags.txt
+            page=$(echo "$resp" | jq -r '.next')
+            pages=$((pages + 1))
+          done
+
+          : > /tmp/series.txt
+          for major in $MYSQL_SUPPORTED_MAJORS; do
+            found=$(grep -E "^${major}\.[0-9]+$" /tmp/hub-tags.txt | sort -uV)
+            if [ -z "$found" ]; then
+              # Anti-shrink: an empty result for a supported major means the
+              # discovery is broken (API change, filter regression), not that
+              # the major vanished upstream — fail loudly rather than
+              # silently stop building its series.
+              echo "no X.Y series discovered for supported major ${major}" >&2
+              exit 1
+            fi
+            echo "$found" >> /tmp/series.txt
+          done
+
+          echo "discovered series:"
+          cat /tmp/series.txt
+
+          echo "series=$(jq -Rnc '[inputs]' < /tmp/series.txt)" >> "$GITHUB_OUTPUT"
+
+      # A published :X.Y tag is a build line users are pinned to. If the
+      # discovered set ever fails to cover one (Docker Hub API glitch, filter
+      # regression), that series would silently stop receiving builds — fail
+      # the run instead. Best-effort on the listing side only: a ghcr API
+      # hiccup warns and proceeds so it cannot block image builds. Published
+      # series outside MYSQL_SUPPORTED_MAJORS are exempt, so retiring a major
+      # stays a one-knob policy change.
+      - name: Refuse to shrink the published series set (best-effort)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          endpoint="/orgs/${{ github.repository_owner }}/packages/container/mysql-ha%2Fmysql-wrapper/versions?per_page=100"
+          if published=$(gh api --paginate "$endpoint" --jq '.[].metadata.container.tags[]' 2>/dev/null); then
+            majors_re=$(echo "$MYSQL_SUPPORTED_MAJORS" | tr ' ' '|')
+            published_series=$(echo "$published" | grep -E "^(${majors_re})\.[0-9]+$" | sort -uV || true)
+            missing=""
+            for tag in $published_series; do
+              grep -qx "$tag" /tmp/series.txt || missing="$missing $tag"
+            done
+            if [ -n "$missing" ]; then
+              echo "discovered set does not cover already-published series:$missing" >&2
+              exit 1
+            fi
+            echo "coverage ok: all published series are in the discovered set"
+          else
+            echo "warning: could not list published ghcr tags; skipping coverage guard"
+          fi
 
   # Build Rust binary for mysql-wrapper (AMD64 - alpine, native, fast ~2-3min)
   # The binary is version-agnostic — one build covers all MySQL major versions.
@@ -134,9 +225,22 @@ jobs:
           cache-from: type=gha,scope=haproxy-rust-binaries
           cache-to: type=gha,mode=max,scope=haproxy-rust-binaries
 
-  # Build mysql-wrapper for AMD64 (one image per MySQL version)
+  # Build mysql-wrapper for AMD64 — one continuously rebuilt image per MySQL
+  # `X.Y` series, discovered from Docker Hub each run. A MySQL data dir
+  # cannot be downgraded and series upgrades (8.0 → 8.4 → 9.x) are one-way,
+  # so the platform's HA conversion pins a converted service to its own
+  # `major.minor` series tag; every series a user might be standing on must
+  # therefore be a real build line that keeps receiving upstream patch,
+  # base-image and wrapper (mysql-wrapper entrypoint / health server)
+  # updates for as long as this workflow runs. The hardcoded two-entry
+  # matrix this replaces ("8.4", "9.4") left users on any other series
+  # (8.0, or an innovation series like 9.2) with no published image at all —
+  # their conversion pinned a tag that does not exist.
+  #
+  # MYSQL_SUPPORTED_MAJORS (env, above) is the single policy knob; the
+  # per-series list is never edited by hand.
   build-mysql-wrapper-amd64:
-    needs: [changes, build-rust-binaries-mysql-wrapper-amd64]
+    needs: [changes, build-rust-binaries-mysql-wrapper-amd64, discover-mysql-series]
     if: ${{ needs.changes.outputs['mysql-wrapper'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
@@ -144,8 +248,11 @@ jobs:
       packages: write
 
     strategy:
+      # Each series is an independent build line — one broken series must
+      # not cancel the others' builds.
+      fail-fast: false
       matrix:
-        mysql_version: ["8.4", "9.4"]
+        mysql_version: ${{ fromJson(needs.discover-mysql-series.outputs.series) }}
 
     steps:
       - name: Checkout repository
@@ -165,6 +272,10 @@ jobs:
         id: sha
         run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
+      # Push only the immutable sha tag here; the resolvable :X.Y series tag
+      # is minted below AFTER the bundled-version guard, so a base-image
+      # mixup can never reach a tag the platform pins. No :latest — every
+      # published tag pins an exact MySQL series or commit SHA.
       - name: Build and push mysql-wrapper for amd64
         uses: docker/build-push-action@v5
         with:
@@ -175,13 +286,32 @@ jobs:
             rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/mysql-wrapper-rust-binaries:${{ steps.sha.outputs.short }}
           platforms: linux/amd64
           push: true
-          # No :latest — every published tag pins an exact MySQL version or
-          # commit SHA.
           tags: |
-            ${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}${{ env.BETA_SUFFIX }}
             ${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
-          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}${{ env.BETA_SUFFIX }}
           cache-to: type=inline
+
+      # The tag IS the compatibility contract (the conversion pin trusts that
+      # :8.4 bundles a MySQL 8.4.x), so refuse to publish a build whose base
+      # image bundles anything else rather than poison the tag.
+      - name: Verify the bundled series matches the matrix entry, then publish
+        run: |
+          img="${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
+          version=$(docker run --rm --entrypoint mysqld "$img" --version)
+          echo "bundled: $version"
+          series=$(echo "$version" | sed -nE 's/.*Ver ([0-9]+\.[0-9]+)\..*/\1/p')
+          if [ -z "$series" ]; then
+            echo "could not parse a major.minor out of mysqld --version" >&2
+            exit 1
+          fi
+          if [ "$series" != "${{ matrix.mysql_version }}" ]; then
+            echo "bundled series $series does not match matrix entry ${{ matrix.mysql_version }}" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            -t "${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}${{ env.BETA_SUFFIX }}" \
+            "$img"
 
   # Build haproxy image for AMD64
   build-haproxy-amd64:
