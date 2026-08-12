@@ -51,12 +51,34 @@ pub fn derive_server_id(private_domain: &str) -> u32 {
 /// 50% of the limit, floored at 128MB. Falls back to 512MB when no limit is
 /// readable (local runs). The standalone template hardcodes 1G regardless of
 /// container size, which OOMs small containers and wastes big ones.
-pub fn buffer_pool_bytes(cgroup_limit_bytes: Option<u64>) -> u64 {
+/// `override_mb` (INNODB_BUFFER_POOL_MB) wins over the computation when set —
+/// the same escape hatch redis-ha's MAXMEMORY_MB provides.
+pub fn buffer_pool_bytes(cgroup_limit_bytes: Option<u64>, override_mb: Option<u64>) -> u64 {
     const MIN: u64 = 128 * 1024 * 1024;
     const FALLBACK: u64 = 512 * 1024 * 1024;
+    if let Some(mb) = override_mb {
+        return (mb * 1024 * 1024).max(MIN);
+    }
     match cgroup_limit_bytes {
         Some(limit) => (limit / 2).max(MIN),
         None => FALLBACK,
+    }
+}
+
+/// max_connections from the container's cgroup memory limit: the image
+/// default (151) is low for pooled applications behind the edge, but each
+/// connection costs per-session buffers, so the ceiling must scale with the
+/// container. limit/8MB, clamped to [151, 1000]; image default when no limit
+/// is readable. MYSQL_MAX_CONNECTIONS overrides.
+pub fn max_connections(cgroup_limit_bytes: Option<u64>, override_conns: Option<u64>) -> u64 {
+    const IMAGE_DEFAULT: u64 = 151;
+    const CEILING: u64 = 1000;
+    if let Some(n) = override_conns {
+        return n.max(1);
+    }
+    match cgroup_limit_bytes {
+        Some(limit) => (limit / (8 * 1024 * 1024)).clamp(IMAGE_DEFAULT, CEILING),
+        None => IMAGE_DEFAULT,
     }
 }
 
@@ -91,6 +113,7 @@ pub struct GrConfInput<'a> {
     pub private_domain: &'a str,
     pub mysql_port: u16,
     pub buffer_pool_bytes: u64,
+    pub max_connections: u64,
 }
 
 pub fn render_gr_conf(input: &GrConfInput) -> String {
@@ -109,6 +132,22 @@ log_bin = binlog
 performance_schema = ON
 
 innodb_buffer_pool_size = {buffer_pool}
+max_connections = {max_connections}
+
+# Binlogs are mandatory for Group Replication and the default 30-day expiry
+# can fill a small volume long before it triggers — and a disk-full member
+# keeps reporting ONLINE while it silently stalls the whole group. Three
+# days is plenty for recovery: a rejoining member whose gap outruns the
+# retained binlogs falls back to a clone (the plugin is loaded below).
+binlog_expire_logs_seconds = 259200
+
+# Repeated aborted connections from one host (a crashing client in a tight
+# loop, an aggressive prober) would otherwise trip max_connect_errors and
+# block that host until flush-hosts — the classic "Host is blocked" page.
+# Disabling the host cache removes the blocking behavior entirely without
+# changing grant semantics for adopted volumes (unlike skip_name_resolve,
+# which breaks hostname-based grants).
+host_cache_size = 0
 
 plugin-load-add = group_replication.so
 plugin-load-add = mysql_clone.so
@@ -134,11 +173,27 @@ loose-group_replication_paxos_single_leader = ON
 # caching_sha2_password without client-side TLS certs needs RSA key exchange
 # on the recovery channel.
 loose-group_replication_recovery_get_public_key = ON
+
+# Deliberately left at their defaults — each was weighed, not forgotten:
+#   group_replication_member_expel_timeout (5s): raising it makes transient
+#     blips survivable but delays crash failover by the same amount; the
+#     expelled-healthy-member case is already covered by autorejoin.
+#   group_replication_unreachable_majority_timeout (0 = block): a timeout
+#     unblocks clients hung on a minority primary, but parks the member in
+#     ERROR where rejoining waits on autorejoin's fixed 5-minute cycle; the
+#     /role fence already pulls a minority primary out of routing in one
+#     probe interval.
+#   group_replication_transaction_size_limit (~143MB): transactions above it
+#     are refused, which is the safe behavior — raising it invites
+#     group-wide stalls (flow control) on bulk imports.
+#   auto_increment_increment: single-primary Group Replication pins it to 1
+#     (offset 2) by itself; only multi-primary uses the 7-step spacing.
 "#,
         server_id = input.server_id,
         private_domain = input.private_domain,
         mysql_port = input.mysql_port,
         buffer_pool = input.buffer_pool_bytes,
+        max_connections = input.max_connections,
         group_name = input.group_name,
         gr_seeds = input.gr_seeds,
     )
@@ -152,13 +207,15 @@ pub fn write_gr_conf(config: &Config, group_name: &str, server_id: u32) -> Resul
         .gr_seeds
         .as_deref()
         .expect("write_gr_conf is only called in HA mode");
+    let cgroup_limit = read_cgroup_memory_limit();
     let content = render_gr_conf(&GrConfInput {
         server_id,
         group_name,
         gr_seeds: seeds,
         private_domain: &config.private_domain,
         mysql_port: config.mysql_port,
-        buffer_pool_bytes: buffer_pool_bytes(read_cgroup_memory_limit()),
+        buffer_pool_bytes: buffer_pool_bytes(cgroup_limit, config.innodb_buffer_pool_mb),
+        max_connections: max_connections(cgroup_limit, config.mysql_max_connections),
     });
 
     let path = Path::new(&config.conf_dir).join(CONF_FILE_NAME);
@@ -180,6 +237,7 @@ mod tests {
             private_domain: "mysql-1.railway.internal",
             mysql_port: 3306,
             buffer_pool_bytes: 536870912,
+            max_connections: 500,
         })
     }
 
@@ -201,6 +259,9 @@ mod tests {
             "plugin-load-add = group_replication.so",
             "plugin-load-add = mysql_clone.so",
             "innodb_buffer_pool_size = 536870912",
+            "max_connections = 500",
+            "binlog_expire_logs_seconds = 259200",
+            "host_cache_size = 0",
             "report_host = mysql-1.railway.internal",
         ] {
             assert!(conf.contains(directive), "missing directive: {directive}");
@@ -220,12 +281,33 @@ mod tests {
     fn buffer_pool_sizing_clamps() {
         // 50% of the limit…
         assert_eq!(
-            buffer_pool_bytes(Some(2 * 1024 * 1024 * 1024)),
+            buffer_pool_bytes(Some(2 * 1024 * 1024 * 1024), None),
             1024 * 1024 * 1024
         );
         // …floored at 128MB…
-        assert_eq!(buffer_pool_bytes(Some(100 * 1024 * 1024)), 128 * 1024 * 1024);
+        assert_eq!(
+            buffer_pool_bytes(Some(100 * 1024 * 1024), None),
+            128 * 1024 * 1024
+        );
         // …with a 512MB fallback when unlimited.
-        assert_eq!(buffer_pool_bytes(None), 512 * 1024 * 1024);
+        assert_eq!(buffer_pool_bytes(None, None), 512 * 1024 * 1024);
+        // The override wins over any limit, still floored.
+        assert_eq!(
+            buffer_pool_bytes(Some(8 * 1024 * 1024 * 1024), Some(256)),
+            256 * 1024 * 1024
+        );
+        assert_eq!(buffer_pool_bytes(None, Some(1)), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_connections_scales_with_the_container() {
+        // limit/8MB, clamped to [151, 1000]; image default when unknown.
+        assert_eq!(max_connections(Some(1024 * 1024 * 1024), None), 151);
+        assert_eq!(max_connections(Some(4 * 1024 * 1024 * 1024), None), 512);
+        assert_eq!(max_connections(Some(32 * 1024 * 1024 * 1024), None), 1000);
+        assert_eq!(max_connections(None, None), 151);
+        // The override wins, unclamped above but never zero.
+        assert_eq!(max_connections(Some(1024 * 1024 * 1024), Some(2000)), 2000);
+        assert_eq!(max_connections(None, Some(0)), 1);
     }
 }

@@ -903,6 +903,8 @@ mod tests {
             conf_dir: "/tmp".to_string(),
             peer_query_timeout_ms: 100,
             bootstrap_dwell_seconds: 1,
+            innodb_buffer_pool_mb: None,
+            mysql_max_connections: None,
         }
     }
 }
