@@ -768,6 +768,14 @@ t_sigterm_primary_demotes_before_exit() {
 
 t_deleted_peer_unfences_bootstrap() {
   log "t_deleted_peer_unfences_bootstrap (scale-down must not wedge total-outage recovery)"
+  # The previous scenario in the chain leaves its unsuffixed trio running
+  # (several scenarios end without a teardown, by design, so the next one
+  # can reuse a live group). Switching NODE_SUFFIX below would make
+  # teardown_trio target the WRONG names and leave that trio running
+  # alongside this one — six live mysqld processes fighting over CPU/RAM
+  # instead of three, which is exactly what timed the group formation out
+  # in CI. Tear it down under its real identity first.
+  teardown_trio
   local old_suffix="${NODE_SUFFIX:-}" old_seeds="$SEEDS"
   NODE_SUFFIX=".wv.e2e.invalid"
   SEEDS="mysql-1$NODE_SUFFIX:3306,mysql-2$NODE_SUFFIX:3306,mysql-3$NODE_SUFFIX:3306"
@@ -831,6 +839,10 @@ t_deleted_peer_unfences_bootstrap() {
 
 t_paused_peer_keeps_the_fence() {
   log "t_paused_peer_keeps_the_fence (a partitioned peer must never read as deleted)"
+  # Defensive, same reasoning as t_deleted_peer_unfences_bootstrap: never
+  # switch NODE_SUFFIX before clearing out whatever identity is currently
+  # live, or teardown_trio below targets the wrong names.
+  teardown_trio
   local old_suffix="${NODE_SUFFIX:-}" old_seeds="$SEEDS"
   NODE_SUFFIX=".pf.e2e.invalid"
   SEEDS="mysql-1$NODE_SUFFIX:3306,mysql-2$NODE_SUFFIX:3306,mysql-3$NODE_SUFFIX:3306"
@@ -862,7 +874,18 @@ t_paused_peer_keeps_the_fence() {
     && ok "fence held past the dwell for a paused (partitioned) peer ($codes)" \
     || bad "a survivor bootstrapped past a merely-partitioned peer ($codes)"
 
+  # Unpausing alone does not heal this: node3's in-memory view is frozen at
+  # "2 peers UNREACHABLE", and expelling them is itself a membership change
+  # that requires a majority to commit — which a lone member can never
+  # reach on its own. This is Group Replication's real, documented safety
+  # property (losing majority needs explicit reconfiguration), not a bug in
+  # the waiver this scenario exists to test. A restart is what actually
+  # recovers it: node3 drops its stale view and goes through the same
+  # dynamic-candidacy bootstrap guard as node1/node2 already did, discovers
+  # no live group anywhere, and the group re-forms via the tie-break
+  # already proven by t_group_forms_and_replicates.
   docker unpause "$n3" >/dev/null
+  docker restart "$n3" >/dev/null
   wait_until 300 "full group re-forms after the partition heals" group_is_fully_online "$n1" \
     || { bad "group never re-formed after unpause"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
   ok "full group re-formed once the partition healed"
