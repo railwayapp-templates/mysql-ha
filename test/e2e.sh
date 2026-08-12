@@ -705,6 +705,107 @@ t_password_variable_edit_does_not_rotate() {
     || bad "no drift warning in the wrapper log"
 }
 
+# switchover_code <from-node> <target-node> — HTTP status class of POST
+# /switchover (200|503). wget's --post-data with an empty body issues the
+# POST the endpoint expects.
+switchover_code() {
+  if docker exec "$1" wget -q -O /dev/null --post-data="" "http://$2:8080/switchover" 2>/dev/null; then
+    echo 200
+  else
+    echo 503
+  fi
+}
+
+t_switchover_promotes_requested_node() {
+  log "t_switchover_promotes_requested_node (the marquee button must move the primary where asked)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (40,'pre-switchover') ON DUPLICATE KEY UPDATE v='pre-switchover';"
+
+  local old_primary
+  old_primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; return; }
+  local target
+  for target in mysql-1 mysql-2 mysql-3; do
+    [ "$target" != "$old_primary" ] && break
+  done
+
+  # The REQUESTED node — not merely some node — must win.
+  [ "$(switchover_code mysql-2 "$target")" = "200" ] \
+    && ok "switchover to $target answered 200" \
+    || { bad "switchover to $target refused"; return; }
+  [ "$(role_code mysql-2 "$target")" = "200" ] \
+    && ok "requested node $target is the writable primary" \
+    || bad "requested node $target did not become primary"
+  [ "$(role_code mysql-2 "$old_primary")" = "503" ] \
+    && ok "outgoing primary $old_primary demoted" \
+    || bad "outgoing primary $old_primary still answers as primary (split view)"
+
+  # Idempotence: asking the current primary again is a 200 no-op.
+  [ "$(switchover_code mysql-2 "$target")" = "200" ] \
+    && ok "switchover to the current primary is a 200 no-op" \
+    || bad "switchover to the current primary errored"
+
+  # Writes land on the new primary and replicate; then a switchover back
+  # proves no state leaked from the first one.
+  sql "$target" "INSERT INTO t.kv VALUES (41,'post-switchover') ON DUPLICATE KEY UPDATE v='post-switchover';"
+  wait_until 60 "post-switchover write replicated" \
+    bash -c '[ "$(docker exec '"$old_primary"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=41" 2>/dev/null)" = "post-switchover" ]' \
+    || { bad "post-switchover write never replicated"; return; }
+  ok "writes flow on the promoted node"
+
+  [ "$(switchover_code mysql-2 "$old_primary")" = "200" ] && [ "$(role_code mysql-2 "$old_primary")" = "200" ] \
+    && ok "switchover back to $old_primary works (no leaked state)" \
+    || bad "second switchover back to $old_primary failed"
+}
+
+t_wiped_primary_volume_rejoins_fresh() {
+  log "t_wiped_primary_volume_rejoins_fresh (losing the primary's volume must not lose the cluster)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; return; }
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (50,'survives-wipe') ON DUPLICATE KEY UPDATE v='survives-wipe';"
+  wait_until 60 "seed write replicated" \
+    bash -c '[ "$(docker exec mysql-2 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=50" 2>/dev/null)" = "survives-wipe" ]' \
+    || { bad "seed write never replicated"; return; }
+
+  # The primary's container AND volume disappear while the group is live —
+  # a dead-disk replacement. The survivors keep quorum (2 of 3).
+  local n; n="${primary#mysql-}"
+  docker rm -f "$primary" >/dev/null 2>&1
+  docker volume rm "mysql-ha-e2e-vol-$n" >/dev/null 2>&1
+
+  local probe
+  probe=$([ "$primary" = "mysql-2" ] && echo mysql-3 || echo mysql-2)
+  wait_until 120 "survivors elect a new primary" \
+    bash -c 'docker exec '"$probe"' wget -q -O /dev/null http://mysql-1:8080/role 2>/dev/null || docker exec '"$probe"' wget -q -O /dev/null http://mysql-2:8080/role 2>/dev/null || docker exec '"$probe"' wget -q -O /dev/null http://mysql-3:8080/role 2>/dev/null' \
+    || { bad "no survivor took over as primary"; return; }
+  ok "survivors kept serving through the volume loss"
+
+  # A fresh replacement boots at the same name with an empty volume and must
+  # come back as a SECONDARY holding the data (recovery/clone), never as a
+  # competing empty primary.
+  start_node "$n"
+  wait_until 420 "replacement rejoins the group" group_is_fully_online "$probe" \
+    || { bad "fresh replacement never rejoined"; return; }
+  wait_until 120 "data recovered onto the replacement" \
+    bash -c '[ "$(docker exec '"$primary"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=50" 2>/dev/null)" = "survives-wipe" ]' \
+    || { bad "replacement did not recover the dataset"; return; }
+  ok "replacement recovered the dataset"
+
+  local codes
+  codes="$(role_code "$probe" mysql-1)/$(role_code "$probe" mysql-2)/$(role_code "$probe" mysql-3)"
+  local n200
+  n200="$(echo "$codes" | tr '/' '\n' | grep -c 200)"
+  [ "$n200" = "1" ] \
+    && ok "exactly one primary after the replacement ($codes)" \
+    || bad "expected exactly one primary, got $codes"
+}
+
 # ---------------------------------------------------------------------------
 
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
@@ -712,7 +813,7 @@ t_password_variable_edit_does_not_rotate() {
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
 # row. The two outage-recovery tests teardown and seed their own trios, so
 # they sit safely between the chain and the cross-version finale.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image
