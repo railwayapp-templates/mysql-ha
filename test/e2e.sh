@@ -646,6 +646,65 @@ t_first_seed_permanent_loss() {
     || bad "expected exactly one primary, got $all_codes"
 }
 
+t_password_variable_edit_does_not_rotate() {
+  log "t_password_variable_edit_does_not_rotate (env drift must not lock the wrapper out)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (10,'before-drift') ON DUPLICATE KEY UPDATE v='before-drift';"
+
+  # A fresh cluster must have persisted the pin — that is what survives the
+  # variable edit below.
+  docker exec mysql-1 test -f /var/lib/mysql/.railway_active_root_password \
+    && ok "active-password pin persisted on the volume" \
+    || bad "pin file missing after a healthy boot"
+
+  # "Edit the variable": every node redeploys with a NEW env password while
+  # the datadir keeps enforcing the real one (docker-entrypoint only applies
+  # MYSQL_ROOT_PASSWORD at first init). Pre-pin, this locked the wrapper out
+  # of its own mysqld on all three nodes at once: /health and /role both
+  # 503'd everywhere and HAProxy dropped the whole backend set.
+  docker rm -f mysql-1 mysql-2 mysql-3 >/dev/null 2>&1
+  local real_pw="$ROOT_PW"
+  ROOT_PW="rotated-by-variable-edit"
+  start_trio
+  ROOT_PW="$real_pw"
+
+  # The wait itself is the assertion: online_members authenticates with the
+  # ORIGINAL password, and /role can only answer 200 if the wrapper's own
+  # connection (pinned) works.
+  wait_until 300 "group re-forms on the pinned password" group_is_fully_online mysql-1 \
+    || { bad "group never re-formed after the variable edit (wrapper locked out?)"; return; }
+
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" \
+    && ok "a writable primary is being served ($primary)" \
+    || { bad "no node answers /role 200 after the variable edit"; return; }
+
+  [ "$(sql mysql-1 "SELECT v FROM t.kv WHERE k=10")" = "before-drift" ] \
+    && ok "original password still authenticates and the data is intact" \
+    || bad "original password no longer reads the dataset"
+
+  # The drifted value must NOT have become the live credential.
+  if docker exec mysql-1 mysql -uroot -p"rotated-by-variable-edit" -e "SELECT 1" >/dev/null 2>&1; then
+    bad "the drifted env password authenticates — the edit rotated the live credential"
+  else
+    ok "the drifted env password does not authenticate (edit was a no-op)"
+  fi
+
+  # Writes still flow and replicate on the pinned credential.
+  sql "$primary" "INSERT INTO t.kv VALUES (11,'after-drift') ON DUPLICATE KEY UPDATE v='after-drift';"
+  wait_until 60 "post-drift write replicated" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=11" 2>/dev/null)" = "after-drift" ]' \
+    || { bad "post-drift write never replicated"; return; }
+  ok "writes replicate after the drifted redeploy"
+
+  docker logs mysql-1 2>&1 | grep -q "MYSQL_ROOT_PASSWORD differs from the active root password" \
+    && ok "wrapper warned about the drifted variable" \
+    || bad "no drift warning in the wrapper log"
+}
+
 # ---------------------------------------------------------------------------
 
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
@@ -653,7 +712,7 @@ t_first_seed_permanent_loss() {
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
 # row. The two outage-recovery tests teardown and seed their own trios, so
 # they sit safely between the chain and the cross-version finale.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

@@ -25,6 +25,7 @@ mod config;
 mod gr;
 mod health_server;
 mod mysql_conf;
+mod password_pin;
 mod peers;
 mod process_manager;
 mod sql;
@@ -51,7 +52,20 @@ async fn main() -> Result<()> {
         "starting mysql-wrapper"
     );
 
-    let sql = sql::Sql::connect_root_over_socket(&config.socket_path, &config.mysql_root_password);
+    // The pool starts on the pinned password when one exists and disagrees
+    // with the environment — a drifted MYSQL_ROOT_PASSWORD edit must not lock
+    // the wrapper out of its own mysqld (see password_pin.rs). The resolver
+    // task then proves the active password against the live server, swaps the
+    // pool if needed, and refreshes the pin.
+    let boot_pin = password_pin::read_pin(&config.data_dir);
+    let boot_password =
+        password_pin::initial_password(&config.mysql_root_password, boot_pin.as_deref());
+    let sql = sql::Sql::connect_root_over_socket(&config.socket_path, &boot_password);
+    tokio::spawn(password_pin::resolve_and_apply(
+        config.clone(),
+        sql.clone(),
+        telemetry.clone(),
+    ));
 
     if config.gr_enabled() {
         let group_name = gr::resolve_group_name(&config);

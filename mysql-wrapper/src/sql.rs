@@ -9,9 +9,12 @@
 use anyhow::{anyhow, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::{Opts, OptsBuilder, Pool};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 const SHORT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+const PASSWORD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberRow {
@@ -23,19 +26,79 @@ pub struct MemberRow {
 
 #[derive(Clone)]
 pub struct Sql {
-    pool: Pool,
+    socket_path: Arc<String>,
+    /// Swappable: the pool is built with the boot-time password guess, and
+    /// the password-pin resolver replaces it once it has proven which
+    /// password mysqld actually enforces (see password_pin.rs). Every clone
+    /// of this handle observes the swap.
+    pool: Arc<RwLock<Pool>>,
+}
+
+fn root_opts(socket_path: &str, root_password: &str) -> Opts {
+    OptsBuilder::default()
+        .socket(Some(socket_path))
+        .user(Some("root"))
+        .pass(Some(root_password))
+        .into()
+}
+
+/// Outcome of a single-connection authentication probe, distinguishing "the
+/// password is wrong" from "mysqld is not up yet" — the password-pin resolver
+/// must never treat a booting server as a credential verdict.
+#[derive(Debug)]
+pub enum RootPasswordProbe {
+    Works,
+    AccessDenied,
+    NotReady(String),
+}
+
+/// Try one throwaway connection with the given password. Kept off the shared
+/// pool on purpose: probing candidates must not poison pooled connections.
+pub async fn probe_root_password(socket_path: &str, password: &str) -> RootPasswordProbe {
+    let attempt = async {
+        let mut conn = mysql_async::Conn::new(root_opts(socket_path, password)).await?;
+        conn.query_drop("SELECT 1").await?;
+        conn.disconnect().await?;
+        Ok::<_, mysql_async::Error>(())
+    };
+    match tokio::time::timeout(PASSWORD_PROBE_TIMEOUT, attempt).await {
+        Ok(Ok(())) => RootPasswordProbe::Works,
+        // ER_ACCESS_DENIED_ERROR — the server is up and rejected the
+        // credential. Anything else (refused socket, timeout, init still
+        // running) is indistinguishable from "not booted yet".
+        Ok(Err(mysql_async::Error::Server(e))) if e.code == 1045 => {
+            RootPasswordProbe::AccessDenied
+        }
+        Ok(Err(e)) => RootPasswordProbe::NotReady(e.to_string()),
+        Err(_) => RootPasswordProbe::NotReady("probe timed out".to_string()),
+    }
 }
 
 impl Sql {
     pub fn connect_root_over_socket(socket_path: &str, root_password: &str) -> Self {
-        let opts: Opts = OptsBuilder::default()
-            .socket(Some(socket_path))
-            .user(Some("root"))
-            .pass(Some(root_password))
-            .into();
         Self {
-            pool: Pool::new(opts),
+            socket_path: Arc::new(socket_path.to_string()),
+            pool: Arc::new(RwLock::new(Pool::new(root_opts(socket_path, root_password)))),
         }
+    }
+
+    /// Rebuild the pool with a different root password (the pin resolver's
+    /// one call). The old pool is drained in the background — its broken
+    /// connections must not linger under the new identity.
+    pub async fn swap_root_password(&self, root_password: &str) {
+        let new_pool = Pool::new(root_opts(&self.socket_path, root_password));
+        let old_pool = {
+            let mut guard = self.pool.write().await;
+            std::mem::replace(&mut *guard, new_pool)
+        };
+        tokio::spawn(async move {
+            let _ = old_pool.disconnect().await;
+        });
+    }
+
+    async fn conn(&self) -> Result<mysql_async::Conn> {
+        let pool = self.pool.read().await.clone();
+        Ok(pool.get_conn().await?)
     }
 
     async fn short<T>(
@@ -49,7 +112,7 @@ impl Sql {
 
     pub async fn ping(&self) -> Result<()> {
         self.short(async {
-            let mut conn = self.pool.get_conn().await?;
+            let mut conn = self.conn().await?;
             conn.query_drop("SELECT 1").await?;
             Ok(())
         })
@@ -62,7 +125,7 @@ impl Sql {
     /// against it.
     pub async fn is_init_temp_server(&self) -> Result<bool> {
         self.short(async {
-            let mut conn = self.pool.get_conn().await?;
+            let mut conn = self.conn().await?;
             let skip: Option<i64> = conn.query_first("SELECT @@skip_networking").await?;
             Ok(skip == Some(1))
         })
@@ -75,7 +138,7 @@ impl Sql {
     /// setup SQL must stay writable.
     pub async fn set_super_read_only(&self) -> Result<()> {
         self.short(async {
-            let mut conn = self.pool.get_conn().await?;
+            let mut conn = self.conn().await?;
             conn.query_drop("SET GLOBAL super_read_only = ON").await?;
             Ok(())
         })
@@ -93,7 +156,7 @@ impl Sql {
     /// InnoDB Cluster's own provisioning (dba.configureInstance) does.
     pub async fn reset_fresh_instance_gtid_history(&self) -> Result<()> {
         self.short(async {
-            let mut conn = self.pool.get_conn().await?;
+            let mut conn = self.conn().await?;
             // 8.4+/9.x syntax first; RESET MASTER for anything older.
             if conn.query_drop("RESET BINARY LOGS AND GTIDS").await.is_err() {
                 conn.query_drop("RESET MASTER").await?;
@@ -105,7 +168,7 @@ impl Sql {
 
     pub async fn server_uuid(&self) -> Result<String> {
         self.short(async {
-            let mut conn = self.pool.get_conn().await?;
+            let mut conn = self.conn().await?;
             let uuid: Option<String> = conn.query_first("SELECT @@server_uuid").await?;
             uuid.context("@@server_uuid returned no row")
         })
@@ -116,7 +179,7 @@ impl Sql {
     /// Group Replication has never been started on this node.
     pub async fn group_members(&self) -> Result<Vec<MemberRow>> {
         self.short(async {
-            let mut conn = self.pool.get_conn().await?;
+            let mut conn = self.conn().await?;
             let rows: Vec<(String, Option<String>, String, String)> = conn
                 .query(
                     "SELECT MEMBER_ID, MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE \
@@ -140,7 +203,7 @@ impl Sql {
     /// pretty-prints it with newlines).
     pub async fn executed_gtid_set(&self) -> Result<String> {
         self.short(async {
-            let mut conn = self.pool.get_conn().await?;
+            let mut conn = self.conn().await?;
             let set: Option<String> = conn.query_first("SELECT @@GLOBAL.gtid_executed").await?;
             Ok(set
                 .unwrap_or_default()
@@ -157,7 +220,7 @@ impl Sql {
     /// lacks). Empty sets need no special-casing — GTID_SUBSET('', X) is 1.
     pub async fn gtid_compare(&self, mine: &str, peer: &str) -> Result<(bool, bool)> {
         self.short(async {
-            let mut conn = self.pool.get_conn().await?;
+            let mut conn = self.conn().await?;
             let row: Option<(i64, i64)> = conn
                 .exec_first(
                     "SELECT GTID_SUBSET(?, ?), GTID_SUBSET(?, ?)",
@@ -186,7 +249,7 @@ impl Sql {
         let user_lit = sql_string_literal(user);
         let pass_lit = sql_string_literal(password);
         // All statements on ONE connection: sql_log_bin is session-scoped.
-        let mut conn = self.pool.get_conn().await?;
+        let mut conn = self.conn().await?;
         conn.query_drop("SET SESSION sql_log_bin = 0").await?;
         conn.query_drop(format!(
             "CREATE USER IF NOT EXISTS {user_lit}@'%' IDENTIFIED BY {pass_lit}"
@@ -213,7 +276,7 @@ impl Sql {
     pub async fn configure_recovery_channel(&self, user: &str, password: &str) -> Result<()> {
         let user_lit = sql_string_literal(user);
         let pass_lit = sql_string_literal(password);
-        let mut conn = self.pool.get_conn().await?;
+        let mut conn = self.conn().await?;
         conn.query_drop(format!(
             "CHANGE REPLICATION SOURCE TO SOURCE_USER = {user_lit}, \
              SOURCE_PASSWORD = {pass_lit} FOR CHANNEL 'group_replication_recovery'"
@@ -225,7 +288,7 @@ impl Sql {
     /// Bootstrap a brand-new group from this node. Only the orchestrator's
     /// guarded path calls this.
     pub async fn bootstrap_group(&self) -> Result<()> {
-        let mut conn = self.pool.get_conn().await?;
+        let mut conn = self.conn().await?;
         conn.query_drop("SET GLOBAL group_replication_bootstrap_group = ON")
             .await?;
         let start = conn.query_drop("START GROUP_REPLICATION").await;
@@ -243,7 +306,7 @@ impl Sql {
     /// supervisor exits the container — the next boot comes up with the
     /// cloned datadir and joins cleanly. Expected, documented behavior.
     pub async fn start_group_replication(&self) -> Result<()> {
-        let mut conn = self.pool.get_conn().await?;
+        let mut conn = self.conn().await?;
         conn.query_drop("START GROUP_REPLICATION").await?;
         Ok(())
     }
@@ -256,7 +319,7 @@ impl Sql {
     /// `short()` — the caller owns the deadline, like
     /// `start_group_replication`.
     pub async fn set_as_primary(&self, uuid: &str, timeout_secs: u32) -> Result<()> {
-        let mut conn = self.pool.get_conn().await?;
+        let mut conn = self.conn().await?;
         conn.query_drop(format!(
             "SELECT group_replication_set_as_primary({}, {timeout_secs})",
             sql_string_literal(uuid)
@@ -272,7 +335,7 @@ impl Sql {
     /// deletion of the adopting node itself — unlike a file marker, which a
     /// clone-recreated datadir loses.
     pub async fn set_group_pre_gtid_flag(&self) -> Result<()> {
-        let mut conn = self.pool.get_conn().await?;
+        let mut conn = self.conn().await?;
         conn.query_drop("CREATE SCHEMA IF NOT EXISTS railway_ha").await?;
         conn.query_drop(
             "CREATE TABLE IF NOT EXISTS railway_ha.meta \
@@ -291,7 +354,7 @@ impl Sql {
     /// doesn't exist (plain groups never create it).
     pub async fn group_pre_gtid_flag(&self) -> bool {
         self.short(async {
-            let mut conn = self.pool.get_conn().await?;
+            let mut conn = self.conn().await?;
             let v: Option<String> = conn
                 .query_first("SELECT v FROM railway_ha.meta WHERE k = 'pre_gtid_data'")
                 .await
@@ -323,7 +386,7 @@ impl Sql {
         password: &str,
     ) -> Result<()> {
         let donor = format!("{donor_host}:{donor_port}");
-        let mut conn = self.pool.get_conn().await?;
+        let mut conn = self.conn().await?;
         // CLONE INSTANCE replaces the datadir, so it is a write — the write
         // fence (super_read_only, set at boot) blocks it with ERROR 1290.
         // Lift it just for the clone. Safe: this node is not in the group and
