@@ -905,6 +905,7 @@ mod tests {
             bootstrap_dwell_seconds: 1,
             innodb_buffer_pool_mb: None,
             mysql_max_connections: None,
+            demote_timeout_ms: 20_000,
         }
     }
 }

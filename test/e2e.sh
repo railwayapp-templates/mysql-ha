@@ -705,6 +705,56 @@ t_password_variable_edit_does_not_rotate() {
     || bad "no drift warning in the wrapper log"
 }
 
+t_sigterm_primary_demotes_before_exit() {
+  log "t_sigterm_primary_demotes_before_exit (planned shutdown = switchover, not timeout failover)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local old_primary
+  old_primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" \
+    || { bad "no primary to stop"; return; }
+  sql "$old_primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (30,'before-demote') ON DUPLICATE KEY UPDATE v='before-demote';"
+
+  # Planned shutdown: SIGTERM with a stop budget above the demote deadline
+  # (20s) plus mysqld's own exit (docker's default 10s would SIGKILL through
+  # the handoff).
+  docker stop -t 60 "$old_primary" >/dev/null
+
+  docker logs "$old_primary" 2>&1 | grep -q "demoted before shutdown: primary handed off" \
+    && ok "outgoing primary handed the role off before exiting" \
+    || bad "no demote-on-shutdown log line — shutdown paid a timeout failover"
+
+  # The handoff is synchronous inside the stop: a survivor must already be
+  # (or within seconds become) the writable primary.
+  local survivors=()
+  local n
+  for n in mysql-1 mysql-2 mysql-3; do
+    [ "$n" != "$old_primary" ] && survivors+=("$n")
+  done
+  new_primary_is_serving() { current_primary "${survivors[0]}" "${survivors[@]}" >/dev/null; }
+  wait_until 60 "a survivor serves as primary" new_primary_is_serving \
+    || { bad "no survivor became primary after the planned shutdown"; return; }
+  local new_primary
+  new_primary="$(current_primary "${survivors[0]}" "${survivors[@]}")"
+  ok "survivor $new_primary is the writable primary"
+
+  sql "$new_primary" "INSERT INTO t.kv VALUES (31,'after-demote') ON DUPLICATE KEY UPDATE v='after-demote';"
+
+  # The old primary rejoins as a SECONDARY — no failback, and the data
+  # written while it was away reaches it.
+  docker start "$old_primary" >/dev/null
+  wait_until 300 "full group re-forms" group_is_fully_online "$new_primary" \
+    || { bad "old primary never rejoined"; return; }
+  [ "$(role_code "$new_primary" "$old_primary")" = "503" ] \
+    && ok "old primary rejoined as a secondary (no failback)" \
+    || bad "old primary reclaimed the primary role on rejoin"
+  wait_until 60 "away-write replicated to the rejoined node" \
+    bash -c '[ "$(docker exec '"$old_primary"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=31" 2>/dev/null)" = "after-demote" ]' \
+    || { bad "write from the away window never reached the rejoined node"; return; }
+  ok "rejoined node caught up with the away-window write"
+}
+
 # switchover_code <from-node> <target-node> — HTTP status class of POST
 # /switchover (200|503). wget's --post-data with an empty body issues the
 # POST the endpoint expects.
@@ -813,7 +863,7 @@ t_wiped_primary_volume_rejoins_fresh() {
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
 # row. The two outage-recovery tests teardown and seed their own trios, so
 # they sit safely between the chain and the cross-version finale.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

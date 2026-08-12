@@ -34,7 +34,16 @@ pub async fn spawn_mysqld(args: &[String]) -> Result<Child> {
 /// Supervise the mysqld child: forward SIGTERM/SIGINT and wait for a graceful
 /// exit, or exit the container immediately (with the child's own code) if it
 /// dies on its own.
-pub async fn supervise(mut child: Child) -> Result<()> {
+///
+/// `demote` — present in HA mode only: hand the primary role off through the
+/// group BEFORE mysqld is signaled, so a planned shutdown is a consensual
+/// switchover rather than a detection-timeout failover (see
+/// demote_on_shutdown.rs). Runs while mysqld is still healthy; a failure
+/// there never blocks the shutdown.
+pub async fn supervise(
+    mut child: Child,
+    demote: Option<crate::demote_on_shutdown::DemoteCtx>,
+) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
@@ -58,12 +67,18 @@ pub async fn supervise(mut child: Child) -> Result<()> {
 
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
+                if let Some(ctx) = &demote {
+                    crate::demote_on_shutdown::demote_if_primary(ctx).await;
+                }
                 graceful_shutdown(pid, &mut child).await;
                 std::process::exit(0);
             }
 
             _ = sigint.recv() => {
                 info!("received SIGINT, shutting down");
+                if let Some(ctx) = &demote {
+                    crate::demote_on_shutdown::demote_if_primary(ctx).await;
+                }
                 graceful_shutdown(pid, &mut child).await;
                 std::process::exit(0);
             }
