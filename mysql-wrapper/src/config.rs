@@ -58,6 +58,12 @@ pub struct Config {
     /// How long the bootstrap decision must hold stable before the candidate
     /// actually bootstraps a brand-new group.
     pub bootstrap_dwell_seconds: u64,
+    /// Override for the cgroup-derived innodb_buffer_pool_size, in MB
+    /// (INNODB_BUFFER_POOL_MB) — redis-ha's MAXMEMORY_MB analog.
+    pub innodb_buffer_pool_mb: Option<u64>,
+    /// Override for the cgroup-derived max_connections
+    /// (MYSQL_MAX_CONNECTIONS).
+    pub mysql_max_connections: Option<u64>,
 }
 
 impl Config {
@@ -83,6 +89,10 @@ impl Config {
             conf_dir: String::env_or("MYSQL_CONF_DIR", "/etc/mysql/conf.d"),
             peer_query_timeout_ms: u64::env_parse("PEER_QUERY_TIMEOUT_MS", 2000),
             bootstrap_dwell_seconds: u64::env_parse("BOOTSTRAP_DWELL_SECONDS", 15),
+            innodb_buffer_pool_mb: non_empty(std::env::var("INNODB_BUFFER_POOL_MB").ok())
+                .and_then(|v| v.parse().ok()),
+            mysql_max_connections: non_empty(std::env::var("MYSQL_MAX_CONNECTIONS").ok())
+                .and_then(|v| v.parse().ok()),
         };
 
         if config.gr_enabled() && config.gr_replication_password.is_none() {
