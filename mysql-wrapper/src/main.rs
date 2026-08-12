@@ -22,6 +22,7 @@
 //! runs in while it still uses this image.
 
 mod config;
+mod demote_on_shutdown;
 mod gr;
 mod health_server;
 mod mysql_conf;
@@ -120,5 +121,14 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let child = process_manager::spawn_mysqld(&args).await?;
 
-    process_manager::supervise(child).await
+    // HA mode: hand the primary role off before mysqld is signaled, so a
+    // planned shutdown is a switchover, not a detection-timeout failover.
+    let demote = config
+        .gr_enabled()
+        .then(|| demote_on_shutdown::DemoteCtx {
+            sql: sql.clone(),
+            deadline_ms: config.demote_timeout_ms,
+        });
+
+    process_manager::supervise(child, demote).await
 }
