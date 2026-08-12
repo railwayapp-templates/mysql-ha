@@ -51,21 +51,26 @@ ensure_network() {
 # shape the Railway template stamps. NODE_IMAGE overrides the image for this
 # one call (patch-skew scenarios boot members on different patch levels, the
 # way a redeploy re-pulling the moving :8.4 tag does in production).
+# NODE_SUFFIX appends to every hostname/alias/container name — the deletion
+# scenarios park their nodes under the reserved `.invalid` TLD so a removed
+# container's name resolves as authoritative NXDOMAIN on any resolver (bare
+# names get environment-dependent answers once the container is gone).
 start_node() {
   local n="$1"; shift
   local image="${NODE_IMAGE:-$IMAGE}"
+  local host="mysql-$n${NODE_SUFFIX:-}"
   docker volume create --label "$LABEL" "mysql-ha-e2e-vol-$n" >/dev/null
   # --restart unless-stopped mirrors Railway's restart policy — and the clone
   # provisioning path DEPENDS on a restart: the clone recipient replaces its
   # datadir and shuts down, expecting the platform to boot it back up.
   docker run -d --label "$LABEL" --restart unless-stopped \
-    --name "mysql-$n" --hostname "mysql-$n" \
-    --network "$NET" --network-alias "mysql-$n" \
+    --name "$host" --hostname "$host" \
+    --network "$NET" --network-alias "$host" \
     -v "mysql-ha-e2e-vol-$n:/var/lib/mysql" \
     -e MYSQL_ROOT_PASSWORD="$ROOT_PW" \
     -e GR_REPLICATION_PASSWORD="$REPL_PW" \
     -e GR_SEEDS="$SEEDS" \
-    -e RAILWAY_PRIVATE_DOMAIN="mysql-$n" \
+    -e RAILWAY_PRIVATE_DOMAIN="$host" \
     -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
     -e RAILWAY_VOLUME_MOUNT_PATH="/var/lib/mysql" \
     -e BOOTSTRAP_DWELL_SECONDS=5 \
@@ -76,7 +81,8 @@ start_node() {
 start_trio() { start_node 1; start_node 2; start_node 3; }
 
 teardown_trio() {
-  docker rm -f mysql-1 mysql-2 mysql-3 >/dev/null 2>&1
+  local s="${NODE_SUFFIX:-}"
+  docker rm -f "mysql-1$s" "mysql-2$s" "mysql-3$s" >/dev/null 2>&1
   docker volume rm mysql-ha-e2e-vol-1 mysql-ha-e2e-vol-2 mysql-ha-e2e-vol-3 >/dev/null 2>&1
 }
 
@@ -755,6 +761,120 @@ t_sigterm_primary_demotes_before_exit() {
   ok "rejoined node caught up with the away-window write"
 }
 
+# Both waiver scenarios run their trios under the reserved `.invalid` TLD
+# (see start_node's NODE_SUFFIX comment) with a short PEER_GONE_DWELL so the
+# dwell fits a test run. They restore the globals and tear down their
+# suffixed containers on exit.
+
+t_deleted_peer_unfences_bootstrap() {
+  log "t_deleted_peer_unfences_bootstrap (scale-down must not wedge total-outage recovery)"
+  local old_suffix="${NODE_SUFFIX:-}" old_seeds="$SEEDS"
+  NODE_SUFFIX=".wv.e2e.invalid"
+  SEEDS="mysql-1$NODE_SUFFIX:3306,mysql-2$NODE_SUFFIX:3306,mysql-3$NODE_SUFFIX:3306"
+  local n1="mysql-1$NODE_SUFFIX" n2="mysql-2$NODE_SUFFIX" n3="mysql-3$NODE_SUFFIX"
+
+  teardown_trio
+  start_node 1 -e PEER_GONE_DWELL_SECONDS=30
+  start_node 2 -e PEER_GONE_DWELL_SECONDS=30
+  start_node 3 -e PEER_GONE_DWELL_SECONDS=30
+
+  if ! wait_until 300 "3 ONLINE members" group_is_fully_online "$n1"; then
+    bad "group never formed"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return
+  fi
+  sql "$n1" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (20,'survives-scale-down') ON DUPLICATE KEY UPDATE v='survives-scale-down';"
+
+  # Scale-down by deletion: the platform removes the service AND its volume;
+  # GR_SEEDS on the survivors is never restamped.
+  docker rm -f "$n3" >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-3 >/dev/null 2>&1
+  wait_until 120 "group settles at 2 members" has_n_online "$n1" 2 \
+    || { bad "group never expelled the deleted member"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
+
+  # Total outage of the survivors. On restart their bootstrap guard queries
+  # the deleted peer forever — pre-waiver this deadlocked here for good.
+  docker stop "$n1" "$n2" >/dev/null
+  docker start "$n1" "$n2" >/dev/null
+
+  # Fail-closed while the deletion proof accumulates (dwell 30s).
+  sleep 15
+  local codes
+  codes="$(role_code "$n1" "$n1")/$(role_code "$n1" "$n2")"
+  [ "$codes" = "503/503" ] \
+    && ok "survivors hold fail-closed inside the deletion dwell ($codes)" \
+    || bad "a survivor bootstrapped before the deletion was proven ($codes)"
+
+  # Past the dwell the waiver drops the deleted peer from the round and the
+  # data-holding survivor bootstraps.
+  wait_until 240 "survivors re-form past the deleted peer" has_n_online "$n1" 2 \
+    || { bad "survivors never re-formed (deleted-peer wedge)"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
+  ok "survivors re-formed the group without the deleted peer"
+
+  codes="$(role_code "$n1" "$n1")/$(role_code "$n1" "$n2")"
+  local n200
+  n200="$(echo "$codes" | tr '/' '\n' | grep -c 200)"
+  [ "$n200" = "1" ] \
+    && ok "exactly one primary after the waiver recovery ($codes)" \
+    || bad "expected exactly one primary, got $codes"
+
+  [ "$(sql "$n1" "SELECT v FROM t.kv WHERE k=20")" = "survives-scale-down" ] \
+    && ok "dataset survived the scale-down outage recovery" \
+    || bad "dataset missing after the waiver recovery"
+
+  docker logs "$n1" 2>&1 | grep -q "no longer waiting on them" \
+    || docker logs "$n2" 2>&1 | grep -q "no longer waiting on them" \
+    && ok "a survivor logged the deletion waiver" \
+    || bad "no waiver log line on either survivor"
+
+  teardown_trio
+  NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"
+}
+
+t_paused_peer_keeps_the_fence() {
+  log "t_paused_peer_keeps_the_fence (a partitioned peer must never read as deleted)"
+  local old_suffix="${NODE_SUFFIX:-}" old_seeds="$SEEDS"
+  NODE_SUFFIX=".pf.e2e.invalid"
+  SEEDS="mysql-1$NODE_SUFFIX:3306,mysql-2$NODE_SUFFIX:3306,mysql-3$NODE_SUFFIX:3306"
+  local n1="mysql-1$NODE_SUFFIX" n2="mysql-2$NODE_SUFFIX" n3="mysql-3$NODE_SUFFIX"
+
+  teardown_trio
+  start_node 1 -e PEER_GONE_DWELL_SECONDS=30
+  start_node 2 -e PEER_GONE_DWELL_SECONDS=30
+  start_node 3 -e PEER_GONE_DWELL_SECONDS=30
+
+  if ! wait_until 300 "3 ONLINE members" group_is_fully_online "$n1"; then
+    bad "group never formed"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return
+  fi
+  sql "$n1" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (21,'survives-pause') ON DUPLICATE KEY UPDATE v='survives-pause';"
+
+  # Pause = partition with the name still registered: the container stays on
+  # the network, so its name resolves (ExistsOrUnknown) while every probe to
+  # it times out. The waiver must never arm on this.
+  docker pause "$n3" >/dev/null
+  docker stop "$n1" "$n2" >/dev/null
+  docker start "$n1" "$n2" >/dev/null
+
+  # Well past the 30s dwell: the fence must still hold — the paused peer's
+  # dataset can't be compared and its name never proves deletion.
+  sleep 75
+  local codes
+  codes="$(role_code "$n1" "$n1")/$(role_code "$n1" "$n2")"
+  [ "$codes" = "503/503" ] \
+    && ok "fence held past the dwell for a paused (partitioned) peer ($codes)" \
+    || bad "a survivor bootstrapped past a merely-partitioned peer ($codes)"
+
+  docker unpause "$n3" >/dev/null
+  wait_until 300 "full group re-forms after the partition heals" group_is_fully_online "$n1" \
+    || { bad "group never re-formed after unpause"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
+  ok "full group re-formed once the partition healed"
+
+  [ "$(sql "$n1" "SELECT v FROM t.kv WHERE k=21")" = "survives-pause" ] \
+    && ok "dataset survived the partition round-trip" \
+    || bad "dataset missing after the partition healed"
+
+  teardown_trio
+  NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"
+}
+
 # switchover_code <from-node> <target-node> — HTTP status class of POST
 # /switchover (200|503). wget's --post-data with an empty body issues the
 # POST the endpoint expects.
@@ -863,7 +983,7 @@ t_wiped_primary_volume_rejoins_fresh() {
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
 # row. The two outage-recovery tests teardown and seed their own trios, so
 # they sit safely between the chain and the cross-version finale.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

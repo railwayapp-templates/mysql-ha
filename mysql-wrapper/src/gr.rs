@@ -12,6 +12,20 @@
 //!     source of truth. (First deploys don't trip this: health servers come
 //!     up well before mysqld finishes initializing, so peers answer
 //!     "no group, empty GTID set" almost immediately.)
+//!     ONE exception, with proof: a peer whose NAME is authoritatively gone
+//!     (continuous NXDOMAIN for the whole `peer_gone_dwell_seconds`) stops
+//!     being waited on. GR_SEEDS is stamped at deploy time and scale-down
+//!     never restamps the survivors, so a deleted member would otherwise
+//!     freeze every future total-outage recovery forever. The private
+//!     resolver answers NXDOMAIN only when zero live containers are
+//!     registered behind the name; a partition yields SERVFAIL, never
+//!     NXDOMAIN (see dns_probe.rs). Caveat, accepted and shared with
+//!     redis-ha's membership prune: a STOPPED service also has zero live
+//!     containers, so a peer stopped for longer than the dwell during a
+//!     total outage can be waived even though its volume still holds data —
+//!     if it was the most advanced node, its tail writes stay stranded
+//!     until an operator reconciles. The dwell is long precisely to keep
+//!     that window out of ordinary redeploy/restart timelines.
 //!   - NEVER bootstrap unless every reachable peer's executed-GTID set is a
 //!     subset of this node's — after a full outage the most-advanced node
 //!     must be the one to bootstrap, and each node can verify that claim
@@ -32,10 +46,12 @@
 //!     node joins it, candidate or not.
 
 use crate::config::Config;
+use crate::dns_probe::{probe_name_detailed, NameVerdict};
 use crate::peers::{query_peer, GrState, PeerAnswer};
 use crate::sql::{role_is_writable_primary, Sql};
 use anyhow::{Context, Result};
 use common::{RailwayEnv, Telemetry, TelemetryEvent};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -129,6 +145,51 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
         // adopting node's deletion.
         pre_gtid_data: has_pre_gtid_data(data_dir) || sql.group_pre_gtid_flag().await,
     })
+}
+
+/// How long each unreachable peer's NAME has been authoritatively gone.
+///
+/// The bootstrap guard refuses to decide while any declared peer is
+/// unreachable — correct for crashes and partitions, but GR_SEEDS is never
+/// restamped on scale-down, so a DELETED peer would freeze every future
+/// total-outage recovery forever. This tracker turns "unreachable AND its
+/// name has answered NXDOMAIN continuously for the whole dwell" into a
+/// waiver: the peer is dropped from the round, as if it were no longer
+/// declared. Any non-Gone observation (records, NODATA, SERVFAIL, timeout —
+/// see dns_probe.rs for why a partition can't fake Gone) resets its clock,
+/// so the proof must hold uninterrupted.
+struct GoneTracker {
+    gone_since: HashMap<String, Instant>,
+}
+
+impl GoneTracker {
+    fn new() -> Self {
+        Self {
+            gone_since: HashMap::new(),
+        }
+    }
+
+    fn observe(&mut self, host: &str, verdict: NameVerdict, now: Instant) {
+        match verdict {
+            NameVerdict::Gone => {
+                self.gone_since.entry(host.to_string()).or_insert(now);
+            }
+            NameVerdict::ExistsOrUnknown => {
+                self.gone_since.remove(host);
+            }
+        }
+    }
+
+    /// A reachable peer is present again by definition — its clock resets.
+    fn observe_reachable(&mut self, host: &str) {
+        self.gone_since.remove(host);
+    }
+
+    fn is_waived(&self, host: &str, now: Instant, dwell: Duration) -> bool {
+        self.gone_since
+            .get(host)
+            .is_some_and(|since| now.duration_since(*since) >= dwell)
+    }
 }
 
 /// How one peer's dataset relates to this node's, for the bootstrap decision.
@@ -414,6 +475,10 @@ pub async fn orchestrate(
 
     let mut safe_since: Option<Instant> = None;
     let mut last_wait_reason = String::new();
+    let mut gone_tracker = GoneTracker::new();
+    let mut last_waiver_note = String::new();
+    let gone_dwell = Duration::from_secs(config.peer_gone_dwell_seconds);
+    let dns_deadline = Duration::from_millis(config.peer_query_timeout_ms);
 
     loop {
         // Already an active member? (Covers both "join succeeded last
@@ -452,6 +517,49 @@ pub async fn orchestrate(
             futures_join_all(futures).await,
         ) {
             answers.push((host.clone(), answer));
+        }
+
+        // Deletion tracking: an unreachable peer's name is probed against the
+        // resolver; only continuous NXDOMAIN across the whole dwell earns a
+        // waiver (see GoneTracker). Reachable peers reset their clock.
+        let now = Instant::now();
+        for (host, answer) in &answers {
+            if matches!(answer, PeerAnswer::Unreachable) {
+                let (verdict, detail) = probe_name_detailed(host, dns_deadline).await;
+                gone_tracker.observe(host, verdict, now);
+                if verdict == NameVerdict::Gone && !gone_tracker.is_waived(host, now, gone_dwell)
+                {
+                    info!(
+                        %host,
+                        ?detail,
+                        dwell = ?gone_dwell,
+                        "unreachable peer's name is authoritatively gone; will stop waiting on it if this persists for the whole dwell"
+                    );
+                }
+            } else {
+                gone_tracker.observe_reachable(host);
+            }
+        }
+        let waived: Vec<&String> = answers
+            .iter()
+            .filter(|(host, answer)| {
+                matches!(answer, PeerAnswer::Unreachable)
+                    && gone_tracker.is_waived(host, now, gone_dwell)
+            })
+            .map(|(host, _)| host)
+            .collect();
+        let waiver_note = if waived.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "peers {waived:?} are deleted (name gone past the dwell); no longer waiting on them"
+            )
+        };
+        if last_waiver_note != waiver_note {
+            if !waiver_note.is_empty() {
+                warn!("{waiver_note}");
+            }
+            last_waiver_note = waiver_note;
         }
 
         let group_seen = answers
@@ -534,7 +642,19 @@ pub async fn orchestrate(
             }
         };
 
-        match classify_round(&sql, &config, &my_gtid, &answers).await {
+        // Waived (deleted) peers are dropped from the round — as if no
+        // longer declared. A waived host that comes back under the same name
+        // answers again as a fresh empty node, which is exactly the
+        // fresh-first-seed recovery path.
+        let considered: Vec<(String, PeerAnswer)> = answers
+            .into_iter()
+            .filter(|(host, answer)| {
+                !(matches!(answer, PeerAnswer::Unreachable)
+                    && gone_tracker.is_waived(host, now, gone_dwell))
+            })
+            .collect();
+
+        match classify_round(&sql, &config, &my_gtid, &considered).await {
             Ok(BootstrapVerdict::SafeToBootstrap) => {
                 let since = *safe_since.get_or_insert_with(Instant::now);
                 let held = since.elapsed();
@@ -716,6 +836,57 @@ mod tests {
 
     fn equal(pre_gtid_data: bool) -> PeerRelation {
         PeerRelation::Equal { pre_gtid_data }
+    }
+
+    #[test]
+    fn gone_tracker_waives_only_after_a_continuous_dwell() {
+        let dwell = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let mut tracker = GoneTracker::new();
+
+        tracker.observe("mysql-3", NameVerdict::Gone, t0);
+        assert!(!tracker.is_waived("mysql-3", t0, dwell));
+        assert!(!tracker.is_waived("mysql-3", t0 + Duration::from_secs(59), dwell));
+        assert!(tracker.is_waived("mysql-3", t0 + Duration::from_secs(60), dwell));
+
+        // The clock does not restart while Gone persists.
+        tracker.observe("mysql-3", NameVerdict::Gone, t0 + Duration::from_secs(30));
+        assert!(tracker.is_waived("mysql-3", t0 + Duration::from_secs(60), dwell));
+    }
+
+    #[test]
+    fn gone_tracker_resets_on_any_non_gone_observation() {
+        let dwell = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let mut tracker = GoneTracker::new();
+
+        tracker.observe("mysql-3", NameVerdict::Gone, t0);
+        // SERVFAIL/timeout/records all read as ExistsOrUnknown — a partition
+        // or a comeback mid-dwell voids the proof entirely.
+        tracker.observe(
+            "mysql-3",
+            NameVerdict::ExistsOrUnknown,
+            t0 + Duration::from_secs(30),
+        );
+        assert!(!tracker.is_waived("mysql-3", t0 + Duration::from_secs(120), dwell));
+
+        // Starting over requires a full fresh dwell.
+        tracker.observe("mysql-3", NameVerdict::Gone, t0 + Duration::from_secs(40));
+        assert!(!tracker.is_waived("mysql-3", t0 + Duration::from_secs(60), dwell));
+        assert!(tracker.is_waived("mysql-3", t0 + Duration::from_secs(100), dwell));
+    }
+
+    #[test]
+    fn gone_tracker_reachable_peer_resets_and_unknown_host_is_never_waived() {
+        let dwell = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let mut tracker = GoneTracker::new();
+
+        assert!(!tracker.is_waived("mysql-2", t0, dwell));
+
+        tracker.observe("mysql-2", NameVerdict::Gone, t0);
+        tracker.observe_reachable("mysql-2");
+        assert!(!tracker.is_waived("mysql-2", t0 + Duration::from_secs(600), dwell));
     }
 
     #[test]
@@ -906,6 +1077,7 @@ mod tests {
             innodb_buffer_pool_mb: None,
             mysql_max_connections: None,
             demote_timeout_ms: 20_000,
+            peer_gone_dwell_seconds: 1800,
         }
     }
 }

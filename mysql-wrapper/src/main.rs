@@ -23,6 +23,7 @@
 
 mod config;
 mod demote_on_shutdown;
+mod dns_probe;
 mod gr;
 mod health_server;
 mod mysql_conf;
