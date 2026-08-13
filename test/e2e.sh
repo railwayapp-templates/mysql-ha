@@ -1468,8 +1468,34 @@ t_pitr_archive_and_restore_to_point_in_time() {
     && ok "post-T1 row correctly absent after restore (restored exactly to T1, not past it)" \
     || bad "post-T1 row present after restore (got: '$v2') — restored past the target time"
 
-  docker rm -f mysql-pitr-src mysql-pitr-restore mysql-ha-e2e-minio >/dev/null 2>&1
-  docker volume rm mysql-ha-e2e-vol-mysql-pitr-src mysql-ha-e2e-vol-mysql-pitr-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+  # A restore that crashed mid-way must self-heal on the next boot: the
+  # datadir holds only derived state, so the wrapper wipes it and re-runs
+  # the restore instead of crash-looping. Simulate the crash by pre-seeding
+  # a fresh volume with an in-progress marker AND a junk mysql/ schema dir
+  # (so the datadir reads as initialized — proving the wipe actually ran,
+  # not just the uninitialized-dir path).
+  docker rm -f mysql-pitr-crash >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-crash >/dev/null 2>&1
+  docker volume create --label "$LABEL" mysql-ha-e2e-vol-mysql-pitr-crash >/dev/null
+  docker run --rm -v mysql-ha-e2e-vol-mysql-pitr-crash:/var/lib/mysql --entrypoint sh "$IMAGE" -c \
+    'printf "%s" "{\"status\":\"in_progress\",\"target_time\":\"2020-01-01T00:00:00.000Z\",\"updated_at\":\"2020-01-01T00:00:00.000Z\"}" > /var/lib/mysql/.pitr_restore_state.json && mkdir -p /var/lib/mysql/mysql && echo junk > /var/lib/mysql/mysql/ibdata1' \
+    || { bad "could not pre-seed the crashed-restore volume"; return; }
+  start_standalone mysql-pitr-crash "${recover_env[@]}"
+
+  wait_until 180 "crashed-restore boot self-heals and serves" \
+    bash -c 'docker exec mysql-pitr-crash wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "crashed-restore boot never became healthy (should have wiped and retried)"; docker logs mysql-pitr-crash 2>&1 | tail -60; return; }
+  docker logs mysql-pitr-crash 2>&1 | grep -q "wiping the partially-restored data directory" \
+    && ok "crashed mid-restore boot wiped the partial datadir and retried" \
+    || bad "no wipe-and-retry log line on the crashed-restore boot"
+  local v3
+  v3="$(sql mysql-pitr-crash "SELECT v FROM t.kv WHERE k=1")"
+  [ "$v3" = "before-t1" ] \
+    && ok "self-healed restore serves the pre-T1 row" \
+    || bad "self-healed restore missing the pre-T1 row (got: '$v3')"
+
+  docker rm -f mysql-pitr-src mysql-pitr-restore mysql-pitr-crash mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-src mysql-ha-e2e-vol-mysql-pitr-restore mysql-ha-e2e-vol-mysql-pitr-crash mysql-ha-e2e-minio-data >/dev/null 2>&1
 }
 
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start

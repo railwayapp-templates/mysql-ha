@@ -26,7 +26,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-const RUNTIME_LOCK_FILE: &str = ".railway-mysql-runtime.lock";
+pub(crate) const RUNTIME_LOCK_FILE: &str = ".railway-mysql-runtime.lock";
 const DEFAULT_WAIT_SECS: u64 = 300;
 
 /// Acquire the exclusive volume runtime lock, waiting up to

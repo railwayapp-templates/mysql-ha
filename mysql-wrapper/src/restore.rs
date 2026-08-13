@@ -89,6 +89,36 @@ pub fn crashed_mid_restore(data_dir: &str) -> bool {
     )
 }
 
+/// Reset a datadir left behind by a crashed mid-restore attempt so the
+/// restore can re-run from scratch on this boot. Everything in the datadir
+/// is derived state by construction — a restore only ever runs on an
+/// uninitialized volume, so nothing in it was authoritative; deleting it
+/// and re-deriving from the bucket is a deterministic retry, not data loss.
+/// The one live file is the runtime volume lock, held by THIS boot — it
+/// survives the sweep.
+pub fn reset_partial_restore(data_dir: &str) -> Result<()> {
+    let keep = std::ffi::OsStr::new(crate::volume_lock::RUNTIME_LOCK_FILE);
+    for entry in std::fs::read_dir(data_dir)
+        .with_context(|| format!("listing {data_dir} to reset a partial restore"))?
+    {
+        let entry = entry.with_context(|| format!("listing {data_dir}"))?;
+        if entry.file_name() == keep {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", path.display()))?;
+        let removed = if file_type.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn write_restore_marker(data_dir: &str, status: RestoreStatus, target: DateTime<Utc>) -> Result<()> {
     let marker = RestoreMarker {
         status,
@@ -479,6 +509,29 @@ mod tests {
         let marker = read_restore_marker(&dir).unwrap();
         assert_eq!(marker.status, RestoreStatus::Completed);
         assert_eq!(marker.target_time, "2026-08-13T14:00:00.000Z");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reset_partial_restore_wipes_everything_but_the_runtime_lock() {
+        let dir = temp_dir("reset");
+        write_restore_marker(&dir, RestoreStatus::InProgress, t()).unwrap();
+        std::fs::create_dir_all(Path::new(&dir).join("mysql")).unwrap();
+        std::fs::write(Path::new(&dir).join("mysql").join("ibdata1"), "junk").unwrap();
+        std::fs::write(Path::new(&dir).join("binlog.000001"), "junk").unwrap();
+        let lock = Path::new(&dir).join(crate::volume_lock::RUNTIME_LOCK_FILE);
+        std::fs::write(&lock, "held-by-this-boot").unwrap();
+
+        reset_partial_restore(&dir).unwrap();
+
+        assert!(!crashed_mid_restore(&dir), "marker must be gone");
+        assert!(!Path::new(&dir).join("mysql").exists(), "partial datadir must be gone");
+        assert!(!Path::new(&dir).join("binlog.000001").exists());
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            "held-by-this-boot",
+            "the held runtime lock must survive the sweep"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

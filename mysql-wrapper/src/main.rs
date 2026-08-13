@@ -75,16 +75,34 @@ async fn main() -> Result<()> {
     volume_lock::acquire_volume_runtime_lock(&config.data_dir)?;
 
     // A PITR restore that crashed mid-way leaves the datadir in an unknown,
-    // partially-loaded state — refuse to boot rather than silently serve it.
-    // Checked unconditionally (not just when restore_enabled()): the
-    // recover env vars themselves may have been removed after the crash, but
-    // the marker on the volume is still the source of truth. See restore.rs.
+    // partially-loaded state. Everything in that datadir is derived from the
+    // recovery bucket by construction (a restore only ever runs on an
+    // uninitialized volume), so when this boot can restore again — recover
+    // vars present, standalone — the partial state is wiped here and the
+    // restore below re-runs from scratch: a deterministic retry, the same
+    // convergent posture as any interrupted init. Only when there is nothing
+    // to retry from (recover vars removed, or GR_SEEDS set) does the boot
+    // refuse: serving partial data silently, or initializing an empty server
+    // that masquerades as data loss, are both worse than stopping.
+    // Checked unconditionally (not just when restore_enabled()): the marker
+    // on the volume stays the source of truth even if the env vars changed
+    // after the crash. See restore.rs.
     if restore::crashed_mid_restore(&config.data_dir) {
-        bail!(
-            "a previous point-in-time restore did not complete (crashed mid-restore); the data \
-             directory is in an unknown state and refuses to boot — restore onto a fresh volume \
-             to retry"
-        );
+        if config.restore_enabled() && config.gr_seeds.is_none() {
+            warn!(
+                "a previous point-in-time restore did not complete; wiping the \
+                 partially-restored data directory (derived state only) and retrying the \
+                 restore from scratch"
+            );
+            restore::reset_partial_restore(&config.data_dir)?;
+        } else {
+            bail!(
+                "a previous point-in-time restore did not complete (crashed mid-restore) and \
+                 this boot has no standalone BINLOG_RECOVER_FROM_* configuration to retry it \
+                 with; the data directory is in an unknown state and refuses to boot — re-add \
+                 the recovery configuration, or restore onto a fresh volume"
+            );
+        }
     }
 
     info!(
