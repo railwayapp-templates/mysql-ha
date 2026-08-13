@@ -753,65 +753,81 @@ pub async fn orchestrate(
                 }
                 _ => None,
             });
-            if let Some((live_name, live_generation)) = live_identity {
-                if live_name != group_name {
-                    if config.gr_group_name.is_some() {
-                        wait_log_once(
-                            &mut last_wait_reason,
-                            &format!(
-                                "live group runs as {live_name} but GR_GROUP_NAME pins {group_name}; refusing to adopt an identity the operator overrode"
-                            ),
+            // Identity adoption: a waiver bootstrap mints a fresh random group
+            // name, so the live group's name can no longer be derived — a
+            // joiner takes it from the group's /gr/state advert (and carries
+            // the group's waiver generation forward, so it votes with the
+            // group's lineage in any future divergence tie-break). Only when
+            // the identities differ; an explicit GR_GROUP_NAME env pin wins —
+            // the operator said exactly which group this node belongs to.
+            let identity_differs = live_identity
+                .as_ref()
+                .map(|(name, _)| *name != group_name)
+                .unwrap_or(false);
+            if identity_differs {
+                let (live_name, live_generation) =
+                    live_identity.expect("identity_differs implies Some");
+                if config.gr_group_name.is_some() {
+                    wait_log_once(
+                        &mut last_wait_reason,
+                        &format!(
+                            "live group runs as {live_name} but GR_GROUP_NAME pins {group_name}; refusing to adopt an identity the operator overrode"
+                        ),
+                    );
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+                match sql.set_group_name(&live_name).await {
+                    Ok(()) => {
+                        info!(
+                            from = %group_name,
+                            to = %live_name,
+                            generation = live_generation,
+                            "adopting the live group's identity"
                         );
+                        if let Err(e) = persist_group_name(&config, &live_name) {
+                            warn!(error = %e, "could not persist adopted group name");
+                        }
+                        let my_generation = read_waiver_generation(&config.data_dir);
+                        if live_generation > my_generation {
+                            if let Err(e) =
+                                persist_waiver_generation(&config.data_dir, live_generation)
+                            {
+                                warn!(error = %e, "could not persist adopted waiver generation");
+                            }
+                        }
+                        group_name = live_name;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "could not adopt the live group's identity; retrying");
                         tokio::time::sleep(POLL_INTERVAL).await;
                         continue;
-                    }
-                    match sql.set_group_name(&live_name).await {
-                        Ok(()) => {
-                            info!(
-                                from = %group_name,
-                                to = %live_name,
-                                generation = live_generation,
-                                "adopting the live group's identity"
-                            );
-                            if let Err(e) = persist_group_name(&config, &live_name) {
-                                warn!(error = %e, "could not persist adopted group name");
-                            }
-                            let my_generation = read_waiver_generation(&config.data_dir);
-                            if live_generation > my_generation {
-                                if let Err(e) =
-                                    persist_waiver_generation(&config.data_dir, live_generation)
-                                {
-                                    warn!(error = %e, "could not persist adopted waiver generation");
-                                }
-                            }
-                            group_name = live_name;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "could not adopt the live group's identity; retrying");
-                            tokio::time::sleep(POLL_INTERVAL).await;
-                            continue;
-                        }
                     }
                 }
             }
 
-            // Divergence self-heal: this node holds committed transactions
-            // the LIVE group does not (a stale tail from before a waiver
-            // bootstrap re-formed the group, or an errant local write). The
-            // group is the authority — those transactions can never be
-            // merged, and Group Replication would refuse this joiner on
-            // every attempt forever. Heal automatically: log exactly what is
-            // being discarded (the orphaned GTID set — the binlogs holding
-            // it are gone once the clone lands, so this line IS the durable
-            // evidence), then reclone from the group. Never blocks on a
-            // human; the worst case is a visibly-logged discarded tail,
-            // never a silent merge and never a wedged node.
+            // Divergence self-heal: this node holds committed transactions the
+            // LIVE group does not — a stale fork's tail (the group re-formed
+            // without it past a waiver bootstrap) or an errant local write.
+            // They can never be merged, and Group Replication would refuse
+            // this joiner forever. Heal automatically: log exactly what is
+            // discarded (the orphaned GTID set — its binlogs are gone once the
+            // clone lands, so this line IS the durable evidence), then reclone.
+            //
+            // Checked on EVERY pass while a group is live, not just the pass
+            // that adopts a foreign identity: the reclone can be refused
+            // transiently — MySQL allows one clone per donor at a time, so two
+            // nodes healing off the same primary collide — and the retry has
+            // to keep coming until the donor frees up. Gating this on
+            // "identity just changed" wedged the loser of that race forever.
+            // For an ordinary returning member (subset GTID) this is two cheap
+            // reads that no-op.
             let my_gtid_now = sql.executed_gtid_set().await.unwrap_or_default();
+            let live_peer_gtid = answers.iter().find_map(|(_, a)| match a {
+                PeerAnswer::State(s) if s.group_active => s.gtid_executed.clone(),
+                _ => None,
+            });
             if !my_gtid_now.is_empty() {
-                let live_peer_gtid = answers.iter().find_map(|(_, a)| match a {
-                    PeerAnswer::State(s) if s.group_active => s.gtid_executed.clone(),
-                    _ => None,
-                });
                 if let Some(peer_gtid) = live_peer_gtid {
                     match sql.gtid_compare(&my_gtid_now, &peer_gtid).await {
                         Ok((_, mine_sub_peer)) if !mine_sub_peer => {
@@ -841,7 +857,13 @@ pub async fn orchestrate(
                                     .await
                                 {
                                     Ok(()) => info!("divergence reclone completed; server will shut down and rejoin on restart"),
-                                    Err(e) => info!(error = %e, "divergence reclone initiated (connection drop on shutdown is expected)"),
+                                    // A donor already serving another clone
+                                    // returns ER_CLONE_TOO_MANY_CONCURRENT
+                                    // (3862); the next pass retries once it is
+                                    // free. Any other error is the expected
+                                    // connection drop of a clone that DID start
+                                    // and shut the server down.
+                                    Err(e) => info!(error = %e, "divergence reclone did not complete this pass (donor busy, or the expected shutdown drop); will retry"),
                                 }
                             }
                             tokio::time::sleep(POLL_INTERVAL).await;
