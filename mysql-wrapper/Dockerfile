@@ -45,11 +45,15 @@ ARG PKG_REFRESH=none
 # image into one bundling mysqld 8.4.0 (caught by the bundled-series guard
 # in CI, which refused to publish). microdnf has no --exclude flag; the
 # glob goes through dnf.conf (empty in this image) and is restored after.
+# Older bases (8.1–8.3, Oracle Linux 8 era) ship no /etc/dnf/dnf.conf at
+# all — creating it works the same (microdnf honors it either way), it just
+# has to be REMOVED again instead of restored.
 RUN echo "refresh key: ${PKG_REFRESH}" \
-    && cp /etc/dnf/dnf.conf /tmp/dnf.conf.orig \
+    && if [ -f /etc/dnf/dnf.conf ]; then cp /etc/dnf/dnf.conf /tmp/dnf.conf.orig; fi \
+    && mkdir -p /etc/dnf \
     && printf '[main]\nexclude=mysql*\n' >> /etc/dnf/dnf.conf \
     && microdnf upgrade -y \
-    && mv /tmp/dnf.conf.orig /etc/dnf/dnf.conf \
+    && if [ -f /tmp/dnf.conf.orig ]; then mv /tmp/dnf.conf.orig /etc/dnf/dnf.conf; else rm -f /etc/dnf/dnf.conf; fi \
     && microdnf install -y wget && microdnf clean all
 
 COPY --from=rust-binaries --chmod=755 /mysql-wrapper /usr/local/bin/mysql-wrapper
