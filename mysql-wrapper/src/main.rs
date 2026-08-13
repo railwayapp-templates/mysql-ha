@@ -81,7 +81,9 @@ async fn main() -> Result<()> {
         // `mysql` system schema directory in the datadir. Checked BEFORE the
         // entrypoint spawns — it decides whether this boot's local GTID
         // history is init noise that must be purged (see gr::orchestrate).
-        let fresh_datadir = !std::path::Path::new(&config.data_dir).join("mysql").is_dir();
+        let fresh_datadir = !std::path::Path::new(&config.data_dir)
+            .join("mysql")
+            .is_dir();
 
         tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
@@ -124,12 +126,10 @@ async fn main() -> Result<()> {
 
     // HA mode: hand the primary role off before mysqld is signaled, so a
     // planned shutdown is a switchover, not a detection-timeout failover.
-    let demote = config
-        .gr_enabled()
-        .then(|| demote_on_shutdown::DemoteCtx {
-            sql: sql.clone(),
-            deadline_ms: config.demote_timeout_ms,
-        });
+    let demote = config.gr_enabled().then(|| demote_on_shutdown::DemoteCtx {
+        sql: sql.clone(),
+        deadline_ms: config.demote_timeout_ms,
+    });
 
     process_manager::supervise(child, demote).await
 }

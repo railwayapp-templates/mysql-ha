@@ -18,4 +18,4 @@ nix.workspace = true
 axum.workspace = true
 mysql_async = { version = "0.37.0", default-features = false, features = ["default-rustls"] }
 reqwest.workspace = true
-uuid = { version = "1.24.0", features = ["v5"] }
+uuid = { version = "1.24.0", features = ["v4", "v5"] }

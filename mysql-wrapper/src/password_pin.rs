@@ -195,8 +195,7 @@ async fn finalize(
         );
         telemetry.send(TelemetryEvent::ComponentError {
             component: "mysql-wrapper".to_string(),
-            error: "MYSQL_ROOT_PASSWORD drifted from the active root password; pinned"
-                .to_string(),
+            error: "MYSQL_ROOT_PASSWORD drifted from the active root password; pinned".to_string(),
             context: "root-password-pin".to_string(),
         });
     } else if source == "env" && pin.is_some_and(|p| p != env_password) {
@@ -243,7 +242,10 @@ mod tests {
         assert_eq!(read_pin(&dir), None);
         write_pin(&dir, "s3cret").unwrap();
         assert_eq!(read_pin(&dir), Some("s3cret".to_string()));
-        let mode = std::fs::metadata(pin_path(&dir)).unwrap().permissions().mode();
+        let mode = std::fs::metadata(pin_path(&dir))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
         // Overwrite converges.
         write_pin(&dir, "rotated").unwrap();

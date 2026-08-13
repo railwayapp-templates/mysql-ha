@@ -197,9 +197,7 @@ pub async fn run_health_server_supervised(
         let attempt_state = state.clone();
         let started_at = std::time::Instant::now();
         let handle =
-            tokio::task::spawn(
-                async move { run_health_server(health_port, attempt_state).await },
-            );
+            tokio::task::spawn(async move { run_health_server(health_port, attempt_state).await });
         let outcome = handle.await;
         let ran_for = started_at.elapsed();
 

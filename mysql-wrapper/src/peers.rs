@@ -39,6 +39,20 @@ pub struct GrState {
     /// forever. Absent from peers on older wrapper builds.
     #[serde(default)]
     pub server_uuid: Option<String>,
+    /// The group name this node runs (or would run) — its resolved identity.
+    /// A waiver bootstrap mints a FRESH random name (see gr.rs), so joiners
+    /// can no longer derive it: they adopt the live group's advertised name
+    /// from here before START GROUP_REPLICATION. Absent on older builds.
+    #[serde(default)]
+    pub group_name: Option<String>,
+    /// How many waiver bootstraps this node's history has been through — the
+    /// divergence tie-break. When two nodes hold histories that BOTH contain
+    /// transactions the other lacks and no group is live, the higher
+    /// generation (the more recent authority) wins and the loser self-heals
+    /// by recloning; equal generations fall through to seed order. Absent
+    /// (0) on older builds and pre-waiver volumes.
+    #[serde(default)]
+    pub waiver_generation: u64,
 }
 
 /// One peer's answer, or why there isn't one. The distinction matters: an
