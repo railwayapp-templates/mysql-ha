@@ -359,6 +359,52 @@ impl Sql {
         Ok(())
     }
 
+    /// Stop the plugin on this node. The stuck-member self-heal needs it:
+    /// CLONE INSTANCE refuses a recipient with Group Replication running.
+    /// Deliberately not wrapped in `short()` — stopping waits on the applier.
+    pub async fn stop_group_replication(&self) -> Result<()> {
+        let mut conn = self.conn().await?;
+        conn.query_drop("STOP GROUP_REPLICATION").await?;
+        Ok(())
+    }
+
+    /// A change-detection signature of recovery/provisioning progress: the
+    /// executed GTID set (grows while distributed recovery applies), the
+    /// per-channel received transaction sets (grow while recovery streams),
+    /// and the clone progress rows (advance while a provisioning clone
+    /// transfers). Two equal reads a poll apart mean no observable progress;
+    /// any change means the member is working — and a working member must
+    /// never be counted as stuck (see self_heal::stuck_watch). Best-effort
+    /// on the optional tables: absence contributes a fixed token, only a
+    /// dead mysqld errors.
+    pub async fn recovery_progress_signature(&self) -> Result<String> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            let gtid: Option<String> = conn.query_first("SELECT @@GLOBAL.gtid_executed").await?;
+            let received: Option<Option<String>> = conn
+                .query_first(
+                    "SELECT GROUP_CONCAT(CHANNEL_NAME, ':', RECEIVED_TRANSACTION_SET) \
+                     FROM performance_schema.replication_connection_status",
+                )
+                .await
+                .unwrap_or(None);
+            let received = received.flatten();
+            let clone_rows: Vec<(Option<String>, Option<String>, Option<u64>)> = conn
+                .query("SELECT STAGE, STATE, DATA FROM performance_schema.clone_progress")
+                .await
+                .unwrap_or_default();
+            Ok(format!(
+                "{}|{}|{:?}",
+                gtid.unwrap_or_default()
+                    .split_whitespace()
+                    .collect::<String>(),
+                received.unwrap_or_default(),
+                clone_rows
+            ))
+        })
+        .await
+    }
+
     /// Hand the group's primary role to the member named by `uuid` — Group
     /// Replication's own planned-switchover primitive, run through the
     /// group's consensus. Blocks while the outgoing primary's in-flight

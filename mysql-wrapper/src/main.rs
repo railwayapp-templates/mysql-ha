@@ -30,6 +30,7 @@ mod mysql_conf;
 mod password_pin;
 mod peers;
 mod process_manager;
+mod self_heal;
 mod sql;
 mod volume_lock;
 
@@ -62,6 +63,16 @@ async fn main() -> Result<()> {
         "starting mysql-wrapper"
     );
 
+    // Boot accounting and, past the boot-loop threshold, the wedged-datadir
+    // self-heal (see self_heal.rs). Must run before ANYTHING reads the
+    // datadir — the password pin, the group-name marker and the fresh-datadir
+    // test below all change meaning when the heal discards the datadir.
+    let preboot = if config.gr_enabled() {
+        Some(self_heal::preboot(&config, &telemetry).await)
+    } else {
+        None
+    };
+
     // The pool starts on the pinned password when one exists and disagrees
     // with the environment — a drifted MYSQL_ROOT_PASSWORD edit must not lock
     // the wrapper out of its own mysqld (see password_pin.rs). The resolver
@@ -77,7 +88,9 @@ async fn main() -> Result<()> {
         telemetry.clone(),
     ));
 
+    let mut boot_note = None;
     if config.gr_enabled() {
+        let preboot = preboot.expect("preboot runs whenever gr is enabled");
         let group_name = gr::resolve_group_name(&config);
         let server_id = config
             .server_id
@@ -103,12 +116,35 @@ async fn main() -> Result<()> {
             telemetry.clone(),
         ));
 
+        boot_note = Some(self_heal::PlannedShutdownNote {
+            data_dir: config.data_dir.clone(),
+            ready: preboot.ready.clone(),
+        });
+        tokio::spawn(self_heal::boot_watch(
+            config.clone(),
+            sql.clone(),
+            telemetry.clone(),
+            preboot,
+        ));
+
+        // Shared with orchestrate: the stuck-member watchdog raises it while
+        // it drives a stop-plugin-then-clone heal, so the join loop can't
+        // restart the plugin mid-clone.
+        let healing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn(self_heal::stuck_watch(
+            config.clone(),
+            sql.clone(),
+            telemetry.clone(),
+            healing.clone(),
+        ));
+
         tokio::spawn(gr::orchestrate(
             config.clone(),
             sql.clone(),
             telemetry.clone(),
             group_name,
             fresh_datadir,
+            healing,
         ));
     } else {
         info!("GR_SEEDS not set — standalone passthrough mode");
@@ -139,5 +175,5 @@ async fn main() -> Result<()> {
         deadline_ms: config.demote_timeout_ms,
     });
 
-    process_manager::supervise(child, demote).await
+    process_manager::supervise(child, demote, boot_note).await
 }

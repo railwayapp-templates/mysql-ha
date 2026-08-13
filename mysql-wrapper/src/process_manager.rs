@@ -40,15 +40,23 @@ pub async fn spawn_mysqld(args: &[String]) -> Result<Child> {
 /// switchover rather than a detection-timeout failover (see
 /// demote_on_shutdown.rs). Runs while mysqld is still healthy; a failure
 /// there never blocks the shutdown.
+///
+/// `boot_note` — present in HA mode only: a signaled shutdown before mysqld
+/// ever accepted connections is an interrupted boot, not a failed one — the
+/// note un-counts it so redeploy bursts can't read as a boot loop (see
+/// self_heal.rs).
 pub async fn supervise(
     mut child: Child,
     demote: Option<crate::demote_on_shutdown::DemoteCtx>,
+    boot_note: Option<crate::self_heal::PlannedShutdownNote>,
 ) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
     let pid = child.id().map(|id| Pid::from_raw(id as i32));
 
+    // Every arm below ends the process — the "loop" runs at most once.
+    #[allow(clippy::never_loop)]
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -73,6 +81,9 @@ pub async fn supervise(
 
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
+                if let Some(note) = &boot_note {
+                    note.note_planned_shutdown();
+                }
                 if let Some(ctx) = &demote {
                     crate::demote_on_shutdown::demote_if_primary(ctx).await;
                 }
@@ -82,6 +93,9 @@ pub async fn supervise(
 
             _ = sigint.recv() => {
                 info!("received SIGINT, shutting down");
+                if let Some(note) = &boot_note {
+                    note.note_planned_shutdown();
+                }
                 if let Some(ctx) = &demote {
                     crate::demote_on_shutdown::demote_if_primary(ctx).await;
                 }

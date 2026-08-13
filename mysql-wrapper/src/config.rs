@@ -73,6 +73,33 @@ pub struct Config {
     /// window, and waiving a peer that was merely mid-redeploy could
     /// bootstrap past the most advanced dataset. See gr::GoneTracker.
     pub peer_gone_dwell_seconds: u64,
+    /// Consecutive supervised mysqld starts that failed to reach
+    /// accepting-connections before the boot-loop self-heal arms
+    /// (BOOT_LOOP_THRESHOLD). Counted in a volume marker — every failed
+    /// start exits the container, so the count must survive restarts. See
+    /// self_heal.rs for the gates the heal itself sits behind.
+    pub boot_loop_threshold: u32,
+    /// Per-boot budget for mysqld to reach accepting-connections
+    /// (BOOT_READY_BUDGET_SECONDS). Only enforced while a peer answers
+    /// /role 200: with the group healthy, a member grinding past this is
+    /// restarted so the attempt is counted; with no healthy group anywhere
+    /// a slow crash recovery is left to finish, however long it takes — it
+    /// may be recovering the best surviving copy.
+    pub boot_ready_budget_seconds: u64,
+    /// How long a member may sit in ERROR, or in RECOVERING without
+    /// observable progress, before the stuck-member self-heal arms
+    /// (STUCK_MEMBER_DWELL_SECONDS). Progress — GTIDs applying, recovery
+    /// streaming, a clone advancing — resets the clock: a slow member is
+    /// not a stuck one.
+    pub stuck_member_dwell_seconds: u64,
+    /// Self-heal attempts (datadir discard or reclone) before the node
+    /// stops healing and stays up for inspection (SELF_HEAL_ATTEMPT_CAP).
+    /// Persisted on the volume; reset after an hour of continuous ONLINE.
+    pub self_heal_attempt_cap: u32,
+    /// Base of the exponential backoff between self-heal attempts, seconds
+    /// (SELF_HEAL_BACKOFF_BASE_SECONDS): attempt N+1 waits base * 2^(N-1).
+    /// A clone is heavy on the donor — repeated attempts must space out.
+    pub self_heal_backoff_base_seconds: u64,
 }
 
 impl Config {
@@ -104,6 +131,11 @@ impl Config {
                 .and_then(|v| v.parse().ok()),
             demote_timeout_ms: u64::env_parse("DEMOTE_TIMEOUT_MS", 20_000),
             peer_gone_dwell_seconds: u64::env_parse("PEER_GONE_DWELL_SECONDS", 1800),
+            boot_loop_threshold: u32::env_parse("BOOT_LOOP_THRESHOLD", 3),
+            boot_ready_budget_seconds: u64::env_parse("BOOT_READY_BUDGET_SECONDS", 900),
+            stuck_member_dwell_seconds: u64::env_parse("STUCK_MEMBER_DWELL_SECONDS", 900),
+            self_heal_attempt_cap: u32::env_parse("SELF_HEAL_ATTEMPT_CAP", 5),
+            self_heal_backoff_base_seconds: u64::env_parse("SELF_HEAL_BACKOFF_BASE_SECONDS", 60),
         };
 
         if config.gr_enabled() && config.gr_replication_password.is_none() {
@@ -194,6 +226,11 @@ mod tests {
             "RAILWAY_VOLUME_MOUNT_PATH",
             "MYSQL_CONF_DIR",
             "RAILWAY_PRIVATE_DOMAIN",
+            "BOOT_LOOP_THRESHOLD",
+            "BOOT_READY_BUDGET_SECONDS",
+            "STUCK_MEMBER_DWELL_SECONDS",
+            "SELF_HEAL_ATTEMPT_CAP",
+            "SELF_HEAL_BACKOFF_BASE_SECONDS",
         ] {
             env::remove_var(key);
         }
@@ -228,6 +265,11 @@ mod tests {
         assert!(!config.gr_enabled());
         assert!(config.seed_hosts().is_empty());
         assert!(!config.is_bootstrap_candidate());
+        assert_eq!(config.boot_loop_threshold, 3);
+        assert_eq!(config.boot_ready_budget_seconds, 900);
+        assert_eq!(config.stuck_member_dwell_seconds, 900);
+        assert_eq!(config.self_heal_attempt_cap, 5);
+        assert_eq!(config.self_heal_backoff_base_seconds, 60);
     }
 
     #[test]

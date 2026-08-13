@@ -1152,12 +1152,192 @@ t_restore_identical_datadirs() {
 
 # ---------------------------------------------------------------------------
 
+# corrupt_datadir <n> — garbage over node N's InnoDB system tablespace header
+# and redo logs while its container is gone, so mysqld aborts crash recovery
+# on every start. This is the unrecoverable-datadir failure mode (a crash
+# mid-write, bad blocks) — nothing short of reprovisioning fixes it.
+corrupt_datadir() {
+  docker run --rm --label "$LABEL" -v "mysql-ha-e2e-vol-$1:/d" alpine sh -c \
+    'dd if=/dev/urandom of=/d/ibdata1 bs=4096 count=4 conv=notrunc 2>/dev/null;
+     for f in /d/#innodb_redo/*; do dd if=/dev/urandom of="$f" bs=4096 count=4 conv=notrunc 2>/dev/null; done;
+     true'
+}
+
+t_boot_wedged_member_self_heals() {
+  log "t_boot_wedged_member_self_heals (a datadir mysqld cannot recover must reprovision from the group on its own)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (80,'pre-corruption') ON DUPLICATE KEY UPDATE v='pre-corruption';"
+  wait_until 60 "seed write replicated" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=80" 2>/dev/null)" = "pre-corruption" ]' \
+    || { bad "seed write never replicated"; return; }
+
+  # Corrupt mysql-3's datadir while its container is gone, then bring it back
+  # with the self-heal thresholds shrunk to test scale (the container is
+  # recreated because env vars are fixed at create time). The survivors keep
+  # quorum, so a /role-200 donor exists the whole time.
+  docker rm -f mysql-3 >/dev/null 2>&1
+  corrupt_datadir 3 || { bad "could not corrupt the datadir"; return; }
+  start_node 3 -e BOOT_LOOP_THRESHOLD=2 -e SELF_HEAL_BACKOFF_BASE_SECONDS=1
+
+  # Wait for the DROP before waiting for the rejoin: right after `docker
+  # rm -f`, mysql-1's membership view can read stale-3-ONLINE for a moment
+  # (failure detection hasn't expelled the removed member yet), so an
+  # immediate 3-ONLINE wait passes spuriously before the heal even starts —
+  # the same stale-view race the patch-skew rollback probe documents. The
+  # drop to 2 can only reflect the real expulsion.
+  wait_until 120 "group drops to 2 while the wedged member crash-loops" has_n_online mysql-1 2 \
+    || { bad "group never expelled the wedged member"; return; }
+
+  # Everything from here is the node's own doing: failed boots accumulate on
+  # the volume marker, the donor gate confirms a quorum-backed primary, the
+  # wedged datadir is discarded, and the fresh boot provisions from the group.
+  wait_until 600 "wedged member healed itself back to 3 ONLINE" group_is_fully_online mysql-1 \
+    || { bad "corrupted member never healed (still stranded)"; return; }
+  ok "corrupted member wiped, reprovisioned, and rejoined with no external action"
+
+  docker logs mysql-3 2>&1 | grep -q "discarding local state to reprovision from the group" \
+    && ok "the heal logged its evidence before discarding" \
+    || bad "no boot-loop self-heal log line on the healed member"
+
+  wait_until 120 "healed member answers SQL locally" \
+    bash -c '[ -n "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT 1" 2>/dev/null)" ]' \
+    || { bad "healed member never accepted local SQL"; return; }
+  [ "$(sql mysql-3 "SELECT v FROM t.kv WHERE k=80")" = "pre-corruption" ] \
+    && ok "pre-corruption data recovered onto the healed member" \
+    || bad "healed member is missing the dataset"
+
+  sql mysql-1 "INSERT INTO t.kv VALUES (81,'post-heal') ON DUPLICATE KEY UPDATE v='post-heal';"
+  wait_until 60 "post-heal write replicated" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=81" 2>/dev/null)" = "post-heal" ]' \
+    && ok "post-heal writes replicate to the healed member" \
+    || bad "post-heal write never reached the healed member"
+
+  [ "$(role_code mysql-1 mysql-3)" = "503" ] \
+    && ok "healed member rejoined as a secondary (/role 503)" \
+    || bad "healed member answers /role 200"
+}
+
+t_stuck_error_member_self_heals() {
+  log "t_stuck_error_member_self_heals (an applier-wedged ERROR member must reclone on its own)"
+  teardown_trio
+  # The stuck dwell is shrunk to test scale (production default is minutes);
+  # all three nodes get it so the scenario doesn't depend on which node ends
+  # up the victim.
+  start_node 1 -e STUCK_MEMBER_DWELL_SECONDS=15 -e SELF_HEAL_BACKOFF_BASE_SECONDS=1
+  start_node 2 -e STUCK_MEMBER_DWELL_SECONDS=15 -e SELF_HEAL_BACKOFF_BASE_SECONDS=1
+  start_node 3 -e STUCK_MEMBER_DWELL_SECONDS=15 -e SELF_HEAL_BACKOFF_BASE_SECONDS=1
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; return; }
+  local victim
+  for victim in mysql-3 mysql-2 mysql-1; do
+    [ "$victim" != "$primary" ] && break
+  done
+
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (90,'pre-wedge') ON DUPLICATE KEY UPDATE v='pre-wedge';"
+  wait_until 60 "seed write replicated" \
+    bash -c '[ "$(docker exec '"$victim"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=90" 2>/dev/null)" = "pre-wedge" ]' \
+    || { bad "seed write never replicated"; return; }
+
+  # Wedge the victim's applier: plant an UNLOGGED local row (sql_log_bin=0 —
+  # no GTID minted, so this is not divergence and the divergence self-heal
+  # stays out of it), then write the same key on the primary. The replicated
+  # INSERT hits a duplicate key on the victim, its applier errors, and the
+  # member drops to ERROR — the state it would otherwise sit in forever
+  # (auto-rejoin covers expulsion, not applier failures).
+  sql "$victim" "SET GLOBAL super_read_only=OFF; SET SESSION sql_log_bin=0; INSERT INTO t.kv VALUES (91,'local-orphan'); SET SESSION sql_log_bin=1; SET GLOBAL super_read_only=ON;" \
+    || { bad "could not plant the conflicting local row"; return; }
+  sql "$primary" "INSERT INTO t.kv VALUES (91,'from-primary');"
+
+  wait_until 120 "victim drops to ERROR" \
+    bash -c '[ "$(docker exec '"$victim"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@server_uuid" 2>/dev/null)" = "ERROR" ]' \
+    || { bad "victim never hit ERROR (wedge did not take)"; return; }
+  ok "victim wedged in ERROR"
+
+  # Wait for the DROP before waiting for the rejoin: the primary's view can
+  # still read stale-3-ONLINE for a moment after the victim's applier dies
+  # (the errored member leaves the group via a view change that takes a few
+  # seconds to land), so an immediate 3-ONLINE wait passes spuriously before
+  # the heal even starts. The drop to 2 can only reflect the real leave.
+  wait_until 120 "group drops to 2 while the victim sits in ERROR" has_n_online "$primary" 2 \
+    || { bad "group never registered the errored member's leave"; return; }
+
+  # Autonomous from here: dwell, donor gate, stop-plugin, clone, restart,
+  # rejoin — no docker/exec intervention.
+  wait_until 420 "wedged member recloned and rejoined (3 ONLINE)" group_is_fully_online "$primary" \
+    || { bad "ERROR member never healed (still stranded)"; return; }
+  ok "ERROR member healed back to 3 ONLINE with no external action"
+
+  docker logs "$victim" 2>&1 | grep -q "provably stuck while the group is healthy" \
+    && ok "the heal logged its evidence before discarding" \
+    || bad "no stuck-member self-heal log line on the victim"
+
+  wait_until 120 "healed member answers SQL locally" \
+    bash -c '[ -n "$(docker exec '"$victim"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT 1" 2>/dev/null)" ]' \
+    || { bad "healed member never accepted local SQL"; return; }
+  [ "$(sql "$victim" "SELECT v FROM t.kv WHERE k=91")" = "from-primary" ] \
+    && ok "conflicting local row was discarded; the group's value won" \
+    || bad "victim still carries the wedging local row (or lost the group write)"
+}
+
+t_no_quorum_no_wipe() {
+  log "t_no_quorum_no_wipe (with no quorum-confirmed donor anywhere, a wedged member must never discard its data)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (95,'must-survive') ON DUPLICATE KEY UPDATE v='must-survive';"
+  wait_until 60 "seed write replicated" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=95" 2>/dev/null)" = "must-survive" ]' \
+    || { bad "seed write never replicated"; return; }
+
+  # Whole-group outage, then the same corruption as the positive scenario —
+  # but now NOTHING answers /role 200, so the wedged copy may be the best one
+  # left and the heal must hold no matter how many boots fail. A sentinel
+  # file marks the datadir so a wipe cannot be missed.
+  docker rm -f mysql-3 >/dev/null 2>&1
+  docker stop mysql-1 mysql-2 >/dev/null
+  docker run --rm --label "$LABEL" -v mysql-ha-e2e-vol-3:/d alpine \
+    touch /d/e2e-corruption-sentinel || { bad "could not plant the sentinel"; return; }
+  corrupt_datadir 3 || { bad "could not corrupt the datadir"; return; }
+  start_node 3 -e BOOT_LOOP_THRESHOLD=2 -e SELF_HEAL_BACKOFF_BASE_SECONDS=1
+
+  # Let it crash-loop well past the threshold (RestartCount is the ground
+  # truth for how many boots have failed; the threshold arms on the third).
+  wait_until 300 "wedged member boot-looped past the threshold" \
+    bash -c '[ "$(docker inspect --format "{{.RestartCount}}" mysql-3 2>/dev/null)" -ge 4 ]' \
+    || { bad "member never accumulated enough failed boots"; return; }
+
+  # The decisive assertion: the datadir is untouched — sentinel and the
+  # table's tablespace still present — and the wrapper said why it held.
+  docker run --rm --label "$LABEL" -v mysql-ha-e2e-vol-3:/d alpine sh -c \
+    'test -f /d/e2e-corruption-sentinel && test -e /d/t/kv.ibd' \
+    && ok "datadir survived the whole boot-loop window (fail closed, invariant held)" \
+    || bad "datadir was discarded with no healthy donor anywhere (invariant broken)"
+
+  docker logs mysql-3 2>&1 | grep -q "refusing to discard the local datadir" \
+    && ok "the wrapper logged the fail-closed hold" \
+    || bad "no fail-closed log line on the wedged member"
+
+  # This scenario intentionally strands the trio (that is the point); clear
+  # everything so the next scenario starts clean.
+  teardown_trio
+}
+
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
 # and seeds its own 'pre-upgrade' dataset, so it must not sit inside the
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
 # row. The two outage-recovery tests teardown and seed their own trios, so
-# they sit safely between the chain and the cross-version finale.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_conversion_cross_version_upgrade)
+# they sit safely between the chain and the cross-version finale. The three
+# self-heal scenarios each teardown and seed their own trio too, and
+# t_no_quorum_no_wipe deliberately wrecks one member's datadir and stops the
+# rest — it sits second to last, with only the (self-contained) cross-version
+# finale after it.
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

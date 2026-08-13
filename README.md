@@ -109,6 +109,18 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
   side's committed writes. The wrapper detects the divergence at
   bootstrap-decision time, refuses to proceed anywhere, and pages through
   telemetry instead of letting GR fail cryptically.
+- **Self-heal for unconnectable members.** A member that provably cannot
+  come back on its own — mysqld stuck in an InnoDB crash-recovery boot loop
+  on a corrupted datadir, or a live member wedged in ERROR /
+  RECOVERING-without-progress past a dwell — discards its local copy and
+  reprovisions from the group, with no operator action. Strictly gated: it
+  only ever fires while a peer answers `/role` 200 (a quorum-confirmed
+  primary, whose side is guaranteed to hold every committed transaction);
+  with the whole group down it fails closed and never destroys what may be
+  the best surviving copy. Attempts are capped and backed off, persisted on
+  the volume. Thresholds: `BOOT_LOOP_THRESHOLD`, `BOOT_READY_BUDGET_SECONDS`,
+  `STUCK_MEMBER_DWELL_SECONDS`, `SELF_HEAL_ATTEMPT_CAP`,
+  `SELF_HEAL_BACKOFF_BASE_SECONDS`.
 
 ## Conversion notes
 
@@ -183,8 +195,10 @@ scale-up 3→5, minority-partition fencing, patch-skew on redeploy (including
 the rollback refusal), total-outage recovery with the first seed behind, loss
 of the first seed's volume, a volume backup of one node restored onto every
 node (identical datadirs — each joiner regenerates its server_uuid instead of
-being refused forever), and cross-version conversion (previous LTS → wrapper
-series).
+being refused forever), cross-version conversion (previous LTS → wrapper
+series), and the unconnectable-member self-heal (a boot-wedged corrupted
+datadir reprovisions from the group; an applier-wedged ERROR member reclones;
+and the negative guard — no quorum-confirmed donor, no wipe, ever).
 
 Deliberately out of scope for v1:
 
