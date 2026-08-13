@@ -44,6 +44,10 @@
 //!     is acted on, so a slow-starting peer gets a window to contradict it.
 //!   - Joining is the default: any peer reporting a live group means this
 //!     node joins it, candidate or not.
+//!   - A joiner whose server_uuid already lives in the group (a restored
+//!     byte copy of a member's volume) regenerates its identity — drop
+//!     auto.cnf, restart — instead of retrying a join the group will refuse
+//!     forever.
 
 use crate::config::Config;
 use crate::dns_probe::{probe_name_detailed, NameVerdict};
@@ -144,6 +148,27 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
         // DB flag: replicated group-level truth — survives clones and the
         // adopting node's deletion.
         pre_gtid_data: has_pre_gtid_data(data_dir) || sql.group_pre_gtid_flag().await,
+        server_uuid: Some(self_uuid),
+    })
+}
+
+/// The host of a live-group peer that reports THIS node's server_uuid, if
+/// any. A joiner in this state can never get in: Group Replication refuses a
+/// member whose uuid is already present in the group ("There is already a
+/// member with server_uuid ..."), so START GROUP_REPLICATION fails on every
+/// retry, forever. In practice it happens exactly one way: every data node
+/// was restored from a volume backup of ONE node, so auto.cnf — where mysqld
+/// keeps its uuid — is byte-identical across the fleet. Only group-active
+/// peers count: two not-yet-joined nodes sharing a uuid resolve through this
+/// same path once one of them is in.
+fn uuid_collision_peer(my_uuid: &str, answers: &[(String, PeerAnswer)]) -> Option<String> {
+    answers.iter().find_map(|(host, answer)| match answer {
+        PeerAnswer::State(GrState {
+            group_active: true,
+            server_uuid: Some(peer_uuid),
+            ..
+        }) if peer_uuid.eq_ignore_ascii_case(my_uuid) => Some(host.clone()),
+        _ => None,
     })
 }
 
@@ -568,6 +593,56 @@ pub async fn orchestrate(
 
         if group_seen {
             safe_since = None;
+
+            // Identity collision: a live member already carries this node's
+            // server_uuid — this datadir is a byte copy of that member's (a
+            // volume backup of one node restored onto every data node). The
+            // group will refuse this joiner on every attempt, so regenerate
+            // identity instead of retrying: drop auto.cnf and shut mysqld
+            // down. The supervisor exits the container, the platform's
+            // restart policy boots it back up, and the fresh boot mints a
+            // new server_uuid and joins normally — its GTID history
+            // (identical to the group's at backup time) recovers over the
+            // binlog. Checked BEFORE the clone path: clone does not replace
+            // auto.cnf, so a cloned datadir would still carry the colliding
+            // uuid.
+            match sql.server_uuid().await {
+                Ok(my_uuid) => {
+                    if let Some(peer) = uuid_collision_peer(&my_uuid, &answers) {
+                        warn!(
+                            %peer,
+                            uuid = %my_uuid,
+                            "a live member already holds this node's server_uuid (restored datadir copy) — regenerating identity"
+                        );
+                        let auto_cnf = Path::new(&config.data_dir).join("auto.cnf");
+                        match std::fs::remove_file(&auto_cnf) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                error!(error = %e, "could not remove auto.cnf; identity cannot be regenerated");
+                                telemetry.send(TelemetryEvent::ComponentError {
+                                    component: "mysql-wrapper".to_string(),
+                                    error: e.to_string(),
+                                    context: "regenerate_server_uuid".to_string(),
+                                });
+                                tokio::time::sleep(POLL_INTERVAL).await;
+                                continue;
+                            }
+                        }
+                        match sql.shutdown_server().await {
+                            Ok(()) => info!("auto.cnf removed; mysqld shutting down to mint a fresh server_uuid on restart"),
+                            Err(e) => info!(error = %e, "auto.cnf removed; shutdown issued (connection drop on the way down is expected)"),
+                        }
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not read local server_uuid");
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+            }
 
             // Clone-first path: the group carries data that predates its
             // GTID history (adopted standalone volume), and this node has no
@@ -1016,6 +1091,48 @@ mod tests {
             decide(false, usize::MAX, &peers),
             BootstrapVerdict::SafeToBootstrap
         );
+    }
+
+    fn peer_state(group_active: bool, server_uuid: Option<&str>) -> PeerAnswer {
+        PeerAnswer::State(GrState {
+            group_active,
+            member_state: group_active.then(|| "ONLINE".to_string()),
+            member_role: None,
+            gtid_executed: Some(String::new()),
+            members_total: usize::from(group_active),
+            members_reachable: usize::from(group_active),
+            pre_gtid_data: false,
+            server_uuid: server_uuid.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn uuid_collision_detected_on_live_group_member() {
+        // The restore signature: a live member reports OUR uuid.
+        let answers = vec![
+            ("mysql-1".to_string(), peer_state(true, Some("AAAA-1111"))),
+            ("mysql-3".to_string(), peer_state(false, Some("AAAA-1111"))),
+        ];
+        assert_eq!(
+            uuid_collision_peer("aaaa-1111", &answers),
+            Some("mysql-1".to_string()),
+            "case-insensitive match against a group-active peer must fire"
+        );
+    }
+
+    #[test]
+    fn uuid_collision_ignores_inactive_peers_and_distinct_uuids() {
+        // A NOT-yet-joined peer sharing our uuid is not a collision with the
+        // group (both sides resolve once one of them joins); a live peer
+        // with a distinct uuid is the healthy case; a peer without the field
+        // (older build) can't vote.
+        let answers = vec![
+            ("mysql-2".to_string(), peer_state(false, Some("AAAA-1111"))),
+            ("mysql-1".to_string(), peer_state(true, Some("BBBB-2222"))),
+            ("mysql-3".to_string(), peer_state(true, None)),
+            ("mysql-4".to_string(), PeerAnswer::Unreachable),
+        ];
+        assert_eq!(uuid_collision_peer("AAAA-1111", &answers), None);
     }
 
     #[test]

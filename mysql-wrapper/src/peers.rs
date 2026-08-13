@@ -32,6 +32,13 @@ pub struct GrState {
     /// the un-GTID'd base data, so binlog recovery would silently skip it.
     #[serde(default)]
     pub pre_gtid_data: bool,
+    /// This node's server_uuid. Lets a joiner detect that a live member
+    /// already carries ITS identity — the signature of a datadir that is a
+    /// byte copy of that member's (a volume backup of one node restored onto
+    /// all of them) — instead of burning join attempts the group will refuse
+    /// forever. Absent from peers on older wrapper builds.
+    #[serde(default)]
+    pub server_uuid: Option<String>,
 }
 
 /// One peer's answer, or why there isn't one. The distinction matters: an

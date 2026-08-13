@@ -300,6 +300,19 @@ impl Sql {
         Ok(())
     }
 
+    /// Ask mysqld to exit. Used by remediations that need a fresh boot to
+    /// take effect (regenerating server_uuid after auto.cnf removal): there
+    /// is no in-container monitor process, so the supervisor exits the
+    /// container with mysqld and the platform's restart policy boots it back
+    /// up. The connection routinely drops while the statement executes — the
+    /// caller must treat that error as the shutdown proceeding, same as the
+    /// clone path.
+    pub async fn shutdown_server(&self) -> Result<()> {
+        let mut conn = self.conn().await?;
+        conn.query_drop("SHUTDOWN").await?;
+        Ok(())
+    }
+
     /// Join an existing group. Blocks while distributed recovery runs; a
     /// clone-based recovery shuts the server down mid-way (no monitor process
     /// in-container to restart it), which surfaces here as an error while the

@@ -1001,12 +1001,68 @@ t_wiped_primary_volume_rejoins_fresh() {
 
 # ---------------------------------------------------------------------------
 
+t_restore_identical_datadirs() {
+  log "t_restore_identical_datadirs (a volume backup of one node restored onto every node must reform)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; return; }
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (60,'survives-restore') ON DUPLICATE KEY UPDATE v='survives-restore';"
+  wait_until 60 "seed write replicated" \
+    bash -c '[ "$(docker exec mysql-2 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=60" 2>/dev/null)" = "survives-restore" ]' \
+    || { bad "seed write never replicated"; return; }
+
+  # Simulate a platform volume-backup restore onto the whole cluster: stop
+  # the trio and replace every node's datadir with a byte copy of node 1's —
+  # auto.cnf included, which is exactly what leaves every node with the SAME
+  # server_uuid. Without the identity-regeneration path the first node up
+  # bootstraps and the other two are refused forever ("There is already a
+  # member with server_uuid ..."), a permanent 1-of-3 group.
+  docker rm -f mysql-1 mysql-2 mysql-3 >/dev/null 2>&1
+  local n
+  for n in 2 3; do
+    docker run --rm --label "$LABEL" \
+      -v "mysql-ha-e2e-vol-1:/src:ro" -v "mysql-ha-e2e-vol-$n:/dst" \
+      alpine sh -c 'find /dst -mindepth 1 -delete && cp -a /src/. /dst/' >/dev/null \
+      || { bad "datadir copy onto node $n failed"; return; }
+  done
+  start_trio
+
+  wait_until 600 "group reforms with 3 ONLINE members" group_is_fully_online mysql-1 \
+    || { bad "group never reformed from identical datadirs"; return; }
+  ok "group reformed from identical datadirs (3/3 ONLINE)"
+
+  # The uuids must have diverged again — three distinct identities.
+  local uuids
+  uuids="$( { sql mysql-1 "SELECT @@server_uuid"; sql mysql-2 "SELECT @@server_uuid"; sql mysql-3 "SELECT @@server_uuid"; } | sort -u | wc -l | tr -d '[:space:]')"
+  [ "$uuids" = "3" ] \
+    && ok "every node minted a distinct server_uuid ($uuids unique)" \
+    || bad "expected 3 distinct server_uuids, got $uuids unique"
+
+  # The restored dataset is served, and the reformed group takes writes.
+  local v
+  v="$(sql mysql-2 "SELECT v FROM t.kv WHERE k=60")"
+  [ "$v" = "survives-restore" ] \
+    && ok "restored dataset intact on a replica" \
+    || bad "restored dataset missing on a replica (got '$v')"
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary after restore"; return; }
+  sql "$primary" "INSERT INTO t.kv VALUES (61,'post-restore') ON DUPLICATE KEY UPDATE v='post-restore';"
+  wait_until 60 "post-restore write replicated" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=61" 2>/dev/null)" = "post-restore" ]' \
+    && ok "post-restore write replicated group-wide" \
+    || bad "post-restore write never replicated"
+}
+
+# ---------------------------------------------------------------------------
+
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
 # and seeds its own 'pre-upgrade' dataset, so it must not sit inside the
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
 # row. The two outage-recovery tests teardown and seed their own trios, so
 # they sit safely between the chain and the cross-version finale.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image
