@@ -148,7 +148,7 @@ only the config change above.
 
 | Image | GHCR path | Base |
 |---|---|---|
-| `mysql-wrapper` | `ghcr.io/railwayapp-templates/mysql-ha/mysql-wrapper:<major.minor>` (every `X.Y` series Docker Hub publishes for majors 8 and 9) | `mysql:<major.minor>` |
+| `mysql-wrapper` | `ghcr.io/railwayapp-templates/mysql-ha/mysql:<major.minor>` (every `X.Y` series Docker Hub publishes for majors 8 and 9) | `mysql:<major.minor>` |
 | `haproxy` | `ghcr.io/railwayapp-templates/mysql-ha/haproxy:3.2` | `haproxy:3.2-alpine` |
 
 No image carries a floating `:latest` tag — every published tag pins an
