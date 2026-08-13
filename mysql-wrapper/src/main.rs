@@ -31,6 +31,7 @@ mod password_pin;
 mod peers;
 mod process_manager;
 mod sql;
+mod volume_lock;
 
 use anyhow::Result;
 use common::{init_logging, Telemetry, TelemetryEvent};
@@ -45,6 +46,13 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(Config::from_env()?);
     let telemetry = Arc::new(Telemetry::from_env("mysql-ha"));
+
+    // At most one container runs against this dataset at a time: wait for a
+    // previous container's supervisor to release the volume before anything
+    // below (the password pin, GR config, mysqld) touches the data directory
+    // (see volume_lock for the overlap rationale). Fail-stop on timeout —
+    // the restart policy retries the boot.
+    volume_lock::acquire_volume_runtime_lock(&config.data_dir)?;
 
     info!(
         mysql_port = config.mysql_port,
