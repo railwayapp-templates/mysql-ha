@@ -39,8 +39,17 @@ USER root
 # otherwise. A superseded series' base never re-mints upstream, so the
 # microdnf upgrade below is the only way OS fixes reach a pinned series.
 ARG PKG_REFRESH=none
+# exclude=mysql*: the OS upgrade must never touch the packages that define
+# the bundled MySQL series — the image's yum repo carries the cross-series
+# upgrade path, so an unrestricted `microdnf upgrade` turned a pinned :8.3
+# image into one bundling mysqld 8.4.0 (caught by the bundled-series guard
+# in CI, which refused to publish). microdnf has no --exclude flag; the
+# glob goes through dnf.conf (empty in this image) and is restored after.
 RUN echo "refresh key: ${PKG_REFRESH}" \
+    && cp /etc/dnf/dnf.conf /tmp/dnf.conf.orig \
+    && printf '[main]\nexclude=mysql*\n' >> /etc/dnf/dnf.conf \
     && microdnf upgrade -y \
+    && mv /tmp/dnf.conf.orig /etc/dnf/dnf.conf \
     && microdnf install -y wget && microdnf clean all
 
 COPY --from=rust-binaries --chmod=755 /mysql-wrapper /usr/local/bin/mysql-wrapper
