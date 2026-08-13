@@ -30,7 +30,13 @@ FROM haproxy:${HAPROXY_VERSION}-alpine
 USER root
 
 # mysql-client for Railway's Database UI SSH tunnel
-RUN apk add --no-cache mysql-client bash
+# CI content key (see the build workflow's content gate) — busts this layer
+# exactly when the repo code, the upstream base, or alpine's pending-fix set
+# moved, and keeps it byte-cached (stable digest) otherwise.
+ARG PKG_REFRESH=none
+RUN echo "refresh key: ${PKG_REFRESH}" \
+    && apk upgrade --no-cache \
+    && apk add --no-cache mysql-client bash
 
 COPY --from=rust-binaries --chmod=755 /haproxy-entrypoint /entrypoint
 

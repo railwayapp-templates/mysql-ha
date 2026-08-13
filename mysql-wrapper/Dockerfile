@@ -32,7 +32,16 @@ USER root
 # Official mysql images (8.0.31+/8.4) are Oracle Linux 9-based and use
 # microdnf, not apt/apk. wget is needed for the HEALTHCHECK below — unlike
 # the redis:bookworm base redis-ha wraps, this image doesn't bundle it.
-RUN microdnf install -y wget && microdnf clean all
+# CI passes its content key here (see the build workflow's content gate):
+# the value only changes when the repo code, the upstream base, or the
+# base's pending-security-fix set moved, so this layer re-runs exactly when
+# there is something to pick up — and stays byte-cached (stable digest)
+# otherwise. A superseded series' base never re-mints upstream, so the
+# microdnf upgrade below is the only way OS fixes reach a pinned series.
+ARG PKG_REFRESH=none
+RUN echo "refresh key: ${PKG_REFRESH}" \
+    && microdnf upgrade -y \
+    && microdnf install -y wget && microdnf clean all
 
 COPY --from=rust-binaries --chmod=755 /mysql-wrapper /usr/local/bin/mysql-wrapper
 
