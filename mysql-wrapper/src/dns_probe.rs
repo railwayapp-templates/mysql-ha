@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(&packet[0..2], &[0xBE, 0xEF]);
         assert_eq!(packet[2], 0x01); // RD
         assert_eq!(&packet[4..6], &[0x00, 0x01]); // one question
-        // QNAME: 7"mysql-2" 7"railway" 8"internal" 0
+                                                  // QNAME: 7"mysql-2" 7"railway" 8"internal" 0
         let qname_start = 12;
         assert_eq!(packet[qname_start], 7);
         assert_eq!(&packet[qname_start + 1..qname_start + 8], b"mysql-2");

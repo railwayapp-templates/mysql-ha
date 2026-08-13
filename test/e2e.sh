@@ -999,6 +999,95 @@ t_wiped_primary_volume_rejoins_fresh() {
     || bad "expected exactly one primary, got $codes"
 }
 
+t_split_brain_fork_self_heals() {
+  log "t_split_brain_fork_self_heals (a stale fork after a waiver bootstrap must self-heal, never merge silently)"
+  # Runs under .invalid so a STOPPED node's name resolves NXDOMAIN exactly
+  # like a deleted one — the condition under which the deletion waiver fires
+  # on a merely-stopped (data-intact) peer. Short dwells so the waiver arms
+  # within the test.
+  local old_suffix="${NODE_SUFFIX:-}" old_seeds="$SEEDS"
+  teardown_trio
+  NODE_SUFFIX=".sb.e2e.invalid"
+  SEEDS="mysql-1$NODE_SUFFIX:3306,mysql-2$NODE_SUFFIX:3306,mysql-3$NODE_SUFFIX:3306"
+  local n1="mysql-1$NODE_SUFFIX" n2="mysql-2$NODE_SUFFIX" n3="mysql-3$NODE_SUFFIX"
+
+  start_node 1 -e PEER_GONE_DWELL_SECONDS=30
+  start_node 2 -e PEER_GONE_DWELL_SECONDS=30
+  start_node 3 -e PEER_GONE_DWELL_SECONDS=30
+  if ! wait_until 300 "3 ONLINE members" group_is_fully_online "$n1"; then
+    bad "group never formed"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return
+  fi
+
+  # W1 (k=1) reaches all three.
+  sql "$n1" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'w1');"
+  wait_until 60 "W1 replicated to the future-behind node" \
+    bash -c '[ "$(docker exec '"$n3"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null)" = "w1" ]' \
+    || { bad "W1 never replicated"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
+  local derived_name
+  derived_name="$(sql "$n1" "SELECT @@group_replication_group_name")"
+
+  # Take the behind node out, then write W2 (k=2='w2-ahead') to the survivors
+  # only. n1/n2 now hold {W1,W2}; n3 holds {W1}. W2 occupies the exact GTID
+  # coordinate n3's post-bootstrap write will reuse.
+  docker stop "$n3" >/dev/null
+  wait_until 90 "group drops to 2 members" has_n_online "$n1" 2 \
+    || { bad "group never expelled the stopped node"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
+  local ahead_primary
+  ahead_primary="$(current_primary "$n1" "$n1" "$n2")" || { bad "no primary among survivors"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
+  sql "$ahead_primary" "INSERT INTO t.kv VALUES (2,'w2-ahead');"
+
+  # Total outage: stop the survivors too (volumes intact — the bug's premise),
+  # then bring back ONLY the behind node. Its stopped peers resolve NXDOMAIN,
+  # so past the dwell it waiver-bootstraps — now under a FRESH identity.
+  docker stop "$n1" "$n2" >/dev/null
+  docker start "$n3" >/dev/null
+  wait_until 240 "behind node waiver-bootstraps a fresh group" \
+    bash -c '[ "$(docker exec '"$n3"' wget -q -O /dev/null http://'"$n3"':8080/role 2>/dev/null && echo 200 || echo 503)" = "200" ]' \
+    || { bad "behind node never re-formed a group"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
+
+  local fresh_name
+  fresh_name="$(sql "$n3" "SELECT @@group_replication_group_name")"
+  [ -n "$fresh_name" ] && [ "$fresh_name" != "$derived_name" ] \
+    && ok "waiver bootstrap minted a fresh group identity ($fresh_name != $derived_name)" \
+    || bad "waiver bootstrap reused the derived identity ($fresh_name) — the fence did not arm"
+
+  # W3 (k=2='w3-reformed') on the reformed primary — SAME key, different value,
+  # SAME GTID coordinate W2 got. Under the old shared identity this is the
+  # silent collision; under the fresh identity it is a distinct transaction.
+  sql "$n3" "INSERT INTO t.kv VALUES (2,'w3-reformed') ON DUPLICATE KEY UPDATE v='w3-reformed';"
+
+  # Bring the stale-ahead nodes back. They must self-heal — with NO human
+  # action — by discarding their orphaned W2 and recloning from n3, never
+  # silently readmitting their forked history.
+  docker start "$n1" "$n2" >/dev/null
+  wait_until 420 "full group re-forms after the fork heals" group_is_fully_online "$n3" \
+    || { bad "group never re-formed 3/3 (stale nodes did not self-heal)"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
+  ok "all three nodes re-formed the group without intervention"
+
+  # The decisive assertion: k=2 is IDENTICAL on every node (no split brain),
+  # and it is the reformed primary's value — the stale W2 was discarded.
+  local v1 v2 v3
+  v1="$(sql "$n1" "SELECT v FROM t.kv WHERE k=2")"
+  v2="$(sql "$n2" "SELECT v FROM t.kv WHERE k=2")"
+  v3="$(sql "$n3" "SELECT v FROM t.kv WHERE k=2")"
+  [ "$v1" = "w3-reformed" ] && [ "$v2" = "w3-reformed" ] && [ "$v3" = "w3-reformed" ] \
+    && ok "k=2 converged to the reformed primary's value on all nodes (no fork: $v1/$v2/$v3)" \
+    || bad "SPLIT BRAIN: k=2 differs across nodes or kept the stale value ($v1/$v2/$v3)"
+
+  # The pre-fork data survived everywhere.
+  [ "$(sql "$n1" "SELECT v FROM t.kv WHERE k=1")" = "w1" ] \
+    && ok "pre-fork data (k=1) intact on the healed nodes" \
+    || bad "pre-fork data lost on a healed node"
+
+  # And it was a genuine self-heal, logged as a discard — not a silent merge.
+  docker logs "$n1" 2>&1 | grep -q "discarding the orphaned transactions and recloning" \
+    || docker logs "$n2" 2>&1 | grep -q "discarding the orphaned transactions and recloning" \
+    && ok "a stale node logged the divergence self-heal (orphaned tail discarded, not merged)" \
+    || bad "no divergence self-heal log line — convergence may have been a silent merge"
+
+  teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"
+}
+
 # ---------------------------------------------------------------------------
 
 t_restore_identical_datadirs() {
@@ -1062,7 +1151,7 @@ t_restore_identical_datadirs() {
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
 # row. The two outage-recovery tests teardown and seed their own trios, so
 # they sit safely between the chain and the cross-version finale.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

@@ -66,9 +66,7 @@ pub async fn probe_root_password(socket_path: &str, password: &str) -> RootPassw
         // ER_ACCESS_DENIED_ERROR — the server is up and rejected the
         // credential. Anything else (refused socket, timeout, init still
         // running) is indistinguishable from "not booted yet".
-        Ok(Err(mysql_async::Error::Server(e))) if e.code == 1045 => {
-            RootPasswordProbe::AccessDenied
-        }
+        Ok(Err(mysql_async::Error::Server(e))) if e.code == 1045 => RootPasswordProbe::AccessDenied,
         Ok(Err(e)) => RootPasswordProbe::NotReady(e.to_string()),
         Err(_) => RootPasswordProbe::NotReady("probe timed out".to_string()),
     }
@@ -78,7 +76,10 @@ impl Sql {
     pub fn connect_root_over_socket(socket_path: &str, root_password: &str) -> Self {
         Self {
             socket_path: Arc::new(socket_path.to_string()),
-            pool: Arc::new(RwLock::new(Pool::new(root_opts(socket_path, root_password)))),
+            pool: Arc::new(RwLock::new(Pool::new(root_opts(
+                socket_path,
+                root_password,
+            )))),
         }
     }
 
@@ -101,10 +102,7 @@ impl Sql {
         Ok(pool.get_conn().await?)
     }
 
-    async fn short<T>(
-        &self,
-        fut: impl std::future::Future<Output = Result<T>>,
-    ) -> Result<T> {
+    async fn short<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         tokio::time::timeout(SHORT_QUERY_TIMEOUT, fut)
             .await
             .map_err(|_| anyhow!("query timed out after {SHORT_QUERY_TIMEOUT:?}"))?
@@ -158,7 +156,11 @@ impl Sql {
         self.short(async {
             let mut conn = self.conn().await?;
             // 8.4+/9.x syntax first; RESET MASTER for anything older.
-            if conn.query_drop("RESET BINARY LOGS AND GTIDS").await.is_err() {
+            if conn
+                .query_drop("RESET BINARY LOGS AND GTIDS")
+                .await
+                .is_err()
+            {
                 conn.query_drop("RESET MASTER").await?;
             }
             Ok(())
@@ -227,8 +229,7 @@ impl Sql {
                     (peer, mine, mine, peer),
                 )
                 .await?;
-            let (peer_sub_mine, mine_sub_peer) =
-                row.context("GTID_SUBSET returned no row")?;
+            let (peer_sub_mine, mine_sub_peer) = row.context("GTID_SUBSET returned no row")?;
             Ok((peer_sub_mine == 1, mine_sub_peer == 1))
         })
         .await
@@ -283,6 +284,40 @@ impl Sql {
         ))
         .await?;
         Ok(())
+    }
+
+    /// Point the NEXT START GROUP_REPLICATION at a different group name.
+    /// Only valid while the plugin is stopped — the orchestrator owns that
+    /// ordering (it never calls this once the node is group-active).
+    pub async fn set_group_name(&self, group_name: &str) -> Result<()> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            conn.query_drop(format!(
+                "SET GLOBAL group_replication_group_name = {}",
+                sql_string_literal(group_name)
+            ))
+            .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Transactions in `mine` that are NOT in `theirs` — evaluated by mysqld
+    /// itself, the only component that parses GTID sets correctly. The
+    /// divergence evidence: exactly what a self-healing reclone is about to
+    /// discard, logged before it happens.
+    pub async fn gtid_subtract(&self, mine: &str, theirs: &str) -> Result<String> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            let diff: Option<String> = conn
+                .exec_first("SELECT GTID_SUBTRACT(?, ?)", (mine, theirs))
+                .await?;
+            Ok(diff
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<String>())
+        })
+        .await
     }
 
     /// Bootstrap a brand-new group from this node. Only the orchestrator's
@@ -349,7 +384,8 @@ impl Sql {
     /// clone-recreated datadir loses.
     pub async fn set_group_pre_gtid_flag(&self) -> Result<()> {
         let mut conn = self.conn().await?;
-        conn.query_drop("CREATE SCHEMA IF NOT EXISTS railway_ha").await?;
+        conn.query_drop("CREATE SCHEMA IF NOT EXISTS railway_ha")
+            .await?;
         conn.query_drop(
             "CREATE TABLE IF NOT EXISTS railway_ha.meta \
              (k VARCHAR(64) PRIMARY KEY, v VARCHAR(255) NOT NULL)",

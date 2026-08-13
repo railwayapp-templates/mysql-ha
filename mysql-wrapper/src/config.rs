@@ -208,7 +208,9 @@ mod tests {
     fn requires_root_password() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
-        let err = Config::from_env().err().expect("should fail without a password");
+        let err = Config::from_env()
+            .err()
+            .expect("should fail without a password");
         assert!(err.to_string().contains("MYSQL_ROOT_PASSWORD"));
     }
 

@@ -19,12 +19,17 @@
 //!     freeze every future total-outage recovery forever. The private
 //!     resolver answers NXDOMAIN only when zero live containers are
 //!     registered behind the name; a partition yields SERVFAIL, never
-//!     NXDOMAIN (see dns_probe.rs). Caveat, accepted and shared with
-//!     redis-ha's membership prune: a STOPPED service also has zero live
-//!     containers, so a peer stopped for longer than the dwell during a
-//!     total outage can be waived even though its volume still holds data —
-//!     if it was the most advanced node, its tail writes stay stranded
-//!     until an operator reconciles. The dwell is long precisely to keep
+//!     NXDOMAIN (see dns_probe.rs). Residual case, now fully self-healing:
+//!     a STOPPED service also has zero live containers, so a peer stopped
+//!     for longer than the dwell during a total outage can be waived even
+//!     though its volume still holds data. If it was the most advanced
+//!     node, its tail forks from the group that re-forms without it — so a
+//!     waiver bootstrap mints a FRESH group identity (see the bootstrap
+//!     arm), which turns that fork from an undetectable GTID-coordinate
+//!     collision into ordinary divergence that the stranded node resolves
+//!     by discarding its orphaned tail and recloning. No human ever
+//!     required; the stranded tail is discarded visibly, never merged
+//!     silently. The dwell is long precisely to keep
 //!     that window out of ordinary redeploy/restart timelines.
 //!   - NEVER bootstrap unless every reachable peer's executed-GTID set is a
 //!     subset of this node's — after a full outage the most-advanced node
@@ -38,8 +43,12 @@
 //!     can't describe) outranks fresh nodes, then declared seed order
 //!     decides. Every node computes the same order, so exactly one wins.
 //!   - DIVERGED histories (two nodes each holding transactions the other
-//!     lacks) freeze bootstrap everywhere: picking a side automatically
-//!     would silently discard the other side's committed writes.
+//!     lacks) are resolved deterministically, never frozen for a human:
+//!     the more recent authority wins — higher waiver generation first,
+//!     then declared seed order — and the losing side self-heals by
+//!     discarding its orphaned tail (logged as evidence) and recloning. A
+//!     fork can only arise past a waiver bootstrap's fresh identity, so the
+//!     generation always separates the two sides cleanly.
 //!   - The bootstrap decision must hold stable for a dwell period before it
 //!     is acted on, so a slow-starting peer gets a window to contradict it.
 //!   - Joining is the default: any peer reporting a live group means this
@@ -65,6 +74,7 @@ use uuid::Uuid;
 pub const RECOVERY_USER: &str = "gr_recovery";
 const GROUP_NAME_MARKER: &str = ".railway_gr_group_name";
 const PRE_GTID_DATA_MARKER: &str = ".railway_pre_gtid_data";
+const WAIVER_GENERATION_MARKER: &str = ".railway_gr_waiver_generation";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 fn marker_path(config: &Config) -> PathBuf {
@@ -73,6 +83,36 @@ fn marker_path(config: &Config) -> PathBuf {
 
 fn pre_gtid_marker_path(data_dir: &str) -> PathBuf {
     Path::new(data_dir).join(PRE_GTID_DATA_MARKER)
+}
+
+fn waiver_generation_path(data_dir: &str) -> PathBuf {
+    Path::new(data_dir).join(WAIVER_GENERATION_MARKER)
+}
+
+/// The group name this volume's history belongs to, straight from the
+/// marker. None before the first persist (a first boot pre-orchestration) —
+/// peers only consume this from group-active nodes, which have long since
+/// persisted theirs.
+fn read_group_name_marker(data_dir: &str) -> Option<String> {
+    let content = std::fs::read_to_string(Path::new(data_dir).join(GROUP_NAME_MARKER)).ok()?;
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// How many waiver bootstraps this volume's history has been through. 0 for
+/// pre-waiver volumes and fresh nodes (marker absent) — see GrState's
+/// waiver_generation for what it decides.
+pub fn read_waiver_generation(data_dir: &str) -> u64 {
+    std::fs::read_to_string(waiver_generation_path(data_dir))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn persist_waiver_generation(data_dir: &str, generation: u64) -> Result<()> {
+    let path = waiver_generation_path(data_dir);
+    std::fs::write(&path, format!("{generation}\n"))
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Does this node hold data that predates its GTID history? True for an
@@ -132,10 +172,7 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
         .iter()
         .find(|m| m.member_id.eq_ignore_ascii_case(&self_uuid));
     let member_state = me.map(|m| m.state.clone());
-    let group_active = matches!(
-        member_state.as_deref(),
-        Some("ONLINE") | Some("RECOVERING")
-    );
+    let group_active = matches!(member_state.as_deref(), Some("ONLINE") | Some("RECOVERING"));
 
     Ok(GrState {
         group_active,
@@ -149,6 +186,8 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
         // adopting node's deletion.
         pre_gtid_data: has_pre_gtid_data(data_dir) || sql.group_pre_gtid_flag().await,
         server_uuid: Some(self_uuid),
+        group_name: read_group_name_marker(data_dir),
+        waiver_generation: read_waiver_generation(data_dir),
     })
 }
 
@@ -226,8 +265,10 @@ enum PeerRelation {
     Equal { pre_gtid_data: bool },
     /// Strict superset of ours — the peer should bootstrap, not us.
     Ahead,
-    /// Each side holds transactions the other lacks. No safe bootstrap
-    /// exists anywhere until an operator reconciles the histories.
+    /// Each side holds transactions the other lacks. classify_round resolves
+    /// this into Behind/Ahead deterministically (waiver generation, then
+    /// seed order) so the losing side self-heals instead of freezing; kept
+    /// as a distinct relation for decide()'s defensive handling and tests.
     Diverged,
     /// Unreachable, not ready, or answered without a GTID set.
     Unknown,
@@ -256,8 +297,9 @@ enum BootstrapVerdict {
     /// A peer's dataset ties ours and it precedes us in the tie-break — it
     /// bootstraps, we join its group.
     DeferToPeer(String),
-    /// A peer's history has DIVERGED from ours — bootstrap is frozen
-    /// everywhere until an operator reconciles the datasets.
+    /// A peer's history has DIVERGED from ours and could not be auto-
+    /// resolved. Defensive only: classify_round resolves divergence into
+    /// Behind/Ahead before decide() ever sees it.
     Diverged(String),
     /// At least one peer is unreachable/not-ready — no safe decision exists.
     Undecidable,
@@ -276,23 +318,56 @@ async fn classify_round(
         return Ok(BootstrapVerdict::JoinExistingGroup);
     }
 
+    let my_generation = read_waiver_generation(&config.data_dir);
+    let my_seed_rank = config.my_seed_rank().unwrap_or(usize::MAX);
+
     let mut peers = Vec::with_capacity(answers.len());
     for (host, answer) in answers {
         let relation = match answer {
             PeerAnswer::State(GrState {
                 gtid_executed: Some(peer_gtid),
                 pre_gtid_data,
+                waiver_generation,
                 ..
             }) => {
-                let (peer_sub_mine, mine_sub_peer) =
-                    sql.gtid_compare(my_gtid, peer_gtid).await?;
+                let (peer_sub_mine, mine_sub_peer) = sql.gtid_compare(my_gtid, peer_gtid).await?;
                 match (peer_sub_mine, mine_sub_peer) {
                     (true, true) => PeerRelation::Equal {
                         pre_gtid_data: *pre_gtid_data,
                     },
                     (true, false) => PeerRelation::Behind,
                     (false, true) => PeerRelation::Ahead,
-                    (false, false) => PeerRelation::Diverged,
+                    // Both sides hold transactions the other lacks. Nothing
+                    // here may EVER merge them — but nothing may freeze
+                    // waiting for a human either: resolve deterministically,
+                    // and the losing side self-heals by discarding its
+                    // orphaned tail (with evidence) and recloning from the
+                    // winner's group once it is live. The winner is the more
+                    // recent authority: higher waiver generation first (a
+                    // fresh waiver bootstrap IS the newer history), seed
+                    // order on a tie. Both inputs are identical on every
+                    // node, so all nodes agree on the single winner.
+                    (false, false) => {
+                        let peer_rank = config.seed_rank(host).unwrap_or(usize::MAX);
+                        let peer_wins = diverged_peer_wins(
+                            my_generation,
+                            my_seed_rank,
+                            *waiver_generation,
+                            peer_rank,
+                        );
+                        warn!(
+                            %host,
+                            peer_generation = waiver_generation,
+                            my_generation,
+                            peer_wins,
+                            "GTID histories DIVERGED; auto-resolving by waiver generation then seed order — the losing side will discard its orphaned tail and reclone"
+                        );
+                        if peer_wins {
+                            PeerRelation::Ahead
+                        } else {
+                            PeerRelation::Behind
+                        }
+                    }
                 }
             }
             // A reachable peer that didn't report a GTID set is as
@@ -310,9 +385,29 @@ async fn classify_round(
 
     Ok(decide(
         has_pre_gtid_data(&config.data_dir),
-        config.my_seed_rank().unwrap_or(usize::MAX),
+        my_seed_rank,
         &peers,
     ))
+}
+
+/// The deterministic winner when two histories have diverged (each holds
+/// transactions the other lacks). Returns true when the PEER's history is
+/// authoritative and this node must self-heal to it. The more recent
+/// authority wins — higher waiver generation first (a waiver bootstrap mints
+/// a strictly greater generation, so the group that re-formed most recently
+/// outranks a stale fork), declared seed order on a tie. Every node feeds
+/// identical inputs, so all agree on one winner and exactly one side reclones.
+fn diverged_peer_wins(
+    my_generation: u64,
+    my_seed_rank: usize,
+    peer_generation: u64,
+    peer_seed_rank: usize,
+) -> bool {
+    match peer_generation.cmp(&my_generation) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => peer_seed_rank < my_seed_rank,
+    }
 }
 
 /// The pure bootstrap decision, given every peer's standing. Candidacy is
@@ -363,7 +458,7 @@ pub async fn orchestrate(
     config: Arc<Config>,
     sql: Sql,
     telemetry: Arc<Telemetry>,
-    group_name: String,
+    mut group_name: String,
     fresh_datadir: bool,
 ) {
     // 1. Wait for the FINAL mysqld. docker-entrypoint's first-boot
@@ -538,9 +633,7 @@ pub async fn orchestrate(
             .iter()
             .map(|host| query_peer(&http, host, config.health_port, peer_timeout))
             .collect();
-        for (host, answer) in peer_hosts.iter().zip(
-            futures_join_all(futures).await,
-        ) {
+        for (host, answer) in peer_hosts.iter().zip(futures_join_all(futures).await) {
             answers.push((host.clone(), answer));
         }
 
@@ -552,8 +645,7 @@ pub async fn orchestrate(
             if matches!(answer, PeerAnswer::Unreachable) {
                 let (verdict, detail) = probe_name_detailed(host, dns_deadline).await;
                 gone_tracker.observe(host, verdict, now);
-                if verdict == NameVerdict::Gone && !gone_tracker.is_waived(host, now, gone_dwell)
-                {
+                if verdict == NameVerdict::Gone && !gone_tracker.is_waived(host, now, gone_dwell) {
                     info!(
                         %host,
                         ?detail,
@@ -586,6 +678,9 @@ pub async fn orchestrate(
             }
             last_waiver_note = waiver_note;
         }
+        // Owned before `answers` moves into `considered` below; drives the
+        // fresh-identity fence in the bootstrap arm.
+        let any_waived = !waived.is_empty();
 
         let group_seen = answers
             .iter()
@@ -644,14 +739,132 @@ pub async fn orchestrate(
                 }
             }
 
+            // Identity adoption: a waiver bootstrap mints a FRESH random
+            // group name (see the bootstrap arm below), so the live group's
+            // name can no longer be derived — joiners take it from the
+            // group's own /gr/state advert. Also carries the group's waiver
+            // generation forward, so this node votes with the group's
+            // lineage in any future divergence tie-break. An explicit
+            // GR_GROUP_NAME env pin wins over adoption — the operator said
+            // exactly which group this node belongs to.
+            let live_identity = answers.iter().find_map(|(_, a)| match a {
+                PeerAnswer::State(s) if s.group_active => {
+                    s.group_name.clone().map(|name| (name, s.waiver_generation))
+                }
+                _ => None,
+            });
+            if let Some((live_name, live_generation)) = live_identity {
+                if live_name != group_name {
+                    if config.gr_group_name.is_some() {
+                        wait_log_once(
+                            &mut last_wait_reason,
+                            &format!(
+                                "live group runs as {live_name} but GR_GROUP_NAME pins {group_name}; refusing to adopt an identity the operator overrode"
+                            ),
+                        );
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                        continue;
+                    }
+                    match sql.set_group_name(&live_name).await {
+                        Ok(()) => {
+                            info!(
+                                from = %group_name,
+                                to = %live_name,
+                                generation = live_generation,
+                                "adopting the live group's identity"
+                            );
+                            if let Err(e) = persist_group_name(&config, &live_name) {
+                                warn!(error = %e, "could not persist adopted group name");
+                            }
+                            let my_generation = read_waiver_generation(&config.data_dir);
+                            if live_generation > my_generation {
+                                if let Err(e) =
+                                    persist_waiver_generation(&config.data_dir, live_generation)
+                                {
+                                    warn!(error = %e, "could not persist adopted waiver generation");
+                                }
+                            }
+                            group_name = live_name;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "could not adopt the live group's identity; retrying");
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Divergence self-heal: this node holds committed transactions
+            // the LIVE group does not (a stale tail from before a waiver
+            // bootstrap re-formed the group, or an errant local write). The
+            // group is the authority — those transactions can never be
+            // merged, and Group Replication would refuse this joiner on
+            // every attempt forever. Heal automatically: log exactly what is
+            // being discarded (the orphaned GTID set — the binlogs holding
+            // it are gone once the clone lands, so this line IS the durable
+            // evidence), then reclone from the group. Never blocks on a
+            // human; the worst case is a visibly-logged discarded tail,
+            // never a silent merge and never a wedged node.
+            let my_gtid_now = sql.executed_gtid_set().await.unwrap_or_default();
+            if !my_gtid_now.is_empty() {
+                let live_peer_gtid = answers.iter().find_map(|(_, a)| match a {
+                    PeerAnswer::State(s) if s.group_active => s.gtid_executed.clone(),
+                    _ => None,
+                });
+                if let Some(peer_gtid) = live_peer_gtid {
+                    match sql.gtid_compare(&my_gtid_now, &peer_gtid).await {
+                        Ok((_, mine_sub_peer)) if !mine_sub_peer => {
+                            let orphaned = sql
+                                .gtid_subtract(&my_gtid_now, &peer_gtid)
+                                .await
+                                .unwrap_or_else(|_| "unavailable".to_string());
+                            warn!(
+                                %orphaned,
+                                "this node's history diverged from the live group; discarding the orphaned transactions and recloning"
+                            );
+                            telemetry.send(TelemetryEvent::ComponentError {
+                                component: "mysql-wrapper".to_string(),
+                                error: format!(
+                                    "diverged from the live group; discarded orphaned transactions: {orphaned}"
+                                ),
+                                context: "divergence_self_heal".to_string(),
+                            });
+                            if let Some(donor) = pick_donor(&answers) {
+                                match sql
+                                    .clone_from_donor(
+                                        &donor,
+                                        config.mysql_port,
+                                        RECOVERY_USER,
+                                        &recovery_password,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => info!("divergence reclone completed; server will shut down and rejoin on restart"),
+                                    Err(e) => info!(error = %e, "divergence reclone initiated (connection drop on shutdown is expected)"),
+                                }
+                            }
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(error = %e, "could not compare GTID history against the live group");
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Clone-first path: the group carries data that predates its
             // GTID history (adopted standalone volume), and this node has no
             // GTID history of its own to prove it holds that base data.
             // Binlog-based recovery would join "successfully" while silently
             // skipping everything that was never binlogged — clone instead.
-            let group_has_pre_gtid_data = answers
-                .iter()
-                .any(|(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active && s.pre_gtid_data));
+            let group_has_pre_gtid_data = answers.iter().any(
+                |(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active && s.pre_gtid_data),
+            );
             let i_hold_pre_gtid_data = has_pre_gtid_data(&config.data_dir);
             let my_gtid_is_empty = sql
                 .executed_gtid_set()
@@ -660,20 +873,15 @@ pub async fn orchestrate(
                 .unwrap_or(false);
 
             if group_has_pre_gtid_data && !i_hold_pre_gtid_data && my_gtid_is_empty {
-                let donor = answers
-                    .iter()
-                    .filter_map(|(host, a)| match a {
-                        PeerAnswer::State(s) if s.group_active => {
-                            Some((host.clone(), s.member_role.clone()))
-                        }
-                        _ => None,
-                    })
-                    .max_by_key(|(_, role)| role.as_deref() == Some("PRIMARY"))
-                    .map(|(host, _)| host);
-                if let Some(donor) = donor {
+                if let Some(donor) = pick_donor(&answers) {
                     info!(%donor, "group holds pre-GTID data — cloning instead of binlog recovery");
                     match sql
-                        .clone_from_donor(&donor, config.mysql_port, RECOVERY_USER, &recovery_password)
+                        .clone_from_donor(
+                            &donor,
+                            config.mysql_port,
+                            RECOVERY_USER,
+                            &recovery_password,
+                        )
                         .await
                     {
                         // Either way the expected outcome is the same: the
@@ -683,8 +891,12 @@ pub async fn orchestrate(
                         // boot joins on the cloned data. An Err here is
                         // almost always the dropped connection of that
                         // shutdown, not a failure.
-                        Ok(()) => info!("clone completed; server will shut down and rejoin on restart"),
-                        Err(e) => info!(error = %e, "clone initiated (connection drop on shutdown is expected)"),
+                        Ok(()) => {
+                            info!("clone completed; server will shut down and rejoin on restart")
+                        }
+                        Err(e) => {
+                            info!(error = %e, "clone initiated (connection drop on shutdown is expected)")
+                        }
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
@@ -739,7 +951,72 @@ pub async fn orchestrate(
                         "bootstrap looks safe; holding for the dwell period",
                     );
                 } else {
-                    info!(?held, "bootstrapping a new group");
+                    // Fencing: a bootstrap that WAIVED a peer is resuming
+                    // authority past a member whose data could not be
+                    // compared — if that member was merely stopped (its name
+                    // resolves gone either way) and it was AHEAD, the two
+                    // histories fork here. Under the derived (deterministic)
+                    // group name, both forks would mint the SAME GTID
+                    // coordinates for DIFFERENT transactions, and every
+                    // GTID-set comparison downstream — including Group
+                    // Replication's own join admission — would read the
+                    // forked histories as EQUAL: the returning member would
+                    // be readmitted silently and the data split would be
+                    // permanent and invisible. A FRESH random name makes the
+                    // fork structurally detectable (the Postgres-timeline /
+                    // Raft-term / fencing-token move): the stale member's
+                    // tail lives under a UUID the new group never issued, so
+                    // it surfaces as ordinary divergence and self-heals via
+                    // the reclone path above. Routine bootstraps (nobody
+                    // waived) keep the persisted name — regenerating it on
+                    // every restart would force a full reclone of every
+                    // member each time.
+                    if any_waived {
+                        let fresh_name = Uuid::new_v4().to_string();
+                        let peer_generations = considered
+                            .iter()
+                            .filter_map(|(_, a)| match a {
+                                PeerAnswer::State(s) => Some(s.waiver_generation),
+                                _ => None,
+                            })
+                            .max()
+                            .unwrap_or(0);
+                        let next_generation =
+                            read_waiver_generation(&config.data_dir).max(peer_generations) + 1;
+                        match sql.set_group_name(&fresh_name).await {
+                            Ok(()) => {
+                                warn!(
+                                    old_name = %group_name,
+                                    new_name = %fresh_name,
+                                    generation = next_generation,
+                                    "bootstrapping past waived peers — minting a fresh group identity to fence off any stale fork"
+                                );
+                                telemetry.send(TelemetryEvent::ComponentError {
+                                    component: "mysql-wrapper".to_string(),
+                                    error: format!(
+                                        "waiver bootstrap: fresh group identity {fresh_name} (generation {next_generation}) fences the waived peers' potential stale fork"
+                                    ),
+                                    context: "waiver_bootstrap_fence".to_string(),
+                                });
+                                if let Err(e) = persist_group_name(&config, &fresh_name) {
+                                    warn!(error = %e, "could not persist fresh group name");
+                                }
+                                if let Err(e) =
+                                    persist_waiver_generation(&config.data_dir, next_generation)
+                                {
+                                    warn!(error = %e, "could not persist waiver generation");
+                                }
+                                group_name = fresh_name;
+                            }
+                            Err(e) => {
+                                error!(error = %e, "could not set the fresh group name; refusing to bootstrap under the shared identity");
+                                safe_since = None;
+                                tokio::time::sleep(POLL_INTERVAL).await;
+                                continue;
+                            }
+                        }
+                    }
+                    info!(?held, group_name = %group_name, "bootstrapping a new group");
                     match sql.bootstrap_group().await {
                         Ok(()) => {
                             if let Err(e) = post_bootstrap(&sql).await {
@@ -814,18 +1091,20 @@ pub async fn orchestrate(
             }
             Ok(BootstrapVerdict::Diverged(host)) => {
                 safe_since = None;
-                // Committed transactions exist on both sides that the other
-                // never saw. Any automatic choice would silently discard one
-                // side's writes — freeze and page. Telemetry only on the
-                // transition; this loop runs every few seconds.
+                // Defensive only: classify_round resolves divergence into
+                // Behind/Ahead (waiver generation, then seed order) before
+                // decide() runs, so this arm should be unreachable. If it
+                // ever fires, hold rather than guess — but surface it loudly,
+                // because reaching here means the deterministic resolution
+                // failed to apply. Telemetry on the transition only.
                 let changed = wait_log_once(
                     &mut last_wait_reason,
-                    &format!("GTID history has DIVERGED from peer {host}; refusing to bootstrap anywhere — operator required"),
+                    &format!("GTID history DIVERGED from peer {host} and did not auto-resolve; holding (unexpected — classify_round should have resolved this)"),
                 );
                 if changed {
                     telemetry.send(TelemetryEvent::ComponentError {
                         component: "mysql-wrapper".to_string(),
-                        error: format!("diverged GTID history with peer {host}"),
+                        error: format!("unresolved diverged GTID history with peer {host}"),
                         context: "bootstrap_guard".to_string(),
                     });
                 }
@@ -884,8 +1163,24 @@ fn wait_log_once(last: &mut String, reason: &str) -> bool {
     false
 }
 
+/// The clone donor among the live group's members — the PRIMARY when one is
+/// visible (its dataset is the authority by definition), else any active
+/// member.
+fn pick_donor(answers: &[(String, PeerAnswer)]) -> Option<String> {
+    answers
+        .iter()
+        .filter_map(|(host, a)| match a {
+            PeerAnswer::State(s) if s.group_active => Some((host.clone(), s.member_role.clone())),
+            _ => None,
+        })
+        .max_by_key(|(_, role)| role.as_deref() == Some("PRIMARY"))
+        .map(|(host, _)| host)
+}
+
 /// Tiny join_all so we don't pull the futures crate in for one call site.
-async fn futures_join_all(futures: Vec<impl std::future::Future<Output = PeerAnswer>>) -> Vec<PeerAnswer> {
+async fn futures_join_all(
+    futures: Vec<impl std::future::Future<Output = PeerAnswer>>,
+) -> Vec<PeerAnswer> {
     let mut results = Vec::with_capacity(futures.len());
     for f in futures {
         results.push(f.await);
@@ -1057,7 +1352,10 @@ mod tests {
     }
 
     #[test]
-    fn diverged_history_freezes_bootstrap() {
+    fn diverged_relation_is_defensive_only_but_still_freezes_decide() {
+        // classify_round never emits Diverged anymore (it resolves into
+        // Behind/Ahead via diverged_peer_wins), but decide() keeps freezing
+        // on it as a belt-and-suspenders guard should one ever reach it.
         let peers = vec![
             standing("mysql-2", 1, PeerRelation::Diverged),
             standing("mysql-3", 2, PeerRelation::Behind),
@@ -1066,6 +1364,48 @@ mod tests {
             decide(false, 0, &peers),
             BootstrapVerdict::Diverged("mysql-2".to_string())
         );
+    }
+
+    #[test]
+    fn divergence_resolves_by_generation_then_seed_order() {
+        // Higher waiver generation is the newer authority and wins outright,
+        // regardless of seed rank.
+        assert!(diverged_peer_wins(0, 0, 1, 9)); // peer gen 1 > my gen 0
+        assert!(!diverged_peer_wins(2, 9, 1, 0)); // my gen 2 > peer gen 1
+
+        // Equal generation falls through to seed order: lower rank wins.
+        assert!(diverged_peer_wins(1, 2, 1, 1)); // peer rank 1 < my rank 2
+        assert!(!diverged_peer_wins(1, 1, 1, 2)); // my rank 1 < peer rank 2
+
+        // Symmetry: exactly one side self-heals. For any (myGen,myRank) vs
+        // (peerGen,peerRank) with distinct ranks, the two nodes reach
+        // opposite verdicts.
+        let a = diverged_peer_wins(1, 0, 1, 1);
+        let b = diverged_peer_wins(1, 1, 1, 0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn waiver_generation_marker_roundtrips() {
+        let dir =
+            std::env::temp_dir().join(format!("mysql-wrapper-gen-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_dir = dir.to_string_lossy().into_owned();
+
+        // Absent marker reads as generation 0 (pre-waiver volumes).
+        assert_eq!(read_waiver_generation(&data_dir), 0);
+
+        persist_waiver_generation(&data_dir, 3).unwrap();
+        assert_eq!(read_waiver_generation(&data_dir), 3);
+
+        // A blank/garbage marker degrades to 0, never panics.
+        std::fs::write(waiver_generation_path(&data_dir), "  \n").unwrap();
+        assert_eq!(read_waiver_generation(&data_dir), 0);
+        std::fs::write(waiver_generation_path(&data_dir), "not-a-number").unwrap();
+        assert_eq!(read_waiver_generation(&data_dir), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1103,6 +1443,8 @@ mod tests {
             members_reachable: usize::from(group_active),
             pre_gtid_data: false,
             server_uuid: server_uuid.map(str::to_string),
+            group_name: None,
+            waiver_generation: 0,
         })
     }
 
@@ -1157,10 +1499,7 @@ mod tests {
 
     #[test]
     fn persisted_marker_wins_over_derivation() {
-        let dir = std::env::temp_dir().join(format!(
-            "mysql-ha-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("mysql-ha-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut config = test_config();
         config.data_dir = dir.to_string_lossy().to_string();
