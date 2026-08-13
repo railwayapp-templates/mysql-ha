@@ -67,6 +67,12 @@ pub struct Config {
     /// Overall bound on the pre-shutdown primary handoff, milliseconds
     /// (see demote_on_shutdown.rs).
     pub demote_timeout_ms: u64,
+    /// How long a declared peer's NAME must be authoritatively gone
+    /// (continuous NXDOMAIN) before the bootstrap guard stops waiting on it.
+    /// Long on purpose: a redeploy passes through a no-container NXDOMAIN
+    /// window, and waiving a peer that was merely mid-redeploy could
+    /// bootstrap past the most advanced dataset. See gr::GoneTracker.
+    pub peer_gone_dwell_seconds: u64,
 }
 
 impl Config {
@@ -97,6 +103,7 @@ impl Config {
             mysql_max_connections: non_empty(std::env::var("MYSQL_MAX_CONNECTIONS").ok())
                 .and_then(|v| v.parse().ok()),
             demote_timeout_ms: u64::env_parse("DEMOTE_TIMEOUT_MS", 20_000),
+            peer_gone_dwell_seconds: u64::env_parse("PEER_GONE_DWELL_SECONDS", 1800),
         };
 
         if config.gr_enabled() && config.gr_replication_password.is_none() {
