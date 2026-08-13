@@ -505,6 +505,92 @@ impl Sql {
         .await?;
         Ok(())
     }
+
+    /// `@@version`, for the PITR full-backup meta record.
+    pub async fn mysql_version(&self) -> Result<String> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            let v: Option<String> = conn.query_first("SELECT @@version").await?;
+            v.context("@@version returned no row")
+        })
+        .await
+    }
+
+    /// The currently active binlog file and mysqld's write position in it.
+    /// `SHOW BINARY LOG STATUS` (8.4+/9.x) replaced `SHOW MASTER STATUS`
+    /// (renamed the same release as `CHANGE MASTER TO` →
+    /// `CHANGE REPLICATION SOURCE TO`) — try the new name first, fall back to
+    /// the old one so the same archiver binary runs against every series this
+    /// image bundles. Read as a raw `Row` and indexed by column NAME, not a
+    /// typed tuple: both statements return several more columns than just
+    /// File/Position (Binlog_Do_DB, Executed_Gtid_Set, ...), and
+    /// `FromRow` for tuples requires an exact column-count match.
+    pub async fn binary_log_status(&self) -> Result<(String, u64)> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            let row: Option<mysql_async::Row> = match conn
+                .query_first("SHOW BINARY LOG STATUS")
+                .await
+            {
+                Ok(row) => row,
+                Err(_) => conn.query_first("SHOW MASTER STATUS").await?,
+            };
+            let row = row.context(
+                "SHOW BINARY LOG STATUS / SHOW MASTER STATUS returned no row (is log_bin enabled?)",
+            )?;
+            let file: String = row.get("File").context("row has no File column")?;
+            let pos: u64 = row.get("Position").context("row has no Position column")?;
+            Ok((file, pos))
+        })
+        .await
+    }
+
+    /// Roll onto a new binlog file — the archiver's rotation cadence, bounding
+    /// how much of the current file can still be lost.
+    pub async fn flush_binary_logs(&self) -> Result<()> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            conn.query_drop("FLUSH BINARY LOGS").await?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Reclaim every binlog strictly before `file` (never `file` itself) —
+    /// only ever called with a file every predecessor of which the archiver
+    /// has already confirmed uploaded (see pitr::purge_cut).
+    pub async fn purge_binary_logs_to(&self, file: &str) -> Result<()> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            conn.query_drop(format!(
+                "PURGE BINARY LOGS TO {}",
+                sql_string_literal(file)
+            ))
+            .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Attempt to toggle the TCP listener at runtime — the restore path's
+    /// defense-in-depth attempt to keep the restore-phase server off the
+    /// network while it loads the dump and replays binlogs. Verified
+    /// read-only at runtime on the bundled 8.4 series, so this routinely
+    /// errors; the caller logs and continues rather than treating it as
+    /// fatal (see restore.rs for why nothing external can reach this boot
+    /// anyway).
+    pub async fn set_global_skip_networking(&self, on: bool) -> Result<()> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            conn.query_drop(format!(
+                "SET GLOBAL skip_networking = {}",
+                if on { "ON" } else { "OFF" }
+            ))
+            .await?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 /// Quote a string as a MySQL literal (single-quoted, backslash-escaped).
