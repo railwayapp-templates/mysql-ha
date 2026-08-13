@@ -225,6 +225,53 @@ pub fn write_gr_conf(config: &Config, group_name: &str, server_id: u32) -> Resul
     Ok(())
 }
 
+pub const ARCHIVE_CONF_FILE_NAME: &str = "zz-railway-pitr-archive.cnf";
+
+/// Standalone + `BINLOG_ARCHIVE_BUCKET` set: the plain standalone rendering
+/// (no file at all — see main.rs) leaves the binlog off, same as the
+/// upstream image. Archiving needs it on; this is the ONLY difference from
+/// that plain rendering. Written to its own file, separate from
+/// `CONF_FILE_NAME`, since the two are mutually exclusive (GR mode never
+/// reaches this path — see main.rs's standalone-only gate).
+pub struct StandaloneArchiveConfInput {
+    pub server_id: u32,
+}
+
+pub fn render_standalone_archive_conf(input: &StandaloneArchiveConfInput) -> String {
+    format!(
+        r#"# Rendered by mysql-wrapper — do not edit; changes are overwritten on boot.
+# Standalone mode with BINLOG_ARCHIVE_BUCKET set: binlog archiving needs the
+# binlog on, which the plain standalone rendering (no file at all) otherwise
+# leaves off, same as the upstream image — see main.rs.
+[mysqld]
+server_id = {server_id}
+
+log_bin = binlog
+binlog_format = ROW
+sync_binlog = 1
+
+# The archiver reclaims a closed binlog itself once it has confirmed the
+# upload (see archiver.rs's PURGE BINARY LOGS TO) — this expiry is only a
+# backstop against an archiver that has stopped running altogether, giving
+# ample time to notice and fix that before the volume fills.
+binlog_expire_logs_seconds = 604800
+"#,
+        server_id = input.server_id,
+    )
+}
+
+/// Write the standalone archive config fragment. Must run before mysqld is
+/// spawned, same requirement as `write_gr_conf`. Never called when GR_SEEDS
+/// is set — main.rs gates archiving to standalone only.
+pub fn write_standalone_archive_conf(config: &Config, server_id: u32) -> Result<()> {
+    let content = render_standalone_archive_conf(&StandaloneArchiveConfInput { server_id });
+    let path = Path::new(&config.conf_dir).join(ARCHIVE_CONF_FILE_NAME);
+    std::fs::create_dir_all(&config.conf_dir)
+        .with_context(|| format!("creating {}", config.conf_dir))?;
+    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +356,22 @@ mod tests {
         // The override wins, unclamped above but never zero.
         assert_eq!(max_connections(Some(1024 * 1024 * 1024), Some(2000)), 2000);
         assert_eq!(max_connections(None, Some(0)), 1);
+    }
+
+    #[test]
+    fn standalone_archive_conf_renders_the_load_bearing_directives() {
+        let conf = render_standalone_archive_conf(&StandaloneArchiveConfInput { server_id: 1 });
+        for directive in [
+            "server_id = 1",
+            "log_bin = binlog",
+            "binlog_format = ROW",
+            "sync_binlog = 1",
+            "binlog_expire_logs_seconds = 604800",
+        ] {
+            assert!(conf.contains(directive), "missing directive: {directive}");
+        }
+        // Never renders any Group Replication directive — this file only
+        // ever ships in standalone mode.
+        assert!(!conf.contains("group_replication"));
     }
 }
