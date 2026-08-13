@@ -20,7 +20,23 @@
 //! with /health as a real liveness probe and /role answering 200 while
 //! mysqld is alive. This is the state a reverted (HA → standalone) service
 //! runs in while it still uses this image.
+//!
+//! Point-in-time recovery (standalone mode only, this version — see
+//! pitr.rs/archiver.rs/restore.rs): two independent env-gated concerns layer
+//! on top of the standalone path.
+//!   - BINLOG_ARCHIVE_BUCKET set: the standalone conf enables the binlog
+//!     (instead of the plain no-binlog rendering) and an archiver task ships
+//!     full backups + binlogs to an S3-compatible bucket.
+//!   - BINLOG_RECOVER_FROM_BUCKET + MYSQL_RECOVERY_TARGET_TIME set, on an
+//!     uninitialized (fresh) datadir: restore-on-boot loads the newest
+//!     qualifying full backup and replays binlogs up to the target instant
+//!     before mysqld ever starts serving.
+//!
+//! Both are refused (warned, not fatal) whenever GR_SEEDS is also set — this
+//! version's archiver/restore paths are standalone-only and must never
+//! touch the Group Replication path.
 
+mod archiver;
 mod config;
 mod demote_on_shutdown;
 mod dns_probe;
@@ -29,17 +45,20 @@ mod health_server;
 mod mysql_conf;
 mod password_pin;
 mod peers;
+mod pitr;
 mod process_manager;
+mod restore;
+mod s3;
 mod self_heal;
 mod sql;
 mod volume_lock;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use common::{init_logging, Telemetry, TelemetryEvent};
 use config::Config;
 use health_server::AppState;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,6 +73,19 @@ async fn main() -> Result<()> {
     // (see volume_lock for the overlap rationale). Fail-stop on timeout —
     // the restart policy retries the boot.
     volume_lock::acquire_volume_runtime_lock(&config.data_dir)?;
+
+    // A PITR restore that crashed mid-way leaves the datadir in an unknown,
+    // partially-loaded state — refuse to boot rather than silently serve it.
+    // Checked unconditionally (not just when restore_enabled()): the
+    // recover env vars themselves may have been removed after the crash, but
+    // the marker on the volume is still the source of truth. See restore.rs.
+    if restore::crashed_mid_restore(&config.data_dir) {
+        bail!(
+            "a previous point-in-time restore did not complete (crashed mid-restore); the data \
+             directory is in an unknown state and refuses to boot — restore onto a fresh volume \
+             to retry"
+        );
+    }
 
     info!(
         mysql_port = config.mysql_port,
@@ -90,6 +122,24 @@ async fn main() -> Result<()> {
 
     let mut boot_note = None;
     if config.gr_enabled() {
+        // PITR archiving is standalone-only in this version — the archiver
+        // and the GR orchestrator have never been exercised together, and
+        // this version doesn't attempt it. Warn and fall through to the
+        // GR path completely unchanged rather than silently ignoring the
+        // variable or refusing to boot.
+        if config.archive_enabled() {
+            warn!(
+                "BINLOG_ARCHIVE_BUCKET is set but GR_SEEDS is also set; binlog archiving is \
+                 standalone-only for now — continuing without archiving"
+            );
+        }
+        if config.restore_enabled() {
+            warn!(
+                "BINLOG_RECOVER_FROM_BUCKET/MYSQL_RECOVERY_TARGET_TIME are set but GR_SEEDS is \
+                 also set; point-in-time restore is standalone-only for now — skipping restore"
+            );
+        }
+
         let preboot = preboot.expect("preboot runs whenever gr is enabled");
         let group_name = gr::resolve_group_name(&config);
         let server_id = config
@@ -102,9 +152,7 @@ async fn main() -> Result<()> {
         // `mysql` system schema directory in the datadir. Checked BEFORE the
         // entrypoint spawns — it decides whether this boot's local GTID
         // history is init noise that must be purged (see gr::orchestrate).
-        let fresh_datadir = !std::path::Path::new(&config.data_dir)
-            .join("mysql")
-            .is_dir();
+        let fresh_datadir = !config.datadir_is_initialized();
 
         tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
@@ -147,6 +195,45 @@ async fn main() -> Result<()> {
             healing,
         ));
     } else {
+        // Restore-on-boot runs before anything else in standalone mode: on
+        // success it leaves an already-initialized datadir behind, which the
+        // conf rendering and the final mysqld spawn below both need to see.
+        // Gated on GR_SEEDS itself (not gr_enabled()) so a GR_ENABLED=false
+        // revert-to-standalone with GR_SEEDS still present gets the same
+        // standalone-only refusal as the GR arm above, instead of silently
+        // restoring under a half-reverted config.
+        if config.restore_enabled() {
+            if config.gr_seeds.is_some() {
+                warn!(
+                    "BINLOG_RECOVER_FROM_BUCKET/MYSQL_RECOVERY_TARGET_TIME are set but GR_SEEDS \
+                     is also set; point-in-time restore is standalone-only for now — skipping \
+                     restore"
+                );
+            } else if config.datadir_is_initialized() {
+                info!(
+                    "data directory is already initialized; skipping point-in-time restore \
+                     (idempotent restart)"
+                );
+            } else {
+                restore::run(&config).await?;
+            }
+        }
+
+        let archiving = config.archive_enabled() && config.gr_seeds.is_none();
+        if config.archive_enabled() && config.gr_seeds.is_some() {
+            warn!(
+                "BINLOG_ARCHIVE_BUCKET is set but GR_SEEDS is also set; binlog archiving is \
+                 standalone-only for now — continuing without archiving"
+            );
+        }
+        if archiving {
+            // No SERVER_ID override in standalone mode today — 1 is the
+            // conventional single-server default (see the env contract).
+            let server_id = config.server_id.unwrap_or(1);
+            info!(server_id, "rendering standalone PITR archive config");
+            mysql_conf::write_standalone_archive_conf(&config, server_id)?;
+        }
+
         info!("GR_SEEDS not set — standalone passthrough mode");
         tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
@@ -161,6 +248,10 @@ async fn main() -> Result<()> {
             node: config.private_domain.clone(),
             role: "standalone".to_string(),
         });
+
+        if archiving {
+            tokio::spawn(archiver::run(config.clone(), sql.clone(), telemetry.clone()));
+        }
     }
 
     // MYSQL_ROOT_PASSWORD and friends reach docker-entrypoint.sh through the
