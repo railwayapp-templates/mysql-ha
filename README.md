@@ -181,8 +181,10 @@ formation and replication with the write fence, failover with rejoin, cold
 restart, conversion of a never-binlogged standalone volume (clone-first),
 scale-up 3→5, minority-partition fencing, patch-skew on redeploy (including
 the rollback refusal), total-outage recovery with the first seed behind, loss
-of the first seed's volume, and cross-version conversion (previous LTS →
-wrapper series).
+of the first seed's volume, a volume backup of one node restored onto every
+node (identical datadirs — each joiner regenerates its server_uuid instead of
+being refused forever), and cross-version conversion (previous LTS → wrapper
+series).
 
 Deliberately out of scope for v1:
 
