@@ -93,7 +93,7 @@ fn waiver_generation_path(data_dir: &str) -> PathBuf {
 /// marker. None before the first persist (a first boot pre-orchestration) —
 /// peers only consume this from group-active nodes, which have long since
 /// persisted theirs.
-fn read_group_name_marker(data_dir: &str) -> Option<String> {
+pub(crate) fn read_group_name_marker(data_dir: &str) -> Option<String> {
     let content = std::fs::read_to_string(Path::new(data_dir).join(GROUP_NAME_MARKER)).ok()?;
     let trimmed = content.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -454,12 +454,18 @@ fn decide(my_pre_gtid: bool, my_seed_rank: usize, peers: &[PeerStanding]) -> Boo
 /// `fresh_datadir` — true when the datadir was EMPTY at wrapper start, i.e.
 /// docker-entrypoint initialized this instance during this very boot. Gates
 /// the local GTID-history reset (see reset_fresh_instance_gtid_history).
+///
+/// `healing` — set by the stuck-member self-heal (self_heal::stuck_watch)
+/// for the duration of its stop-plugin-then-clone sequence: a START
+/// GROUP_REPLICATION issued in between would make the recipient refuse the
+/// clone, so this loop holds while the flag is up.
 pub async fn orchestrate(
     config: Arc<Config>,
     sql: Sql,
     telemetry: Arc<Telemetry>,
     mut group_name: String,
     fresh_datadir: bool,
+    healing: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // 1. Wait for the FINAL mysqld. docker-entrypoint's first-boot
     //    initialization runs setup SQL against a temp server whose socket is
@@ -601,6 +607,18 @@ pub async fn orchestrate(
     let dns_deadline = Duration::from_millis(config.peer_query_timeout_ms);
 
     loop {
+        // A self-heal reclone is being driven by the stuck-member watchdog:
+        // hold every join/bootstrap action until it lands (the recipient
+        // must keep the plugin stopped through the clone).
+        if healing.load(std::sync::atomic::Ordering::Relaxed) {
+            wait_log_once(
+                &mut last_wait_reason,
+                "a self-heal reclone is in progress; holding orchestration until it lands",
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
+
         // Already an active member? (Covers both "join succeeded last
         // iteration" and "this node restarted while the group kept running".)
         match local_gr_state(&sql, &config.data_dir).await {
@@ -1187,8 +1205,9 @@ fn wait_log_once(last: &mut String, reason: &str) -> bool {
 
 /// The clone donor among the live group's members — the PRIMARY when one is
 /// visible (its dataset is the authority by definition), else any active
-/// member.
-fn pick_donor(answers: &[(String, PeerAnswer)]) -> Option<String> {
+/// member. Shared with the stuck-member self-heal (self_heal.rs), which
+/// clones through the same machinery.
+pub(crate) fn pick_donor(answers: &[(String, PeerAnswer)]) -> Option<String> {
     answers
         .iter()
         .filter_map(|(host, a)| match a {
@@ -1556,6 +1575,11 @@ mod tests {
             mysql_max_connections: None,
             demote_timeout_ms: 20_000,
             peer_gone_dwell_seconds: 1800,
+            boot_loop_threshold: 3,
+            boot_ready_budget_seconds: 900,
+            stuck_member_dwell_seconds: 900,
+            self_heal_attempt_cap: 5,
+            self_heal_backoff_base_seconds: 60,
         }
     }
 }
