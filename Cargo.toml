@@ -21,6 +21,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 nix = { version = "0.29", features = ["signal", "process", "fs"] }
 axum = "0.8"
+# This crate family's MSRV creeps forward on ordinary releases (currently
+# 1.94.1) — the mysql-wrapper Dockerfile's rust-builder stage is pinned to
+# match (see its comment).
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-sdk-s3 = "1"
+# Pinned explicitly (not just pulled in transitively) so its "rt-tokio"
+# feature — ByteStream::into_async_read/from_path, used to stream S3 objects
+# in and out without buffering them whole — is guaranteed on.
+aws-smithy-types = { version = "1", features = ["rt-tokio"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 
 [profile.release]
 lto = true
