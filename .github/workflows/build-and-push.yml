@@ -152,7 +152,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          endpoint="/orgs/${{ github.repository_owner }}/packages/container/mysql-ha%2Fmysql-wrapper/versions?per_page=100"
+          endpoint="/orgs/${{ github.repository_owner }}/packages/container/mysql-ha%2Fmysql/versions?per_page=100"
           if published=$(gh api --paginate "$endpoint" --jq '.[].metadata.container.tags[]' 2>/dev/null); then
             majors_re=$(echo "$MYSQL_SUPPORTED_MAJORS" | tr ' ' '|')
             published_series=$(echo "$published" | grep -E "^(${majors_re})\.[0-9]+$" | sort -uV || true)
@@ -207,9 +207,9 @@ jobs:
           push: true
           # SHA-tagged, not :latest — this is a same-run handoff to
           # build-mysql-wrapper-amd64, never pulled independently.
-          tags: ${{ env.IMAGE_PREFIX }}/mysql-wrapper-rust-binaries:${{ steps.sha.outputs.short }}
-          cache-from: type=gha,scope=mysql-wrapper-rust-binaries
-          cache-to: type=gha,mode=max,scope=mysql-wrapper-rust-binaries
+          tags: ${{ env.IMAGE_PREFIX }}/mysql-rust-binaries:${{ steps.sha.outputs.short }}
+          cache-from: type=gha,scope=mysql-rust-binaries
+          cache-to: type=gha,mode=max,scope=mysql-rust-binaries
 
   # Build Rust binary for haproxy (AMD64 - alpine, native, fast ~2-3min)
   build-rust-binaries-haproxy-amd64:
@@ -312,7 +312,7 @@ jobs:
         id: gate
         run: |
           set -o pipefail
-          IMG="${{ env.IMAGE_PREFIX }}/mysql-wrapper"
+          IMG="${{ env.IMAGE_PREFIX }}/mysql"
           TAG="${{ matrix.mysql_version }}${{ env.BETA_SUFFIX }}"
           BASE="mysql:${{ matrix.mysql_version }}"
 
@@ -367,12 +367,12 @@ jobs:
           labels: |
             railway.content-key=${{ steps.gate.outputs.key }}
           build-contexts: |
-            rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/mysql-wrapper-rust-binaries:${{ steps.sha.outputs.short }}
+            rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/mysql-rust-binaries:${{ steps.sha.outputs.short }}
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
-          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}${{ env.BETA_SUFFIX }}
+            ${{ env.IMAGE_PREFIX }}/mysql:${{ matrix.mysql_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/mysql:${{ matrix.mysql_version }}${{ env.BETA_SUFFIX }}
           cache-to: type=inline
 
       # Unchanged image: keep the per-commit pin tag current WITHOUT minting
@@ -381,7 +381,7 @@ jobs:
       - name: Refresh pin tags on unchanged image
         if: steps.gate.outputs.changed == 'false'
         run: |
-          IMG="${{ env.IMAGE_PREFIX }}/mysql-wrapper"
+          IMG="${{ env.IMAGE_PREFIX }}/mysql"
           docker buildx imagetools create \
             -t "$IMG:${{ matrix.mysql_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}" \
             "$IMG:${{ matrix.mysql_version }}${{ env.BETA_SUFFIX }}"
@@ -392,7 +392,7 @@ jobs:
       - name: Verify the bundled series matches the matrix entry, then publish
         if: steps.gate.outputs.changed == 'true'
         run: |
-          img="${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
+          img="${{ env.IMAGE_PREFIX }}/mysql:${{ matrix.mysql_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
           version=$(docker run --rm --entrypoint mysqld "$img" --version)
           echo "bundled: $version"
           series=$(echo "$version" | sed -nE 's/.*Ver ([0-9]+\.[0-9]+)\..*/\1/p')
@@ -406,7 +406,7 @@ jobs:
           fi
 
           docker buildx imagetools create \
-            -t "${{ env.IMAGE_PREFIX }}/mysql-wrapper:${{ matrix.mysql_version }}${{ env.BETA_SUFFIX }}" \
+            -t "${{ env.IMAGE_PREFIX }}/mysql:${{ matrix.mysql_version }}${{ env.BETA_SUFFIX }}" \
             "$img"
 
   # Build haproxy image for AMD64
