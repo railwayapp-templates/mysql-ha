@@ -77,11 +77,19 @@ RUN echo "refresh key: ${PKG_REFRESH}" \
 # client package at the same version — rpm's own conflict check would
 # otherwise refuse that overlap, which microdnf's transaction planner can't
 # route around on its own.
+# The download is PINNED to the exact version-release the image's server
+# was built with: an unpinned download grabs the series' latest RPMs, and on
+# an older-patch base (e.g. a pinned 8.4.0 while 8.4.x is current) that
+# silently upgrades mysql-community-common/libs underneath the older mysqld
+# — a package skew that broke group replication formation in CI's
+# patch-skew scenario. Same version in, same version out, on every base.
 RUN minimal_repo="$(grep -l '/docker/el/' /etc/yum.repos.d/*.repo | head -1)" \
     && full_baseurl="$(grep '^baseurl=' "$minimal_repo" | sed 's#/docker/el/#/el/#')" \
     && printf '[mysql-full-client]\nname=MySQL Full Client\n%s\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-mysql\nmodule_hotfixes=true\n' "$full_baseurl" > /etc/yum.repos.d/mysql-full-client.repo \
+    && server_ver="$(rpm -qa --qf '%{VERSION}-%{RELEASE}\n' 'mysql-community-server*' | head -1)" \
+    && test -n "$server_ver" \
     && mkdir -p /tmp/mysql-client-rpms && cd /tmp/mysql-client-rpms \
-    && microdnf download mysql-community-client mysql-community-client-plugins mysql-community-common mysql-community-libs \
+    && microdnf download "mysql-community-client-${server_ver}" "mysql-community-client-plugins-${server_ver}" "mysql-community-common-${server_ver}" "mysql-community-libs-${server_ver}" \
     && rpm -Uvh --replacefiles --replacepkgs ./*.rpm \
     && cd / && rm -rf /tmp/mysql-client-rpms /etc/yum.repos.d/mysql-full-client.repo
 
