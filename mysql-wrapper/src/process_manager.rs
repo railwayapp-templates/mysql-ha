@@ -62,7 +62,13 @@ pub async fn supervise(
                         1
                     }
                 };
-                std::process::exit(code);
+                // An unasked exit must never look like success: with an
+                // ON_FAILURE restart policy, propagating mysqld's clean 0
+                // here leaves the container "exited (0)" and the database
+                // down until a human redeploys. Every deliberate stop goes
+                // through the signal branches below, which are the only
+                // paths allowed to exit 0.
+                std::process::exit(if code == 0 { 1 } else { code });
             }
 
             _ = sigterm.recv() => {
