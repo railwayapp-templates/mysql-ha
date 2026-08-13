@@ -121,6 +121,25 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
   the volume. Thresholds: `BOOT_LOOP_THRESHOLD`, `BOOT_READY_BUDGET_SECONDS`,
   `STUCK_MEMBER_DWELL_SECONDS`, `SELF_HEAL_ATTEMPT_CAP`,
   `SELF_HEAL_BACKOFF_BASE_SECONDS`.
+- **Point-in-time recovery — standalone mode only.** Two independent,
+  env-gated concerns layered on the standalone (non-GR) path (see
+  `pitr.rs`/`archiver.rs`/`restore.rs`):
+  - **Continuous archiving**, gated by `BINLOG_ARCHIVE_BUCKET` (plus
+    `_KEY`/`_SECRET`/`_REGION`/`_ENDPOINT`, and `_PATH`, default `/binlog`):
+    enables the binlog, takes an initial `mysqldump` full backup (then one
+    every `BINLOG_FULL_BACKUP_INTERVAL_SECONDS`, default a day) and
+    continuously ships closed binlogs to an S3-compatible bucket, rotating
+    every `BINLOG_ROTATE_INTERVAL_SECONDS` (default 60s) to bound the
+    recovery point objective. A binlog is only purged locally once its
+    upload is confirmed — the volume is the spool during a bucket outage.
+  - **Restore-on-boot**, gated by `BINLOG_RECOVER_FROM_BUCKET` (same
+    `_KEY`/`_SECRET`/`_REGION`/`_ENDPOINT`/`_PATH` shape) together with
+    `MYSQL_RECOVERY_TARGET_TIME` (ISO-8601 UTC): on a fresh volume only,
+    loads the newest full backup at or before the target instant and
+    replays binlogs up to it before mysqld ever starts serving.
+  - Both are refused (logged, not fatal) whenever `GR_SEEDS` is set — the
+    archiver/restore paths are standalone-only in this version and never
+    touch the Group Replication path.
 
 ## Conversion notes
 
@@ -196,14 +215,19 @@ the rollback refusal), total-outage recovery with the first seed behind, loss
 of the first seed's volume, a volume backup of one node restored onto every
 node (identical datadirs — each joiner regenerates its server_uuid instead of
 being refused forever), cross-version conversion (previous LTS → wrapper
-series), and the unconnectable-member self-heal (a boot-wedged corrupted
-datadir reprovisions from the group; an applier-wedged ERROR member reclones;
-and the negative guard — no quorum-confirmed donor, no wipe, ever).
+series), the unconnectable-member self-heal (a boot-wedged corrupted datadir
+reprovisions from the group; an applier-wedged ERROR member reclones; and the
+negative guard — no quorum-confirmed donor, no wipe, ever), and point-in-time
+recovery (continuous archiving to a bucket, then restoring a second node onto
+an arbitrary timestamp and asserting only the pre-target writes are present).
 
 Deliberately out of scope for v1:
 
 - **No read port.** The edge exposes only the write frontend; a load-balanced
   read port is a future addition.
+- **PITR is standalone-only.** Binlog archiving and restore-on-boot don't run
+  in Group Replication mode yet — the gate vars are refused with a warning
+  instead of interacting with the GR path.
 - **Rolling upgrades are not coordinated — and don't need to be, within a
   series.** Data nodes carry a series tag with no auto-update; any redeploy
   re-pulls the tag's current patch. This is safe by the LTS model: Group

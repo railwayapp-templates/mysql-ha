@@ -19,6 +19,13 @@ ROOT_PW="e2e-root-pw"
 REPL_PW="e2e-repl-pw"
 SEEDS="mysql-1:3306,mysql-2:3306,mysql-3:3306"
 
+# PITR scenario: a minio container stands in for the S3-compatible bucket.
+# MINIO_HOST_PORT is set by start_minio() itself (docker-assigned at random).
+MINIO_ROOT_USER="e2e-minio-user"
+MINIO_ROOT_PASSWORD="e2e-minio-password"
+PITR_BUCKET="mysql-pitr-e2e"
+MINIO_HOST_PORT=""
+
 PASS=0
 FAIL=0
 FAILED_TESTS=()
@@ -84,6 +91,54 @@ teardown_trio() {
   local s="${NODE_SUFFIX:-}"
   docker rm -f "mysql-1$s" "mysql-2$s" "mysql-3$s" >/dev/null 2>&1
   docker volume rm mysql-ha-e2e-vol-1 mysql-ha-e2e-vol-2 mysql-ha-e2e-vol-3 >/dev/null 2>&1
+}
+
+# start_standalone <name> [extra docker args...] — boots a standalone
+# (no GR_SEEDS) wrapper node under the given name/hostname. Used by the PITR
+# scenario: archiving and restore are standalone-only in this version.
+start_standalone() {
+  local name="$1"; shift
+  docker volume create --label "$LABEL" "mysql-ha-e2e-vol-$name" >/dev/null
+  docker run -d --label "$LABEL" --restart unless-stopped \
+    --name "$name" --hostname "$name" \
+    --network "$NET" --network-alias "$name" \
+    -v "mysql-ha-e2e-vol-$name:/var/lib/mysql" \
+    -e MYSQL_ROOT_PASSWORD="$ROOT_PW" \
+    -e RAILWAY_PRIVATE_DOMAIN="$name" \
+    -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+    -e RAILWAY_VOLUME_MOUNT_PATH="/var/lib/mysql" \
+    "$@" \
+    "$IMAGE" >/dev/null
+}
+
+# start_minio — a minio container standing in for the S3-compatible bucket
+# the PITR env contract points at, on the shared e2e network, with
+# PITR_BUCKET pre-created via the mc client. The wrapper containers reach it
+# over the network alias (never the host port); the host port is ONLY for
+# this function's own readiness probe, and is docker-assigned at random
+# (`-p 9000` with no host part) rather than a fixed guess, which collided
+# with an unrelated local listener in practice.
+start_minio() {
+  docker volume create --label "$LABEL" mysql-ha-e2e-minio-data >/dev/null
+  docker run -d --label "$LABEL" --name mysql-ha-e2e-minio --hostname mysql-ha-e2e-minio \
+    --network "$NET" --network-alias mysql-ha-e2e-minio \
+    -p 9000 \
+    -v mysql-ha-e2e-minio-data:/data \
+    -e MINIO_ROOT_USER="$MINIO_ROOT_USER" -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+    minio/minio server /data >/dev/null
+
+  MINIO_HOST_PORT="$(docker port mysql-ha-e2e-minio 9000/tcp | head -1 | awk -F: '{print $NF}')"
+  [ -n "$MINIO_HOST_PORT" ] || { log "could not determine minio's assigned host port"; return 1; }
+
+  wait_until 60 "minio up" \
+    bash -c "curl -sf http://localhost:$MINIO_HOST_PORT/minio/health/live >/dev/null 2>&1" \
+    || return 1
+
+  # minio/mc's entrypoint is `mc` itself, not a shell — override it to chain
+  # the alias-set and bucket-create in one container.
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc mb --ignore-existing e2e/$PITR_BUCKET >/dev/null" \
+    >/dev/null 2>&1
 }
 
 # sql <node> <statement> — root SQL over the node's local socket.
@@ -1328,6 +1383,121 @@ t_no_quorum_no_wipe() {
   teardown_trio
 }
 
+# PITR: standalone-only in this version, so this scenario never touches the
+# GR trio at all — a fresh pair of standalone (non-GR) nodes plus a minio
+# container standing in for the S3-compatible bucket. Self-contained: no
+# teardown_trio, no shared GR state, safe to run anywhere in the list.
+t_pitr_archive_and_restore_to_point_in_time() {
+  log "t_pitr_archive_and_restore_to_point_in_time"
+  docker rm -f mysql-pitr-src mysql-pitr-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-src mysql-ha-e2e-vol-mysql-pitr-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  ok "minio up with bucket $PITR_BUCKET"
+
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr"
+  )
+  start_standalone mysql-pitr-src "${archive_env[@]}"
+
+  wait_until 120 "PITR source node healthy" \
+    bash -c 'docker exec mysql-pitr-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "PITR source node never became healthy"; return; }
+  ok "PITR source node up with archiving enabled"
+
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-src 2>&1 | tail -40; return; }
+  ok "initial full backup completed"
+
+  sql mysql-pitr-src "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'before-t1');"
+  # Second-granularity separation on both sides of T1 — mysqlbinlog's
+  # --stop-datetime is second-granular, so the marker rows must not share a
+  # wall-clock second with the writes they need to be distinguished from.
+  sleep 2
+  local t1
+  t1="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  log "captured T1=$t1"
+  sleep 2
+  sql mysql-pitr-src "INSERT INTO t.kv VALUES (2,'after-t1');"
+  sql mysql-pitr-src "DROP TABLE t.kv;"
+
+  # Force rotation so the pre-drop data closes into a shippable binlog file
+  # instead of waiting out BINLOG_ROTATE_INTERVAL_SECONDS.
+  sql mysql-pitr-src "FLUSH BINARY LOGS;"
+
+  wait_until 60 "binlog shipped" \
+    bash -c 'docker logs mysql-pitr-src 2>&1 | grep -q "binlog uploaded"' \
+    || { bad "binlog was never shipped to the bucket"; docker logs mysql-pitr-src 2>&1 | tail -40; return; }
+  ok "binlog shipped to the bucket"
+
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$t1"
+  )
+  start_standalone mysql-pitr-restore "${recover_env[@]}"
+
+  wait_until 180 "restore completed and serving" \
+    bash -c 'docker exec mysql-pitr-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "restored node never became healthy (restore failed?)"; docker logs mysql-pitr-restore 2>&1 | tail -60; return; }
+  ok "restored node completed PITR and is serving"
+
+  docker logs mysql-pitr-restore 2>&1 | grep -q "point-in-time restore completed" \
+    && ok "restore log confirms completion" \
+    || bad "no restore-completed log line found"
+
+  local v1
+  v1="$(sql mysql-pitr-restore "SELECT v FROM t.kv WHERE k=1")"
+  [ "$v1" = "before-t1" ] \
+    && ok "pre-T1 row present after restore" \
+    || bad "pre-T1 row missing after restore (got: '$v1')"
+
+  local v2
+  v2="$(sql mysql-pitr-restore "SELECT v FROM t.kv WHERE k=2")"
+  [ -z "$v2" ] \
+    && ok "post-T1 row correctly absent after restore (restored exactly to T1, not past it)" \
+    || bad "post-T1 row present after restore (got: '$v2') — restored past the target time"
+
+  # A restore that crashed mid-way must self-heal on the next boot: the
+  # datadir holds only derived state, so the wrapper wipes it and re-runs
+  # the restore instead of crash-looping. Simulate the crash by pre-seeding
+  # a fresh volume with an in-progress marker AND a junk mysql/ schema dir
+  # (so the datadir reads as initialized — proving the wipe actually ran,
+  # not just the uninitialized-dir path).
+  docker rm -f mysql-pitr-crash >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-crash >/dev/null 2>&1
+  docker volume create --label "$LABEL" mysql-ha-e2e-vol-mysql-pitr-crash >/dev/null
+  docker run --rm -v mysql-ha-e2e-vol-mysql-pitr-crash:/var/lib/mysql --entrypoint sh "$IMAGE" -c \
+    'printf "%s" "{\"status\":\"in_progress\",\"target_time\":\"2020-01-01T00:00:00.000Z\",\"updated_at\":\"2020-01-01T00:00:00.000Z\"}" > /var/lib/mysql/.pitr_restore_state.json && mkdir -p /var/lib/mysql/mysql && echo junk > /var/lib/mysql/mysql/ibdata1' \
+    || { bad "could not pre-seed the crashed-restore volume"; return; }
+  start_standalone mysql-pitr-crash "${recover_env[@]}"
+
+  wait_until 180 "crashed-restore boot self-heals and serves" \
+    bash -c 'docker exec mysql-pitr-crash wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "crashed-restore boot never became healthy (should have wiped and retried)"; docker logs mysql-pitr-crash 2>&1 | tail -60; return; }
+  docker logs mysql-pitr-crash 2>&1 | grep -q "wiping the partially-restored data directory" \
+    && ok "crashed mid-restore boot wiped the partial datadir and retried" \
+    || bad "no wipe-and-retry log line on the crashed-restore boot"
+  local v3
+  v3="$(sql mysql-pitr-crash "SELECT v FROM t.kv WHERE k=1")"
+  [ "$v3" = "before-t1" ] \
+    && ok "self-healed restore serves the pre-T1 row" \
+    || bad "self-healed restore missing the pre-T1 row (got: '$v3')"
+
+  docker rm -f mysql-pitr-src mysql-pitr-restore mysql-pitr-crash mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-src mysql-ha-e2e-vol-mysql-pitr-restore mysql-ha-e2e-vol-mysql-pitr-crash mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
 # and seeds its own 'pre-upgrade' dataset, so it must not sit inside the
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
@@ -1335,9 +1505,10 @@ t_no_quorum_no_wipe() {
 # they sit safely between the chain and the cross-version finale. The three
 # self-heal scenarios each teardown and seed their own trio too, and
 # t_no_quorum_no_wipe deliberately wrecks one member's datadir and stops the
-# rest — it sits second to last, with only the (self-contained) cross-version
-# finale after it.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_conversion_cross_version_upgrade)
+# rest — it sits second to last. t_pitr_archive_and_restore_to_point_in_time
+# is fully self-contained (its own standalone nodes + minio, no GR trio at
+# all) and sits after it, with only the cross-version finale last.
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

@@ -7,8 +7,21 @@
 //!   - set    → HA mode: my.cnf is rendered with Group Replication
 //!     (single-primary, MYSQL communication stack), and the orchestrator
 //!     decides bootstrap-vs-join. GR_REPLICATION_PASSWORD is required.
+//!
+//! A third, orthogonal, standalone-only concern layers on top: point-in-time
+//! recovery (see pitr.rs, archiver.rs, restore.rs). Two independent gates,
+//! each all-or-nothing with its own sub-vars:
+//!   - BINLOG_ARCHIVE_BUCKET set     → continuous binlog archiving.
+//!   - BINLOG_RECOVER_FROM_BUCKET +
+//!     MYSQL_RECOVERY_TARGET_TIME set → restore-on-boot to that instant.
+//!
+//! Both are refused (logged, not fatal) whenever GR_SEEDS is also set — see
+//! main.rs — because this version's archiver/restore paths assume they own
+//! the only mysqld in the picture.
 
+use crate::pitr::S3Location;
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use common::{ConfigExt, RailwayEnv};
 
 pub struct Config {
@@ -100,12 +113,42 @@ pub struct Config {
     /// (SELF_HEAL_BACKOFF_BASE_SECONDS): attempt N+1 waits base * 2^(N-1).
     /// A clone is heavy on the donor — repeated attempts must space out.
     pub self_heal_backoff_base_seconds: u64,
+
+    // --- PITR: archive gate (BINLOG_ARCHIVE_*) ---
+    pub binlog_archive_bucket: Option<String>,
+    pub binlog_archive_key: Option<String>,
+    pub binlog_archive_secret: Option<String>,
+    pub binlog_archive_region: Option<String>,
+    pub binlog_archive_endpoint: Option<String>,
+    pub binlog_archive_path: String,
+    /// How often a fresh full backup is taken once one already exists
+    /// (BINLOG_FULL_BACKUP_INTERVAL_SECONDS).
+    pub binlog_full_backup_interval_seconds: u64,
+    /// `FLUSH BINARY LOGS` cadence — bounds the recovery point objective, the
+    /// same role `archive_timeout` plays for a WAL archive
+    /// (BINLOG_ROTATE_INTERVAL_SECONDS).
+    pub binlog_rotate_interval_seconds: u64,
+
+    // --- PITR: restore gate (BINLOG_RECOVER_FROM_* + MYSQL_RECOVERY_TARGET_TIME) ---
+    pub binlog_recover_from_bucket: Option<String>,
+    pub binlog_recover_from_key: Option<String>,
+    pub binlog_recover_from_secret: Option<String>,
+    pub binlog_recover_from_region: Option<String>,
+    pub binlog_recover_from_endpoint: Option<String>,
+    pub binlog_recover_from_path: String,
+    /// Parsed once at startup so a malformed value fails boot immediately
+    /// with a clear error rather than deep inside the restore path.
+    pub mysql_recovery_target_time: Option<DateTime<Utc>>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         let mysql_root_password = String::env_required("MYSQL_ROOT_PASSWORD")
             .context("MYSQL_ROOT_PASSWORD must be set")?;
+
+        let mysql_recovery_target_time = non_empty(std::env::var("MYSQL_RECOVERY_TARGET_TIME").ok())
+            .map(|raw| crate::pitr::parse_target_time(&raw))
+            .transpose()?;
 
         let config = Self {
             mysql_root_password,
@@ -136,10 +179,65 @@ impl Config {
             stuck_member_dwell_seconds: u64::env_parse("STUCK_MEMBER_DWELL_SECONDS", 900),
             self_heal_attempt_cap: u32::env_parse("SELF_HEAL_ATTEMPT_CAP", 5),
             self_heal_backoff_base_seconds: u64::env_parse("SELF_HEAL_BACKOFF_BASE_SECONDS", 60),
+
+            binlog_archive_bucket: non_empty(std::env::var("BINLOG_ARCHIVE_BUCKET").ok()),
+            binlog_archive_key: non_empty(std::env::var("BINLOG_ARCHIVE_KEY").ok()),
+            binlog_archive_secret: non_empty(std::env::var("BINLOG_ARCHIVE_SECRET").ok()),
+            binlog_archive_region: non_empty(std::env::var("BINLOG_ARCHIVE_REGION").ok()),
+            binlog_archive_endpoint: non_empty(std::env::var("BINLOG_ARCHIVE_ENDPOINT").ok()),
+            binlog_archive_path: String::env_or("BINLOG_ARCHIVE_PATH", "/binlog"),
+            binlog_full_backup_interval_seconds: u64::env_parse(
+                "BINLOG_FULL_BACKUP_INTERVAL_SECONDS",
+                86_400,
+            ),
+            binlog_rotate_interval_seconds: u64::env_parse("BINLOG_ROTATE_INTERVAL_SECONDS", 60),
+
+            binlog_recover_from_bucket: non_empty(
+                std::env::var("BINLOG_RECOVER_FROM_BUCKET").ok(),
+            ),
+            binlog_recover_from_key: non_empty(std::env::var("BINLOG_RECOVER_FROM_KEY").ok()),
+            binlog_recover_from_secret: non_empty(std::env::var("BINLOG_RECOVER_FROM_SECRET").ok()),
+            binlog_recover_from_region: non_empty(std::env::var("BINLOG_RECOVER_FROM_REGION").ok()),
+            binlog_recover_from_endpoint: non_empty(
+                std::env::var("BINLOG_RECOVER_FROM_ENDPOINT").ok(),
+            ),
+            binlog_recover_from_path: String::env_or("BINLOG_RECOVER_FROM_PATH", "/binlog"),
+            mysql_recovery_target_time,
         };
 
         if config.gr_enabled() && config.gr_replication_password.is_none() {
             bail!("GR_REPLICATION_PASSWORD must be set when GR_SEEDS is set");
+        }
+
+        if config.binlog_archive_bucket.is_some()
+            && (config.binlog_archive_key.is_none()
+                || config.binlog_archive_secret.is_none()
+                || config.binlog_archive_region.is_none()
+                || config.binlog_archive_endpoint.is_none())
+        {
+            bail!(
+                "BINLOG_ARCHIVE_KEY, BINLOG_ARCHIVE_SECRET, BINLOG_ARCHIVE_REGION, and \
+                 BINLOG_ARCHIVE_ENDPOINT must all be set when BINLOG_ARCHIVE_BUCKET is set"
+            );
+        }
+
+        if config.binlog_recover_from_bucket.is_some() != config.mysql_recovery_target_time.is_some()
+        {
+            bail!(
+                "BINLOG_RECOVER_FROM_BUCKET and MYSQL_RECOVERY_TARGET_TIME must be set together"
+            );
+        }
+        if config.binlog_recover_from_bucket.is_some()
+            && (config.binlog_recover_from_key.is_none()
+                || config.binlog_recover_from_secret.is_none()
+                || config.binlog_recover_from_region.is_none()
+                || config.binlog_recover_from_endpoint.is_none())
+        {
+            bail!(
+                "BINLOG_RECOVER_FROM_KEY, BINLOG_RECOVER_FROM_SECRET, BINLOG_RECOVER_FROM_REGION, \
+                 and BINLOG_RECOVER_FROM_ENDPOINT must all be set when \
+                 BINLOG_RECOVER_FROM_BUCKET is set"
+            );
         }
 
         Ok(config)
@@ -147,6 +245,57 @@ impl Config {
 
     pub fn gr_enabled(&self) -> bool {
         self.gr_enabled_flag && self.gr_seeds.is_some()
+    }
+
+    /// The archive gate: BINLOG_ARCHIVE_BUCKET (and its required siblings,
+    /// already validated in `from_env`) are set.
+    pub fn archive_enabled(&self) -> bool {
+        self.binlog_archive_bucket.is_some()
+    }
+
+    /// The restore gate: BINLOG_RECOVER_FROM_BUCKET + MYSQL_RECOVERY_TARGET_TIME
+    /// (and the bucket's required siblings) are set.
+    pub fn restore_enabled(&self) -> bool {
+        self.binlog_recover_from_bucket.is_some()
+    }
+
+    /// The parsed restore target — only meaningful (and only ever `Some`)
+    /// when `restore_enabled()`.
+    pub fn recovery_target_time(&self) -> Option<DateTime<Utc>> {
+        self.mysql_recovery_target_time
+    }
+
+    /// Where the archiver ships to, built from the `BINLOG_ARCHIVE_*` family.
+    /// `None` unless `archive_enabled()`.
+    pub fn archive_s3_location(&self) -> Option<S3Location> {
+        Some(S3Location {
+            bucket: self.binlog_archive_bucket.clone()?,
+            access_key: self.binlog_archive_key.clone()?,
+            secret_key: self.binlog_archive_secret.clone()?,
+            region: self.binlog_archive_region.clone()?,
+            endpoint: self.binlog_archive_endpoint.clone()?,
+            path: self.binlog_archive_path.clone(),
+        })
+    }
+
+    /// Where restore reads from, built from the `BINLOG_RECOVER_FROM_*`
+    /// family. `None` unless `restore_enabled()`.
+    pub fn restore_s3_location(&self) -> Option<S3Location> {
+        Some(S3Location {
+            bucket: self.binlog_recover_from_bucket.clone()?,
+            access_key: self.binlog_recover_from_key.clone()?,
+            secret_key: self.binlog_recover_from_secret.clone()?,
+            region: self.binlog_recover_from_region.clone()?,
+            endpoint: self.binlog_recover_from_endpoint.clone()?,
+            path: self.binlog_recover_from_path.clone(),
+        })
+    }
+
+    /// The image's own uninitialized-instance test (mirrors main.rs's HA-mode
+    /// `fresh_datadir` check and docker-entrypoint.sh's own): no `mysql`
+    /// system schema directory yet.
+    pub fn datadir_is_initialized(&self) -> bool {
+        std::path::Path::new(&self.data_dir).join("mysql").is_dir()
     }
 
     /// The bare hostnames from GR_SEEDS, in declared order.
@@ -231,9 +380,41 @@ mod tests {
             "STUCK_MEMBER_DWELL_SECONDS",
             "SELF_HEAL_ATTEMPT_CAP",
             "SELF_HEAL_BACKOFF_BASE_SECONDS",
+            "BINLOG_ARCHIVE_BUCKET",
+            "BINLOG_ARCHIVE_KEY",
+            "BINLOG_ARCHIVE_SECRET",
+            "BINLOG_ARCHIVE_REGION",
+            "BINLOG_ARCHIVE_ENDPOINT",
+            "BINLOG_ARCHIVE_PATH",
+            "BINLOG_FULL_BACKUP_INTERVAL_SECONDS",
+            "BINLOG_ROTATE_INTERVAL_SECONDS",
+            "BINLOG_RECOVER_FROM_BUCKET",
+            "BINLOG_RECOVER_FROM_KEY",
+            "BINLOG_RECOVER_FROM_SECRET",
+            "BINLOG_RECOVER_FROM_REGION",
+            "BINLOG_RECOVER_FROM_ENDPOINT",
+            "BINLOG_RECOVER_FROM_PATH",
+            "MYSQL_RECOVERY_TARGET_TIME",
         ] {
             env::remove_var(key);
         }
+    }
+
+    fn set_archive_env() {
+        env::set_var("BINLOG_ARCHIVE_BUCKET", "my-bucket");
+        env::set_var("BINLOG_ARCHIVE_KEY", "ak");
+        env::set_var("BINLOG_ARCHIVE_SECRET", "sk");
+        env::set_var("BINLOG_ARCHIVE_REGION", "auto");
+        env::set_var("BINLOG_ARCHIVE_ENDPOINT", "https://s3.example.com");
+    }
+
+    fn set_restore_env() {
+        env::set_var("BINLOG_RECOVER_FROM_BUCKET", "my-bucket");
+        env::set_var("BINLOG_RECOVER_FROM_KEY", "ak");
+        env::set_var("BINLOG_RECOVER_FROM_SECRET", "sk");
+        env::set_var("BINLOG_RECOVER_FROM_REGION", "auto");
+        env::set_var("BINLOG_RECOVER_FROM_ENDPOINT", "https://s3.example.com");
+        env::set_var("MYSQL_RECOVERY_TARGET_TIME", "2026-08-13T14:00:00.000Z");
     }
 
     fn base_env() {
@@ -357,5 +538,129 @@ mod tests {
         env::set_var("DATA_DIR", "/custom");
         let config = Config::from_env().unwrap();
         assert_eq!(config.data_dir, "/custom");
+    }
+
+    #[test]
+    fn archive_disabled_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        let config = Config::from_env().unwrap();
+        assert!(!config.archive_enabled());
+        assert!(config.archive_s3_location().is_none());
+        assert_eq!(config.binlog_archive_path, "/binlog");
+        assert_eq!(config.binlog_full_backup_interval_seconds, 86_400);
+        assert_eq!(config.binlog_rotate_interval_seconds, 60);
+    }
+
+    #[test]
+    fn archive_enabled_requires_every_sibling_var() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        env::set_var("BINLOG_ARCHIVE_BUCKET", "my-bucket");
+        let err = Config::from_env().err().expect("should fail");
+        assert!(err.to_string().contains("BINLOG_ARCHIVE_KEY"));
+
+        set_archive_env();
+        let config = Config::from_env().unwrap();
+        assert!(config.archive_enabled());
+        let loc = config.archive_s3_location().unwrap();
+        assert_eq!(loc.bucket, "my-bucket");
+        assert_eq!(loc.access_key, "ak");
+        assert_eq!(loc.secret_key, "sk");
+        assert_eq!(loc.region, "auto");
+        assert_eq!(loc.endpoint, "https://s3.example.com");
+        assert_eq!(loc.path, "/binlog");
+    }
+
+    #[test]
+    fn archive_path_and_intervals_are_overridable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        set_archive_env();
+        env::set_var("BINLOG_ARCHIVE_PATH", "/custom-path");
+        env::set_var("BINLOG_FULL_BACKUP_INTERVAL_SECONDS", "3600");
+        env::set_var("BINLOG_ROTATE_INTERVAL_SECONDS", "30");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.archive_s3_location().unwrap().path, "/custom-path");
+        assert_eq!(config.binlog_full_backup_interval_seconds, 3600);
+        assert_eq!(config.binlog_rotate_interval_seconds, 30);
+    }
+
+    #[test]
+    fn restore_disabled_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        let config = Config::from_env().unwrap();
+        assert!(!config.restore_enabled());
+        assert!(config.restore_s3_location().is_none());
+        assert!(config.recovery_target_time().is_none());
+    }
+
+    #[test]
+    fn restore_requires_bucket_and_target_time_together() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        env::set_var("BINLOG_RECOVER_FROM_BUCKET", "my-bucket");
+        env::set_var("BINLOG_RECOVER_FROM_KEY", "ak");
+        env::set_var("BINLOG_RECOVER_FROM_SECRET", "sk");
+        env::set_var("BINLOG_RECOVER_FROM_REGION", "auto");
+        env::set_var("BINLOG_RECOVER_FROM_ENDPOINT", "https://s3.example.com");
+        // Bucket set without the target time.
+        let err = Config::from_env().err().expect("should fail");
+        assert!(err.to_string().contains("MYSQL_RECOVERY_TARGET_TIME"));
+
+        // Target time set without the bucket.
+        base_env();
+        env::set_var("MYSQL_RECOVERY_TARGET_TIME", "2026-08-13T14:00:00.000Z");
+        let err = Config::from_env().err().expect("should fail");
+        assert!(err.to_string().contains("MYSQL_RECOVERY_TARGET_TIME"));
+    }
+
+    #[test]
+    fn restore_enabled_requires_every_sibling_var() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        env::set_var("BINLOG_RECOVER_FROM_BUCKET", "my-bucket");
+        env::set_var("MYSQL_RECOVERY_TARGET_TIME", "2026-08-13T14:00:00.000Z");
+        let err = Config::from_env().err().expect("should fail");
+        assert!(err.to_string().contains("BINLOG_RECOVER_FROM_KEY"));
+
+        set_restore_env();
+        let config = Config::from_env().unwrap();
+        assert!(config.restore_enabled());
+        let loc = config.restore_s3_location().unwrap();
+        assert_eq!(loc.bucket, "my-bucket");
+        assert_eq!(
+            config.recovery_target_time().unwrap(),
+            crate::pitr::parse_target_time("2026-08-13T14:00:00.000Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn restore_target_time_must_parse() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        set_restore_env();
+        env::set_var("MYSQL_RECOVERY_TARGET_TIME", "not-a-timestamp");
+        let err = Config::from_env().err().expect("should fail");
+        assert!(err.to_string().contains("MYSQL_RECOVERY_TARGET_TIME"));
+    }
+
+    #[test]
+    fn datadir_initialized_check_matches_the_mysql_system_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        let dir = std::env::temp_dir().join(format!(
+            "mysql-wrapper-config-test-datadir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("DATA_DIR", dir.to_string_lossy().to_string());
+        let config = Config::from_env().unwrap();
+        assert!(!config.datadir_is_initialized());
+        std::fs::create_dir_all(dir.join("mysql")).unwrap();
+        assert!(config.datadir_is_initialized());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

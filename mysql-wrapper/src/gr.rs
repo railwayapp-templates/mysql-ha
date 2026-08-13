@@ -1580,6 +1580,21 @@ mod tests {
             stuck_member_dwell_seconds: 900,
             self_heal_attempt_cap: 5,
             self_heal_backoff_base_seconds: 60,
+            binlog_archive_bucket: None,
+            binlog_archive_key: None,
+            binlog_archive_secret: None,
+            binlog_archive_region: None,
+            binlog_archive_endpoint: None,
+            binlog_archive_path: "/binlog".to_string(),
+            binlog_full_backup_interval_seconds: 86_400,
+            binlog_rotate_interval_seconds: 60,
+            binlog_recover_from_bucket: None,
+            binlog_recover_from_key: None,
+            binlog_recover_from_secret: None,
+            binlog_recover_from_region: None,
+            binlog_recover_from_endpoint: None,
+            binlog_recover_from_path: "/binlog".to_string(),
+            mysql_recovery_target_time: None,
         }
     }
 }
