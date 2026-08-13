@@ -486,7 +486,7 @@ t_patch_skew_on_redeploy() {
   docker rm -f mysql-2 >/dev/null 2>&1
   start_node 2
 
-  wait_until 300 "skewed member rejoined (3 ONLINE)" group_is_fully_online mysql-1 \
+  wait_until 420 "skewed member rejoined (3 ONLINE)" group_is_fully_online mysql-1 \
     || { bad "higher-patch member did not rejoin a lower-patch group"; return; }
   # Membership is observed from mysql-1; mysql-2's own SQL port lags ONLINE by
   # a few seconds (clone/upgrade restart window), so poll it before asserting.
@@ -504,10 +504,16 @@ t_patch_skew_on_redeploy() {
     || bad "data missing on patch-upgraded member (got '$v')"
 
   sql mysql-1 "INSERT INTO t.kv VALUES (2,'during-skew') ON DUPLICATE KEY UPDATE v='during-skew';"
-  wait_until 60 "write replicates across the patch skew" \
+  # A just-rejoined higher-patch member finishes distributed recovery and
+  # applies this write within seconds normally, but under the full suite's
+  # CPU contention certification/apply can lag — a tight window here used to
+  # time out and then cascade into the rollback probe below (which fails on a
+  # still-stabilizing group). return on failure so one slow apply can't be
+  # read as two separate regressions.
+  wait_until 240 "write replicates across the patch skew" \
     bash -c '[ "$(docker exec mysql-2 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=2" 2>/dev/null)" = "during-skew" ]' \
     && ok "writes replicate in the mixed-patch group" \
-    || bad "replication broken across patch skew"
+    || { bad "replication broken across patch skew"; return; }
 
   # Rollback probe — a deployment ROLLBACK boots the older binary against
   # the now-upgraded datadir. Within an LTS series this is SUPPORTED: the
@@ -537,7 +543,7 @@ t_patch_skew_on_redeploy() {
   else
     bad "member booted but no 'Server downgrade' log line — behavior changed, investigate"
   fi
-  wait_until 300 "rolled-back member rejoined the group (3 ONLINE)" group_is_fully_online mysql-1 \
+  wait_until 420 "rolled-back member rejoined the group (3 ONLINE)" group_is_fully_online mysql-1 \
     || { bad "rolled-back member did not rejoin the group"; return; }
   local back_ver
   back_ver="$(sql mysql-2 "SELECT @@version")"
@@ -553,7 +559,7 @@ t_patch_skew_on_redeploy() {
   # And rolling forward again onto the current tag must also work.
   docker rm -f mysql-2 >/dev/null 2>&1
   start_node 2
-  wait_until 300 "member re-upgraded onto the current patch" group_is_fully_online mysql-1 \
+  wait_until 420 "member re-upgraded onto the current patch" group_is_fully_online mysql-1 \
     && ok "re-redeploy onto the current patch works after a rollback" \
     || bad "member did not recover after returning to the current patch"
 }
