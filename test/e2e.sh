@@ -141,6 +141,20 @@ start_minio() {
     >/dev/null 2>&1
 }
 
+# mc_rm_key <bucket-relative-key> — deletes exactly one object from the e2e
+# minio bucket via a throwaway mc container (same alias-then-act pattern as
+# start_minio's own bucket-create, since the alias config lives only inside
+# that one throwaway container). Used by the PITR adversarial scenarios below
+# to force a shipped binlog out of the archive after the fact — standing in
+# for an object a bucket lifecycle rule expired, or one that was simply
+# corrupted/dropped — which is a deterministic way to punch a hole in the
+# archive without racing the archiver's own ~10s ship-poll timing.
+mc_rm_key() {
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc rm e2e/$PITR_BUCKET/$1" \
+    >/dev/null 2>&1
+}
+
 # sql <node> <statement> — root SQL over the node's local socket.
 sql() {
   local node="$1"; shift
@@ -1498,6 +1512,236 @@ t_pitr_archive_and_restore_to_point_in_time() {
   docker volume rm mysql-ha-e2e-vol-mysql-pitr-src mysql-ha-e2e-vol-mysql-pitr-restore mysql-ha-e2e-vol-mysql-pitr-crash mysql-ha-e2e-minio-data >/dev/null 2>&1
 }
 
+# ADVERSARIAL (expected RED): the two scenarios below prove known,
+# confirmed-but-not-yet-fixed gaps in the PITR path. They are intentionally
+# NOT expected to pass — they document the defect precisely enough that
+# fixing it means making them go green, not deleting or loosening them.
+
+t_pitr_restore_silently_stops_short_of_target() {
+  log "t_pitr_restore_silently_stops_short_of_target (BUG: replay_binlogs never verifies the target was reached)"
+  # mysql-wrapper/src/restore.rs's replay_binlogs treats a zero exit from
+  # `mysqlbinlog | mysql` as complete success — it never checks that the
+  # replay's final GTID/position/timestamp actually reached the requested
+  # target. That gap is compounded by pitr.rs's binlogs_to_replay, which
+  # silently `break`s (no log line) at the FIRST sequence-number gap it finds
+  # in the lineage's binlog files — indistinguishable from legitimately
+  # running out of binlogs at the target. A single hole anywhere in the
+  # archive, even with perfectly good, fully-uploaded binlogs sitting past
+  # it, makes the restore silently stop right at the hole while still
+  # reporting success.
+  docker rm -f mysql-pitr-gap-src mysql-pitr-gap-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-gap-src mysql-ha-e2e-vol-mysql-pitr-gap-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  ok "minio up with bucket $PITR_BUCKET"
+
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-gap"
+    # The auto-rotate loop must stay out of the way — this scenario drives
+    # every rotation with explicit FLUSH BINARY LOGS calls and identifies
+    # "binlog A/B/C" purely by their POSITION in the shipping order; an
+    # uncontrolled auto-rotation landing between two of those FLUSHes would
+    # throw that ordering off.
+    -e "BINLOG_ROTATE_INTERVAL_SECONDS=3600"
+  )
+  start_standalone mysql-pitr-gap-src "${archive_env[@]}"
+
+  wait_until 120 "PITR source node healthy" \
+    bash -c 'docker exec mysql-pitr-gap-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "PITR source node never became healthy"; return; }
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-gap-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-gap-src 2>&1 | tail -40; return; }
+  ok "source node archiving, initial full backup completed"
+
+  # Row A closes into the binlog the full backup's own coordinate names and
+  # ships normally — never touched again. It is the control: if it went
+  # missing too, that would be a harness/setup bug, not the one under test.
+  sql mysql-pitr-gap-src "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'row-a');"
+  sql mysql-pitr-gap-src "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog A shipped" \
+    bash -c '[ "$(docker logs mysql-pitr-gap-src 2>&1 | grep -c "binlog uploaded")" -ge 1 ]' \
+    || { bad "binlog A was never shipped"; return; }
+  ok "binlog A shipped"
+
+  # Row B closes into the SECOND binlog. Let it ship normally too, then
+  # delete the object straight out of the bucket — simulating a binlog that
+  # made it out but was then lost (an object a lifecycle rule expired, or a
+  # corrupted/dropped upload — see Bug 2 below for the "never even shipped"
+  # variant of this same loss). Deleting an already-confirmed upload is
+  # deterministic and immune to the archiver's ~10s ship-poll timing, where
+  # racing the LOCAL file against ship_once would flake under CI load.
+  sql mysql-pitr-gap-src "INSERT INTO t.kv VALUES (2,'row-b');"
+  sql mysql-pitr-gap-src "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog B shipped" \
+    bash -c '[ "$(docker logs mysql-pitr-gap-src 2>&1 | grep -c "binlog uploaded")" -ge 2 ]' \
+    || { bad "binlog B was never shipped"; return; }
+  local binlog_b
+  binlog_b="$(docker logs mysql-pitr-gap-src 2>&1 | grep '"message":"binlog uploaded"' | grep -o '"file":"[^"]*"' | cut -d'"' -f4 | sed -n '2p')"
+  [ -n "$binlog_b" ] || { bad "could not identify binlog B's shipped file name"; return; }
+  local server_uuid
+  server_uuid="$(sql mysql-pitr-gap-src "SELECT @@server_uuid")"
+  [ -n "$server_uuid" ] || { bad "could not read the source node's server_uuid"; return; }
+  mc_rm_key "e2e-pitr-gap/server-$server_uuid/binlog/$binlog_b" \
+    || { bad "could not delete binlog B ($binlog_b) from the bucket"; return; }
+  ok "binlog B ($binlog_b) shipped, then deleted from the bucket to punch a gap"
+
+  # Row C closes into the THIRD binlog, well after a captured T_target — and
+  # ships normally (nothing touches it). Second-granularity separation on
+  # both sides, same as t_pitr_archive_and_restore_to_point_in_time:
+  # mysqlbinlog's --stop-datetime is second-granular.
+  sql mysql-pitr-gap-src "INSERT INTO t.kv VALUES (3,'row-c');"
+  sleep 2
+  local t_target
+  t_target="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  log "captured T_target=$t_target (after rows B and C, past the punched-out gap)"
+  sleep 2
+  sql mysql-pitr-gap-src "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog C shipped" \
+    bash -c '[ "$(docker logs mysql-pitr-gap-src 2>&1 | grep -c "binlog uploaded")" -ge 3 ]' \
+    || { bad "binlog C was never shipped"; return; }
+  ok "binlog C shipped normally — the archive now holds [A, <gap>, C]"
+
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-gap"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$t_target"
+  )
+  start_standalone mysql-pitr-gap-restore "${recover_env[@]}"
+
+  wait_until 180 "restore completed and serving" \
+    bash -c 'docker exec mysql-pitr-gap-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "restored node never became healthy (restore failed?)"; docker logs mysql-pitr-gap-restore 2>&1 | tail -60; return; }
+
+  local restore_claims_done="no"
+  docker logs mysql-pitr-gap-restore 2>&1 | grep -q "point-in-time restore completed" && restore_claims_done="yes"
+
+  local va vb vc
+  va="$(sql mysql-pitr-gap-restore "SELECT v FROM t.kv WHERE k=1")"
+  vb="$(sql mysql-pitr-gap-restore "SELECT v FROM t.kv WHERE k=2")"
+  vc="$(sql mysql-pitr-gap-restore "SELECT v FROM t.kv WHERE k=3")"
+
+  [ "$va" = "row-a" ] \
+    && ok "pre-gap data (row A) present — the gap-free prefix replayed fine" \
+    || bad "row A missing too — harness/setup problem, not the bug under test (got '$va')"
+
+  # THE decisive assertion — this is the one that is expected to FAIL today.
+  # The correct behavior would be for the restore to fail loudly, or at
+  # minimum to not claim success while silently missing data before the
+  # requested target. Instead: the restore reports success (health serving,
+  # "point-in-time restore completed" logged) while row B is absent (its
+  # binlog was deleted — expected) AND row C is ALSO absent, even though
+  # binlog C shipped perfectly intact and was never touched — because
+  # binlogs_to_replay stops at the FIRST hole and never even looks past it,
+  # so one lost middle file silently discards every good file that follows.
+  if [ "$restore_claims_done" = "yes" ] && [ "$vb" = "row-b" ] && [ "$vc" = "row-c" ]; then
+    ok "restore reached T_target in full despite the mid-lineage binlog gap"
+  else
+    bad "restore reported success but is missing data past a binlog gap — replay_binlogs does not verify the target was reached (see restore.rs). claims_done=$restore_claims_done row_b='$vb' row_c='$vc'"
+  fi
+
+  docker rm -f mysql-pitr-gap-src mysql-pitr-gap-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-gap-src mysql-ha-e2e-vol-mysql-pitr-gap-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
+t_binlog_expiry_silently_loses_unshipped_data() {
+  log "t_binlog_expiry_silently_loses_unshipped_data (BUG: a purged-before-upload binlog vanishes with zero signal)"
+  # mysql_conf.rs hardcodes binlog_expire_logs_seconds to 604800 (7 days) for
+  # an archiving standalone node (render_standalone_archive_conf) with no env
+  # var to override it — config.rs has no BINLOG_EXPIRE_* knob at all. So on
+  # any host where the archiver falls behind for 7+ days (a bucket outage,
+  # host contention, anything), mysqld's OWN auto-expiry can reclaim a
+  # binlog before the archiver ever ships it. archiver.rs's ship_once handles
+  # exactly this case with `if !path.is_file() { continue; }` — a silently
+  # skipped file: zero log line, and zero telemetry event either way, since
+  # this path returns Ok(()) and binlog_shipping_loop's error-telemetry hook
+  # only fires on an Err.
+  #
+  # Forcing the REAL 7-day expiry deterministically inside a short e2e run
+  # isn't practical, and there is no override to shrink it: a live `SET
+  # GLOBAL binlog_expire_logs_seconds` would still only be proving the same
+  # underlying condition ("the file is gone from disk before ship_once gets
+  # to it"), contingent on mysqld's own internal purge-check timing, which
+  # runs on rotation/flush events rather than a clock this test controls.
+  # So this scenario removes the just-rotated file directly off the
+  # container's datadir, immediately after the FLUSH that closes it and
+  # comfortably inside the archiver's 10s SHIP_POLL — functionally identical
+  # to what the expiry would eventually do (the file disappearing off disk
+  # before it is ever shipped), without depending on mysqld's internal purge
+  # scheduling.
+  docker rm -f mysql-pitr-expiry-src mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-expiry-src mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  ok "minio up with bucket $PITR_BUCKET"
+
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-expiry"
+    -e "BINLOG_ROTATE_INTERVAL_SECONDS=3600"
+  )
+  start_standalone mysql-pitr-expiry-src "${archive_env[@]}"
+
+  wait_until 120 "PITR source node healthy" \
+    bash -c 'docker exec mysql-pitr-expiry-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "PITR source node never became healthy"; return; }
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-expiry-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-expiry-src 2>&1 | tail -40; return; }
+  ok "source node archiving, initial full backup completed"
+
+  sql mysql-pitr-expiry-src "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'lost-row');"
+
+  # Identify the binlog this write lands in BEFORE rotating, so exactly that
+  # file (and nothing else) gets removed.
+  local victim
+  victim="$(sql mysql-pitr-expiry-src "SHOW BINARY LOG STATUS" | awk '{print $1}')"
+  [ -n "$victim" ] || { bad "could not determine the active binlog file"; return; }
+
+  sql mysql-pitr-expiry-src "FLUSH BINARY LOGS;"
+  docker exec mysql-pitr-expiry-src rm -f "/var/lib/mysql/$victim" \
+    || { bad "could not remove the victim binlog from the container's datadir"; return; }
+  ok "binlog $victim closed and removed from disk before the archiver could ship it"
+
+  # Several ship-poll cycles (SHIP_POLL=10s in archiver.rs) to let it notice.
+  sleep 45
+
+  local logs
+  logs="$(docker logs mysql-pitr-expiry-src 2>&1)"
+
+  if printf '%s' "$logs" | grep '"message":"binlog uploaded"' | grep -q "\"file\":\"$victim\""; then
+    bad "the archiver claims it shipped $victim after it was removed from disk — false success logged"
+  else
+    ok "the archiver never falsely claims to have shipped the removed binlog"
+  fi
+
+  # The decisive assertion — expected to FAIL today. Scoped to the wrapper's
+  # own structured (JSON, "message"-bearing) log lines so this can't be
+  # satisfied by unrelated raw mysqld chatter — it must be a signal FROM the
+  # archiver naming the lost file.
+  if printf '%s' "$logs" | grep '"message":' | grep -iE '(missing|lost|purged|gap)' | grep -q "$victim"; then
+    ok "the archiver logged a signal naming the lost binlog $victim"
+  else
+    bad "a binlog ($victim) was purged/lost before upload and the archiver logged nothing — see archiver.rs's ship_once"
+  fi
+
+  docker rm -f mysql-pitr-expiry-src mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-expiry-src mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
 # and seeds its own 'pre-upgrade' dataset, so it must not sit inside the
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
@@ -1507,8 +1751,12 @@ t_pitr_archive_and_restore_to_point_in_time() {
 # t_no_quorum_no_wipe deliberately wrecks one member's datadir and stops the
 # rest — it sits second to last. t_pitr_archive_and_restore_to_point_in_time
 # is fully self-contained (its own standalone nodes + minio, no GR trio at
-# all) and sits after it, with only the cross-version finale last.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_conversion_cross_version_upgrade)
+# all) and sits after it, followed by the two adversarial PITR scenarios
+# (t_pitr_restore_silently_stops_short_of_target,
+# t_binlog_expiry_silently_loses_unshipped_data — same self-contained shape,
+# EXPECTED TO FAIL: they prove known, confirmed-but-unfixed bugs rather than
+# a working guarantee), with only the cross-version finale last.
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image
