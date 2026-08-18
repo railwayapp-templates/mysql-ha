@@ -28,7 +28,10 @@
 //!   4. Load the selected full backup (`gunzip -c | mysql`, streamed
 //!      straight from the bucket — nothing stages the whole dump on disk).
 //!   5. Replay the lineage's binlogs from the full's own coordinate up to
-//!      the target time, stopping at the first sequence gap.
+//!      the target time. A sequence gap with binlogs still present past it
+//!      FAILS the restore loudly (see replay_binlogs) — replaying short of
+//!      the target and reporting success would silently lose everything
+//!      after the hole.
 //!   6. Shut the restore-phase mysqld down cleanly and return — main.rs's
 //!      normal flow starts the real, fully-networked, long-lived instance
 //!      right after this, against the now-restored (and already
@@ -46,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const RESTORE_STATE_FILE: &str = ".pitr_restore_state.json";
 const SCRATCH_DIR: &str = ".pitr_restore_binlogs";
@@ -119,7 +122,11 @@ pub fn reset_partial_restore(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_restore_marker(data_dir: &str, status: RestoreStatus, target: DateTime<Utc>) -> Result<()> {
+fn write_restore_marker(
+    data_dir: &str,
+    status: RestoreStatus,
+    target: DateTime<Utc>,
+) -> Result<()> {
     let marker = RestoreMarker {
         status,
         target_time: pitr::format_rfc3339_millis(target),
@@ -201,7 +208,9 @@ pub async fn run(config: &Config) -> Result<()> {
     }
 
     write_restore_marker(&data_dir, RestoreStatus::Completed, target)?;
-    info!("point-in-time restore completed; the normal boot flow starts mysqld in serving mode next");
+    info!(
+        "point-in-time restore completed; the normal boot flow starts mysqld in serving mode next"
+    );
     Ok(())
 }
 
@@ -331,7 +340,10 @@ async fn load_full_backup(s3: &S3Client, full: &FullBackupRef, config: &Config) 
         .context("spawning mysql")?;
 
     let mut gunzip_stdin = gunzip.stdin.take().context("gunzip stdin was not piped")?;
-    let gunzip_stdout = gunzip.stdout.take().context("gunzip stdout was not piped")?;
+    let gunzip_stdout = gunzip
+        .stdout
+        .take()
+        .context("gunzip stdout was not piped")?;
     let mut mysql_stdin = mysql.stdin.take().context("mysql stdin was not piped")?;
 
     let relay_in = tokio::spawn(async move {
@@ -389,20 +401,47 @@ async fn replay_binlogs(
         .filter_map(|k| k.rsplit('/').next().map(str::to_string))
         .collect();
 
-    let to_replay = pitr::binlogs_to_replay(names, &full.meta.binlog_file);
+    let plan = pitr::binlogs_to_replay(names, &full.meta.binlog_file);
+    if let Some(gap) = &plan.gap {
+        // Binlogs exist PAST a hole in the lineage: replaying up to the hole
+        // and stopping would serve a database silently missing everything
+        // after it while reporting success — worse than failing. Refuse, name
+        // the gap, and leave the datadir marked mid-restore (fail-closed, the
+        // same posture as every other unrecoverable restore state).
+        error!(
+            after = %gap.after,
+            next_present = %gap.next_present,
+            start_file = %full.meta.binlog_file,
+            "binlog lineage has a gap: a binlog is missing from the archive while later \
+             binlogs exist past it — the requested point-in-time target cannot be reached, \
+             and replaying short of it would silently lose the data after the gap"
+        );
+        anyhow::bail!(
+            "binlog lineage gap: no binlog follows {:?} but {:?} exists past the hole — \
+             the archive is missing at least one binlog (expired, deleted, or lost before \
+             upload), so a restore to the requested target is impossible; pick a target \
+             at or before the gap, or restore from a newer full backup",
+            if gap.after.is_empty() {
+                full.meta.binlog_file.as_str()
+            } else {
+                gap.after.as_str()
+            },
+            gap.next_present,
+        );
+    }
+    let to_replay = plan.run;
     if to_replay.is_empty() {
         info!(
             start_file = %full.meta.binlog_file,
-            "no binlogs to replay beyond the full backup (none were shipped yet, or the \
-             lineage's own coordinate file is missing from the archive)"
+            "no binlogs to replay beyond the full backup (none were shipped yet, or \
+             everything after the dump coordinate is still in the active binlog)"
         );
         return Ok(());
     }
     info!(files = ?to_replay, start_position = full.meta.binlog_pos, "replaying binlogs");
 
     let scratch = Path::new(&config.data_dir).join(SCRATCH_DIR);
-    std::fs::create_dir_all(&scratch)
-        .with_context(|| format!("creating {}", scratch.display()))?;
+    std::fs::create_dir_all(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
     let mut local_paths = Vec::new();
     for name in &to_replay {
         let key = pitr::binlog_key(location, &full.server_uuid, name);
@@ -450,7 +489,10 @@ async fn replay_binlogs(
     });
 
     let relay_result = relay.await;
-    let binlog_status = mysqlbinlog.wait().await.context("waiting for mysqlbinlog")?;
+    let binlog_status = mysqlbinlog
+        .wait()
+        .await
+        .context("waiting for mysqlbinlog")?;
     let mysql_status = mysql.wait().await.context("waiting for mysql")?;
     let _ = std::fs::remove_dir_all(&scratch);
 
@@ -525,7 +567,10 @@ mod tests {
         reset_partial_restore(&dir).unwrap();
 
         assert!(!crashed_mid_restore(&dir), "marker must be gone");
-        assert!(!Path::new(&dir).join("mysql").exists(), "partial datadir must be gone");
+        assert!(
+            !Path::new(&dir).join("mysql").exists(),
+            "partial datadir must be gone"
+        );
         assert!(!Path::new(&dir).join("binlog.000001").exists());
         assert_eq!(
             std::fs::read_to_string(&lock).unwrap(),

@@ -1518,17 +1518,15 @@ t_pitr_archive_and_restore_to_point_in_time() {
 # fixing it means making them go green, not deleting or loosening them.
 
 t_pitr_restore_silently_stops_short_of_target() {
-  log "t_pitr_restore_silently_stops_short_of_target (BUG: replay_binlogs never verifies the target was reached)"
-  # mysql-wrapper/src/restore.rs's replay_binlogs treats a zero exit from
-  # `mysqlbinlog | mysql` as complete success — it never checks that the
-  # replay's final GTID/position/timestamp actually reached the requested
-  # target. That gap is compounded by pitr.rs's binlogs_to_replay, which
-  # silently `break`s (no log line) at the FIRST sequence-number gap it finds
-  # in the lineage's binlog files — indistinguishable from legitimately
-  # running out of binlogs at the target. A single hole anywhere in the
-  # archive, even with perfectly good, fully-uploaded binlogs sitting past
-  # it, makes the restore silently stop right at the hole while still
-  # reporting success.
+  log "t_pitr_restore_silently_stops_short_of_target (a lineage gap must fail the restore loudly, never replay short)"
+  # Regression for the silent-stop-short bug: pitr.rs's binlogs_to_replay
+  # used to silently truncate at the FIRST sequence-number gap in the
+  # lineage's binlog files — indistinguishable from legitimately running out
+  # of binlogs — and restore.rs reported complete success, so a single hole
+  # anywhere in the archive silently discarded every good, fully-uploaded
+  # binlog past it. Fixed: a gap with binlogs still present beyond it now
+  # FAILS the restore outright, with a structured log line naming the hole
+  # (see BinlogReplayPlan in pitr.rs and the bail in replay_binlogs).
   docker rm -f mysql-pitr-gap-src mysql-pitr-gap-restore mysql-ha-e2e-minio >/dev/null 2>&1
   docker volume rm mysql-ha-e2e-vol-mysql-pitr-gap-src mysql-ha-e2e-vol-mysql-pitr-gap-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
 
@@ -1618,35 +1616,32 @@ t_pitr_restore_silently_stops_short_of_target() {
   )
   start_standalone mysql-pitr-gap-restore "${recover_env[@]}"
 
-  wait_until 180 "restore completed and serving" \
-    bash -c 'docker exec mysql-pitr-gap-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
-    || { bad "restored node never became healthy (restore failed?)"; docker logs mysql-pitr-gap-restore 2>&1 | tail -60; return; }
+  # THE decisive assertions. Row B is unrecoverable by construction (its
+  # binlog was deleted from the bucket), so "reach the target in full" is
+  # impossible — the only correct behavior is the one restore.rs now
+  # implements: detect the hole, name it in a structured log line, and FAIL
+  # the restore outright rather than serving a green-looking database that
+  # silently lost row B AND row C (binlog C shipped intact but sits past the
+  # hole). Before that fix, this scenario failed here: the node came up
+  # healthy, logged "point-in-time restore completed", and was missing both
+  # rows.
+  wait_until 180 "restore refused loudly on the lineage gap" \
+    bash -c 'docker logs mysql-pitr-gap-restore 2>&1 | grep "\"message\":" | grep -qi "binlog lineage has a gap"' \
+    || { bad "the restore never logged the lineage gap — did it silently replay short of the target again?"; docker logs mysql-pitr-gap-restore 2>&1 | tail -60; return; }
+  ok "restore detected and named the lineage gap"
 
-  local restore_claims_done="no"
-  docker logs mysql-pitr-gap-restore 2>&1 | grep -q "point-in-time restore completed" && restore_claims_done="yes"
-
-  local va vb vc
-  va="$(sql mysql-pitr-gap-restore "SELECT v FROM t.kv WHERE k=1")"
-  vb="$(sql mysql-pitr-gap-restore "SELECT v FROM t.kv WHERE k=2")"
-  vc="$(sql mysql-pitr-gap-restore "SELECT v FROM t.kv WHERE k=3")"
-
-  [ "$va" = "row-a" ] \
-    && ok "pre-gap data (row A) present — the gap-free prefix replayed fine" \
-    || bad "row A missing too — harness/setup problem, not the bug under test (got '$va')"
-
-  # THE decisive assertion — this is the one that is expected to FAIL today.
-  # The correct behavior would be for the restore to fail loudly, or at
-  # minimum to not claim success while silently missing data before the
-  # requested target. Instead: the restore reports success (health serving,
-  # "point-in-time restore completed" logged) while row B is absent (its
-  # binlog was deleted — expected) AND row C is ALSO absent, even though
-  # binlog C shipped perfectly intact and was never touched — because
-  # binlogs_to_replay stops at the FIRST hole and never even looks past it,
-  # so one lost middle file silently discards every good file that follows.
-  if [ "$restore_claims_done" = "yes" ] && [ "$vb" = "row-b" ] && [ "$vc" = "row-c" ]; then
-    ok "restore reached T_target in full despite the mid-lineage binlog gap"
+  if docker logs mysql-pitr-gap-restore 2>&1 | grep -q "point-in-time restore completed"; then
+    bad "restore claimed completion despite the lineage gap"
   else
-    bad "restore reported success but is missing data past a binlog gap — replay_binlogs does not verify the target was reached (see restore.rs). claims_done=$restore_claims_done row_b='$vb' row_c='$vc'"
+    ok "restore never claimed completion"
+  fi
+
+  # Fail-closed: the wrapper must not bring the health server up over a
+  # datadir whose restore refused — nothing may route to partial data.
+  if docker exec mysql-pitr-gap-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null; then
+    bad "health endpoint is serving on a node whose restore refused"
+  else
+    ok "health endpoint is not serving — the refused restore stays fail-closed"
   fi
 
   docker rm -f mysql-pitr-gap-src mysql-pitr-gap-restore mysql-ha-e2e-minio >/dev/null 2>&1
@@ -1654,17 +1649,17 @@ t_pitr_restore_silently_stops_short_of_target() {
 }
 
 t_binlog_expiry_silently_loses_unshipped_data() {
-  log "t_binlog_expiry_silently_loses_unshipped_data (BUG: a purged-before-upload binlog vanishes with zero signal)"
-  # mysql_conf.rs hardcodes binlog_expire_logs_seconds to 604800 (7 days) for
-  # an archiving standalone node (render_standalone_archive_conf) with no env
-  # var to override it — config.rs has no BINLOG_EXPIRE_* knob at all. So on
-  # any host where the archiver falls behind for 7+ days (a bucket outage,
-  # host contention, anything), mysqld's OWN auto-expiry can reclaim a
-  # binlog before the archiver ever ships it. archiver.rs's ship_once handles
-  # exactly this case with `if !path.is_file() { continue; }` — a silently
-  # skipped file: zero log line, and zero telemetry event either way, since
-  # this path returns Ok(()) and binlog_shipping_loop's error-telemetry hook
-  # only fires on an Err.
+  log "t_binlog_expiry_silently_loses_unshipped_data (a binlog lost before upload must be reported, never skipped silently)"
+  # Regression for the silent-loss bug pair: mysql_conf.rs used to hardcode
+  # binlog_expire_logs_seconds to 604800 (7 days) on an archiving standalone
+  # node, so mysqld's OWN auto-expiry could reclaim a binlog the archiver had
+  # not shipped yet — and archiver.rs's ship_once skipped the missing file
+  # with a bare `continue`: zero log line, zero telemetry. Fixed twice over:
+  # auto-expiry is now DISABLED on archiving nodes (only the archiver purges,
+  # and only files it confirmed uploaded), and a closed, never-uploaded
+  # binlog found missing from disk is reported once with a structured
+  # error naming the file and recorded in the upload-state file as a
+  # permanent lineage gap.
   #
   # Forcing the REAL 7-day expiry deterministically inside a short e2e run
   # isn't practical, and there is no override to shrink it: a live `SET
@@ -1753,9 +1748,9 @@ t_binlog_expiry_silently_loses_unshipped_data() {
 # is fully self-contained (its own standalone nodes + minio, no GR trio at
 # all) and sits after it, followed by the two adversarial PITR scenarios
 # (t_pitr_restore_silently_stops_short_of_target,
-# t_binlog_expiry_silently_loses_unshipped_data — same self-contained shape,
-# EXPECTED TO FAIL: they prove known, confirmed-but-unfixed bugs rather than
-# a working guarantee), with only the cross-version finale last.
+# t_binlog_expiry_silently_loses_unshipped_data — same self-contained shape;
+# born RED to prove the silent-loss bugs, green since the gap-refusal and
+# lost-binlog-signal fixes), with only the cross-version finale last.
 ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
 
 main() {

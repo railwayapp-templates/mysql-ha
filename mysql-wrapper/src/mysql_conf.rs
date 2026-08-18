@@ -251,10 +251,15 @@ binlog_format = ROW
 sync_binlog = 1
 
 # The archiver reclaims a closed binlog itself once it has confirmed the
-# upload (see archiver.rs's PURGE BINARY LOGS TO) — this expiry is only a
-# backstop against an archiver that has stopped running altogether, giving
-# ample time to notice and fix that before the volume fills.
-binlog_expire_logs_seconds = 604800
+# upload (see archiver.rs's PURGE BINARY LOGS TO) — and NOTHING else may:
+# auto-expiry is disabled outright, because mysqld's own purge cannot know
+# what has shipped, so any nonzero expiry can reclaim a not-yet-uploaded
+# binlog and punch a silent, permanent hole into the archive lineage. A
+# wedged archiver therefore grows the volume LOUDLY (disk pressure is
+# monitored and mysqld blocks writes on a full disk) instead of quietly
+# corrupting point-in-time recovery — the failure a backup system must never
+# trade for disk space.
+binlog_expire_logs_seconds = 0
 "#,
         server_id = input.server_id,
     )
@@ -366,7 +371,12 @@ mod tests {
             "log_bin = binlog",
             "binlog_format = ROW",
             "sync_binlog = 1",
-            "binlog_expire_logs_seconds = 604800",
+            // Auto-expiry DISABLED on an archiving node: mysqld's own purge
+            // cannot know what has shipped, so any nonzero expiry can reclaim
+            // a not-yet-uploaded binlog and punch a silent, permanent hole
+            // into the archive lineage. Only the archiver purges (uploaded
+            // files only) — see archiver.rs.
+            "binlog_expire_logs_seconds = 0",
         ] {
             assert!(conf.contains(directive), "missing directive: {directive}");
         }
