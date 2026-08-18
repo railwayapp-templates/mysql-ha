@@ -1557,31 +1557,46 @@ t_pitr_restore_silently_stops_short_of_target() {
     || { bad "initial full backup never completed"; docker logs mysql-pitr-gap-src 2>&1 | tail -40; return; }
   ok "source node archiving, initial full backup completed"
 
-  # Row A closes into the binlog the full backup's own coordinate names and
-  # ships normally — never touched again. It is the control: if it went
-  # missing too, that would be a harness/setup bug, not the one under test.
-  sql mysql-pitr-gap-src "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'row-a');"
-  sql mysql-pitr-gap-src "FLUSH BINARY LOGS;"
-  wait_until 60 "binlog A shipped" \
-    bash -c '[ "$(docker logs mysql-pitr-gap-src 2>&1 | grep -c "binlog uploaded")" -ge 1 ]' \
-    || { bad "binlog A was never shipped"; return; }
-  ok "binlog A shipped"
+  # Each row's binlog is identified DIRECTLY (SHOW BINARY LOG STATUS names
+  # the active file the row just landed in, same technique as the expiry
+  # scenario) and every ship-wait matches that exact file name in the
+  # archiver's structured log. Never by upload COUNT or upload ORDER: the
+  # first ship cycle uploads every binlog the first-boot init left behind
+  # (docker-entrypoint's temp-server/final-server restarts each rotate), so
+  # count-based waits pass early and ordinal picks grab an init-era file —
+  # exactly the harness bug that made the first run of this scenario punch
+  # its "gap" BEFORE the full backup's own coordinate, where a gap is
+  # legitimately invisible (everything before the dump coordinate is in the
+  # dump itself; see binlogs_to_replay).
 
-  # Row B closes into the SECOND binlog. Let it ship normally too, then
-  # delete the object straight out of the bucket — simulating a binlog that
-  # made it out but was then lost (an object a lifecycle rule expired, or a
-  # corrupted/dropped upload — see Bug 2 below for the "never even shipped"
-  # variant of this same loss). Deleting an already-confirmed upload is
-  # deterministic and immune to the archiver's ~10s ship-poll timing, where
-  # racing the LOCAL file against ship_once would flake under CI load.
-  sql mysql-pitr-gap-src "INSERT INTO t.kv VALUES (2,'row-b');"
+  # Row A ships normally — never touched again. It is the control: if it
+  # went missing too, that would be a harness/setup bug, not the one under
+  # test.
+  sql mysql-pitr-gap-src "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'row-a');"
+  local binlog_a
+  binlog_a="$(sql mysql-pitr-gap-src "SHOW BINARY LOG STATUS" | awk '{print $1}')"
+  [ -n "$binlog_a" ] || { bad "could not determine row A's active binlog"; return; }
   sql mysql-pitr-gap-src "FLUSH BINARY LOGS;"
-  wait_until 60 "binlog B shipped" \
-    bash -c '[ "$(docker logs mysql-pitr-gap-src 2>&1 | grep -c "binlog uploaded")" -ge 2 ]' \
-    || { bad "binlog B was never shipped"; return; }
+  wait_until 60 "binlog A ($binlog_a) shipped" \
+    bash -c 'docker logs mysql-pitr-gap-src 2>&1 | grep "\"message\":\"binlog uploaded\"" | grep -q "\"file\":\"'"$binlog_a"'\""' \
+    || { bad "binlog A ($binlog_a) was never shipped"; return; }
+  ok "binlog A ($binlog_a) shipped"
+
+  # Row B's binlog ships normally too, then its object is deleted straight
+  # out of the bucket — simulating a binlog that made it out but was then
+  # lost (an object a lifecycle rule expired, or a corrupted/dropped upload —
+  # see Bug 2 below for the "never even shipped" variant of this same loss).
+  # Deleting an already-confirmed upload is deterministic and immune to the
+  # archiver's ~10s ship-poll timing, where racing the LOCAL file against
+  # ship_once would flake under CI load.
+  sql mysql-pitr-gap-src "INSERT INTO t.kv VALUES (2,'row-b');"
   local binlog_b
-  binlog_b="$(docker logs mysql-pitr-gap-src 2>&1 | grep '"message":"binlog uploaded"' | grep -o '"file":"[^"]*"' | cut -d'"' -f4 | sed -n '2p')"
-  [ -n "$binlog_b" ] || { bad "could not identify binlog B's shipped file name"; return; }
+  binlog_b="$(sql mysql-pitr-gap-src "SHOW BINARY LOG STATUS" | awk '{print $1}')"
+  [ -n "$binlog_b" ] || { bad "could not determine row B's active binlog"; return; }
+  sql mysql-pitr-gap-src "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog B ($binlog_b) shipped" \
+    bash -c 'docker logs mysql-pitr-gap-src 2>&1 | grep "\"message\":\"binlog uploaded\"" | grep -q "\"file\":\"'"$binlog_b"'\""' \
+    || { bad "binlog B ($binlog_b) was never shipped"; return; }
   local server_uuid
   server_uuid="$(sql mysql-pitr-gap-src "SELECT @@server_uuid")"
   [ -n "$server_uuid" ] || { bad "could not read the source node's server_uuid"; return; }
@@ -1589,21 +1604,24 @@ t_pitr_restore_silently_stops_short_of_target() {
     || { bad "could not delete binlog B ($binlog_b) from the bucket"; return; }
   ok "binlog B ($binlog_b) shipped, then deleted from the bucket to punch a gap"
 
-  # Row C closes into the THIRD binlog, well after a captured T_target — and
-  # ships normally (nothing touches it). Second-granularity separation on
-  # both sides, same as t_pitr_archive_and_restore_to_point_in_time:
+  # Row C's binlog closes well after a captured T_target — and ships
+  # normally (nothing touches it). Second-granularity separation on both
+  # sides, same as t_pitr_archive_and_restore_to_point_in_time:
   # mysqlbinlog's --stop-datetime is second-granular.
   sql mysql-pitr-gap-src "INSERT INTO t.kv VALUES (3,'row-c');"
+  local binlog_c
+  binlog_c="$(sql mysql-pitr-gap-src "SHOW BINARY LOG STATUS" | awk '{print $1}')"
+  [ -n "$binlog_c" ] || { bad "could not determine row C's active binlog"; return; }
   sleep 2
   local t_target
   t_target="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
   log "captured T_target=$t_target (after rows B and C, past the punched-out gap)"
   sleep 2
   sql mysql-pitr-gap-src "FLUSH BINARY LOGS;"
-  wait_until 60 "binlog C shipped" \
-    bash -c '[ "$(docker logs mysql-pitr-gap-src 2>&1 | grep -c "binlog uploaded")" -ge 3 ]' \
-    || { bad "binlog C was never shipped"; return; }
-  ok "binlog C shipped normally — the archive now holds [A, <gap>, C]"
+  wait_until 60 "binlog C ($binlog_c) shipped" \
+    bash -c 'docker logs mysql-pitr-gap-src 2>&1 | grep "\"message\":\"binlog uploaded\"" | grep -q "\"file\":\"'"$binlog_c"'\""' \
+    || { bad "binlog C ($binlog_c) was never shipped"; return; }
+  ok "binlog C ($binlog_c) shipped normally — the archive now holds [.., $binlog_a, <gap: $binlog_b>, $binlog_c]"
 
   local recover_env=(
     -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
