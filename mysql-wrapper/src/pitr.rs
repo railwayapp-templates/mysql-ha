@@ -111,7 +111,9 @@ pub fn format_rfc3339_millis(t: DateTime<Utc>) -> String {
 pub fn parse_target_time(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
-        .with_context(|| format!("MYSQL_RECOVERY_TARGET_TIME {s:?} is not a valid ISO-8601 timestamp"))
+        .with_context(|| {
+            format!("MYSQL_RECOVERY_TARGET_TIME {s:?} is not a valid ISO-8601 timestamp")
+        })
 }
 
 /// A full backup's sidecar metadata (`<...>.meta.json`).
@@ -273,38 +275,88 @@ pub fn purge_cut(
     files_oldest_first: &[String],
     active: &str,
     uploaded: &BTreeSet<String>,
+    lost: &BTreeSet<String>,
 ) -> Option<String> {
-    let boundary = files_oldest_first
-        .iter()
-        .find(|f| f.as_str() == active || !uploaded.contains(f.as_str()))?;
+    // A file recorded as LOST (gone from disk before it was ever uploaded)
+    // can never be shipped, so it must not pin the cut forever: skipping it
+    // lets the shipped files past it still be reclaimed. The loss itself is
+    // reported where it is detected (archiver.rs), not here.
+    let boundary = files_oldest_first.iter().find(|f| {
+        f.as_str() == active || (!uploaded.contains(f.as_str()) && !lost.contains(f.as_str()))
+    })?;
     if files_oldest_first.first() == Some(boundary) {
         return None;
     }
     Some(boundary.clone())
 }
 
-/// Given the lineage's binlog files on disk (any order) and the coordinate
-/// where replay must start, the ordered, gap-free run of files to replay:
-/// the file the full backup's own coordinate names, then every following
-/// file with no missing sequence number, stopping (and logging, at the
-/// caller) at the first gap.
-pub fn binlogs_to_replay(mut files: Vec<String>, start_file: &str) -> Vec<String> {
+/// A sequence hole in the archived lineage, with shipped binlogs still
+/// present on the far side: replaying past it is impossible, and replaying
+/// UP TO it while the caller asked for a later target would silently lose
+/// everything after the hole — the caller must fail loudly instead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinlogGap {
+    /// The last replayable file before the hole — empty when the hole is the
+    /// start file itself (the full backup's own coordinate file is absent
+    /// while later binlogs exist).
+    pub after: String,
+    /// The first file present past the hole.
+    pub next_present: String,
+}
+
+/// The replay plan for a lineage: the ordered, gap-free run of files
+/// starting at the full backup's own coordinate, plus the gap that
+/// terminated it, when one exists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinlogReplayPlan {
+    pub run: Vec<String>,
+    pub gap: Option<BinlogGap>,
+}
+
+/// Given the lineage's binlog files in the archive (any order) and the
+/// coordinate where replay must start, the ordered, gap-free run of files to
+/// replay — plus the gap that cut it short, when files exist past a missing
+/// sequence number. A run that simply ends (no later files) is not a gap:
+/// that is the normal shape, since the active binlog is only shipped on
+/// rotation.
+pub fn binlogs_to_replay(mut files: Vec<String>, start_file: &str) -> BinlogReplayPlan {
     files.sort_by(|a, b| binlog_name_cmp(a, b));
     let Some(start_idx) = files.iter().position(|f| f == start_file) else {
-        return Vec::new();
+        // The full backup's own coordinate file is not in the archive. Files
+        // BEFORE it are covered by the dump itself; any file AFTER it is
+        // unreachable without the start file — a gap, not an empty lineage.
+        let next_past_start = binlog_seq(start_file).and_then(|start_seq| {
+            files
+                .iter()
+                .find(|f| binlog_seq(f).is_some_and(|s| s > start_seq))
+                .cloned()
+        });
+        return BinlogReplayPlan {
+            run: Vec::new(),
+            gap: next_past_start.map(|next_present| BinlogGap {
+                after: String::new(),
+                next_present,
+            }),
+        };
     };
-    let mut run = Vec::new();
+    let mut run: Vec<String> = Vec::new();
     let mut prev_seq = None;
     for name in &files[start_idx..] {
         if let (Some(prev), Some(cur)) = (prev_seq, binlog_seq(name)) {
             if cur != prev + 1 {
-                break;
+                return BinlogReplayPlan {
+                    gap: Some(BinlogGap {
+                        after: run.last().cloned().unwrap_or_default(),
+                        next_present: name.clone(),
+                    }),
+                    run,
+                };
             }
         }
         run.push(name.clone());
         prev_seq = binlog_seq(name);
     }
-    run
+    BinlogReplayPlan { run, gap: None }
 }
 
 #[cfg(test)]
@@ -419,7 +471,10 @@ mod tests {
         let target = parse_target_time("2026-08-13T14:00:00.000Z").unwrap();
         let picked = newest_qualifying_full(&fulls, target).unwrap();
         assert_eq!(picked.server_uuid, "b");
-        assert_eq!(picked.meta.taken_at, parse_target_time("2026-08-13T13:00:00.000Z").unwrap());
+        assert_eq!(
+            picked.meta.taken_at,
+            parse_target_time("2026-08-13T13:00:00.000Z").unwrap()
+        );
     }
 
     #[test]
@@ -439,11 +494,17 @@ mod tests {
 
     #[test]
     fn newest_qualifying_full_ties_break_on_server_uuid() {
-        let fulls = vec![full("z", "2026-08-13T10:00:00.000Z"), full("a", "2026-08-13T10:00:00.000Z")];
+        let fulls = vec![
+            full("z", "2026-08-13T10:00:00.000Z"),
+            full("a", "2026-08-13T10:00:00.000Z"),
+        ];
         let target = parse_target_time("2026-08-13T10:00:00.000Z").unwrap();
         // Deterministic: same instant, "z" wins the lexicographic tie-break —
         // pinned here so the rule can't silently flip between runs.
-        assert_eq!(newest_qualifying_full(&fulls, target).unwrap().server_uuid, "z");
+        assert_eq!(
+            newest_qualifying_full(&fulls, target).unwrap().server_uuid,
+            "z"
+        );
     }
 
     #[test]
@@ -510,7 +571,10 @@ mod tests {
 
     #[test]
     fn coords_absent_reads_as_none() {
-        assert_eq!(parse_change_master_coords("-- just a regular header\n"), None);
+        assert_eq!(
+            parse_change_master_coords("-- just a regular header\n"),
+            None
+        );
         assert_eq!(parse_change_master_coords(""), None);
         // A line that names the statement but is missing a coordinate is
         // still None, not a false partial match.
@@ -564,23 +628,33 @@ mod tests {
 
     #[test]
     fn purge_cut_stops_before_the_first_ungapped_or_active_file() {
-        let disk = files(&["binlog.000001", "binlog.000002", "binlog.000003", "binlog.000004"]);
+        let disk = files(&[
+            "binlog.000001",
+            "binlog.000002",
+            "binlog.000003",
+            "binlog.000004",
+        ]);
         // Everything but the active file is uploaded: cut right at active.
         let uploaded = set(&["binlog.000001", "binlog.000002", "binlog.000003"]);
         assert_eq!(
-            purge_cut(&disk, "binlog.000004", &uploaded),
+            purge_cut(&disk, "binlog.000004", &uploaded, &set(&[])),
             Some("binlog.000004".to_string())
         );
     }
 
     #[test]
     fn purge_cut_never_crosses_an_unuploaded_gap() {
-        let disk = files(&["binlog.000001", "binlog.000002", "binlog.000003", "binlog.000004"]);
+        let disk = files(&[
+            "binlog.000001",
+            "binlog.000002",
+            "binlog.000003",
+            "binlog.000004",
+        ]);
         // 000002 failed to upload (backoff in progress): nothing at or after
         // it may be reclaimed, even though 000001 (older) is safe.
         let uploaded = set(&["binlog.000001", "binlog.000003"]);
         assert_eq!(
-            purge_cut(&disk, "binlog.000004", &uploaded),
+            purge_cut(&disk, "binlog.000004", &uploaded, &set(&[])),
             Some("binlog.000002".to_string())
         );
     }
@@ -590,42 +664,109 @@ mod tests {
         let disk = files(&["binlog.000001", "binlog.000002"]);
         // The very first file on disk is itself unuploaded/active: nothing
         // precedes it, so there is nothing to purge yet.
-        assert_eq!(purge_cut(&disk, "binlog.000001", &set(&[])), None);
+        assert_eq!(
+            purge_cut(&disk, "binlog.000001", &set(&[]), &set(&[])),
+            None
+        );
         let uploaded = set(&[]);
-        assert_eq!(purge_cut(&disk, "binlog.000002", &uploaded), None);
+        assert_eq!(
+            purge_cut(&disk, "binlog.000002", &uploaded, &set(&[])),
+            None
+        );
     }
 
     #[test]
     fn purge_cut_empty_disk_list_is_none() {
-        assert_eq!(purge_cut(&[], "binlog.000001", &set(&[])), None);
+        assert_eq!(purge_cut(&[], "binlog.000001", &set(&[]), &set(&[])), None);
     }
 
     #[test]
-    fn binlogs_to_replay_runs_from_the_start_file_until_a_gap() {
-        let disk = files(&["binlog.000001", "binlog.000002", "binlog.000003", "binlog.000005"]);
+    fn binlogs_to_replay_runs_from_the_start_file_and_reports_the_gap() {
+        let disk = files(&[
+            "binlog.000001",
+            "binlog.000002",
+            "binlog.000003",
+            "binlog.000005",
+        ]);
+        let plan = binlogs_to_replay(disk.clone(), "binlog.000002");
+        assert_eq!(plan.run, vec!["binlog.000002", "binlog.000003"]);
+        // 000004 is missing while 000005 exists past it: a hole, not an end —
+        // the caller must fail loudly instead of replaying short.
         assert_eq!(
-            binlogs_to_replay(disk.clone(), "binlog.000002"),
-            vec!["binlog.000002", "binlog.000003"]
+            plan.gap,
+            Some(BinlogGap {
+                after: "binlog.000003".to_string(),
+                next_present: "binlog.000005".to_string(),
+            })
         );
-        // Starting file missing entirely -> nothing to replay.
-        assert_eq!(binlogs_to_replay(disk, "binlog.000099"), Vec::<String>::new());
+        // Starting file missing entirely, with nothing past it -> nothing to
+        // replay and no gap (everything up to the dump is in the dump).
+        let plan = binlogs_to_replay(disk, "binlog.000099");
+        assert_eq!(plan.run, Vec::<String>::new());
+        assert_eq!(plan.gap, None);
+    }
+
+    #[test]
+    fn binlogs_to_replay_missing_start_file_with_later_files_is_a_gap() {
+        // The full backup's own coordinate file is absent from the archive
+        // while LATER binlogs exist: those are unreachable without it — the
+        // exact silent-loss shape, reported as a gap at the start.
+        let disk = files(&["binlog.000001", "binlog.000004", "binlog.000005"]);
+        let plan = binlogs_to_replay(disk, "binlog.000003");
+        assert_eq!(plan.run, Vec::<String>::new());
+        assert_eq!(
+            plan.gap,
+            Some(BinlogGap {
+                after: String::new(),
+                next_present: "binlog.000004".to_string(),
+            })
+        );
     }
 
     #[test]
     fn binlogs_to_replay_handles_no_gap_at_all() {
         let disk = files(&["binlog.000001", "binlog.000002", "binlog.000003"]);
+        let plan = binlogs_to_replay(disk, "binlog.000001");
         assert_eq!(
-            binlogs_to_replay(disk, "binlog.000001"),
+            plan.run,
             vec!["binlog.000001", "binlog.000002", "binlog.000003"]
         );
+        assert_eq!(plan.gap, None);
     }
 
     #[test]
     fn binlogs_to_replay_tolerates_unordered_input() {
         let disk = files(&["binlog.000003", "binlog.000001", "binlog.000002"]);
+        let plan = binlogs_to_replay(disk, "binlog.000001");
         assert_eq!(
-            binlogs_to_replay(disk, "binlog.000001"),
+            plan.run,
             vec!["binlog.000001", "binlog.000002", "binlog.000003"]
+        );
+        assert_eq!(plan.gap, None);
+    }
+
+    #[test]
+    fn purge_cut_skips_a_lost_file_so_it_cannot_pin_the_cut_forever() {
+        let disk = files(&[
+            "binlog.000001",
+            "binlog.000002",
+            "binlog.000003",
+            "binlog.000004",
+        ]);
+        // 000002 is LOST (gone from disk before upload — reported where it
+        // was detected): it can never ship, so it must not hold the boundary;
+        // uploaded 000003 may still be reclaimed behind the active file.
+        let uploaded = set(&["binlog.000001", "binlog.000003"]);
+        let lost = set(&["binlog.000002"]);
+        assert_eq!(
+            purge_cut(&disk, "binlog.000004", &uploaded, &lost),
+            Some("binlog.000004".to_string())
+        );
+        // The same shape WITHOUT the lost marker still refuses to cross the
+        // unuploaded file — losing must be an explicit, recorded state.
+        assert_eq!(
+            purge_cut(&disk, "binlog.000004", &uploaded, &set(&[])),
+            Some("binlog.000002".to_string())
         );
     }
 }

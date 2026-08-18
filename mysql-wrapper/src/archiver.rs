@@ -98,7 +98,11 @@ pub async fn run(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
         location.clone(),
         server_uuid.clone(),
     ));
-    let rotate_task = tokio::spawn(rotation_loop(config.clone(), sql.clone(), telemetry.clone()));
+    let rotate_task = tokio::spawn(rotation_loop(
+        config.clone(),
+        sql.clone(),
+        telemetry.clone(),
+    ));
 
     // None of these loops return in normal operation; if one panics, say so
     // loudly instead of the archiver silently going dark (mirrors
@@ -321,7 +325,10 @@ async fn tee_and_scan(
     let mut scanned = Vec::with_capacity(scan_cap.min(64 * 1024));
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = src.read(&mut buf).await.context("reading mysqldump output")?;
+        let n = src
+            .read(&mut buf)
+            .await
+            .context("reading mysqldump output")?;
         if n == 0 {
             break;
         }
@@ -376,13 +383,29 @@ async fn ship_once(
     let mut state = read_upload_state(&config.data_dir);
 
     for name in &disk_files {
-        if !pitr::binlog_is_closed(name, &active) || state.uploaded.contains(name) {
+        if !pitr::binlog_is_closed(name, &active)
+            || state.uploaded.contains(name)
+            || state.lost.contains(name)
+        {
             continue;
         }
         let path = Path::new(&config.data_dir).join(name);
         if !path.is_file() {
-            // Already purged by an earlier cycle (or an adopted datadir
-            // whose index predates this volume) — nothing left to ship.
+            // A closed binlog this boot never confirmed uploading, gone from
+            // disk: it was purged or lost before it could ship, and the
+            // archive lineage now has a PERMANENT hole — a restore past this
+            // point will refuse rather than silently stop short (see
+            // restore.rs). Our own reclaim only ever purges uploaded files,
+            // so this is never the archiver's doing. Recorded in the state
+            // file so the loss is reported exactly once, not every poll.
+            state.lost.insert(name.clone());
+            write_upload_state(&config.data_dir, &state)?;
+            error!(
+                file = %name,
+                "binlog lost from disk before upload — the archive lineage now has a \
+                 permanent gap at this file; point-in-time restores past it will refuse \
+                 rather than silently lose the data after it"
+            );
             continue;
         }
         let key = pitr::binlog_key(location, server_uuid, name);
@@ -394,7 +417,7 @@ async fn ship_once(
         info!(file = %name, "binlog uploaded");
     }
 
-    if let Some(cut) = pitr::purge_cut(&disk_files, &active, &state.uploaded) {
+    if let Some(cut) = pitr::purge_cut(&disk_files, &active, &state.uploaded, &state.lost) {
         sql.purge_binary_logs_to(&cut)
             .await
             .with_context(|| format!("PURGE BINARY LOGS TO {cut}"))?;
@@ -443,6 +466,12 @@ fn local_binlog_index(data_dir: &str) -> Result<Vec<String>> {
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 struct UploadState {
     uploaded: BTreeSet<String>,
+    /// Closed binlogs that vanished from disk before they were ever
+    /// uploaded — each is a permanent hole in the archive lineage, reported
+    /// (once) where detected in ship_once. `serde(default)` so state files
+    /// written before this field existed still parse.
+    #[serde(default)]
+    lost: BTreeSet<String>,
 }
 
 fn upload_state_path(data_dir: &str) -> PathBuf {
