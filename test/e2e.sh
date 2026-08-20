@@ -438,16 +438,17 @@ t_adoption_survives_seed_disadvantaged_race() {
   # Stall mysql-1's adoption detection well past BOOTSTRAP_DWELL_SECONDS (5s)
   # and several POLL_INTERVAL (3s) cycles, so the fresh pair has every
   # opportunity to observe a stable (wrong, pre-fix) verdict and act on it.
-  start_node 1 -e RAILWAY_TEST_ADOPTION_DETECTION_DELAY_MS=30000
+  start_node 1 -e RAILWAY_TEST_ADOPTION_DETECTION_DELAY_MS=60000
   start_node 2
   start_node 3
 
   # Mechanism-level check, direct: mysql-1's own /gr/state must never answer
   # 200 for the whole stall — the gate this test exists to pin. Bounded to
-  # 25s (inside the 30s stall) so it can only observe pre-gate behavior, not
-  # the legitimate 200 that follows once the stall elapses.
+  # 45s (comfortably inside the 60s stall, wide margin on both sides) so it
+  # can only observe pre-gate behavior, not the legitimate 200 that follows
+  # once the stall elapses.
   local leaked_early_answer=1 elapsed=0
-  while [ "$elapsed" -lt 25 ]; do
+  while [ "$elapsed" -lt 45 ]; do
     if [ "$(gr_state_code mysql-2 mysql-1)" = "200" ]; then
       leaked_early_answer=0
       break
@@ -461,25 +462,30 @@ t_adoption_survives_seed_disadvantaged_race() {
     ok "mysql-1's /gr/state stayed non-200 for the whole probed stall window"
   fi
 
-  wait_until 20 "a 2-node group forms from the fresh pair, excluding mysql-1, while it is stalled" \
+  # Wide margin on purpose: mysqld for the fresh pair is typically reachable
+  # within ~10s of container start, leaving the rest of this 45s budget for
+  # several full POLL_INTERVAL (3s) cycles to satisfy BOOTSTRAP_DWELL_SECONDS
+  # (5s) well before the 60s stall lifts — no ambiguity between "the race
+  # didn't have time to manifest" and "the fix actually holds".
+  wait_until 45 "a 2-node group forms from the fresh pair, excluding mysql-1, while it is stalled" \
     group_online_excluding mysql-2 2 mysql-1
   local fresh_pair_bootstrapped=$?
   if [ "$fresh_pair_bootstrapped" -eq 0 ]; then
     bad "$t" "mysql-2/mysql-3 formed a 2-node group WITHOUT the adopted node while it was still stalled"
   fi
 
-  # Generous on purpose: the stall alone is 30s, and if the fresh pair did
+  # Generous on purpose: the stall alone is 60s, and if the fresh pair did
   # bootstrap early, correcting requires the adopted node to bootstrap ITS
   # OWN group after the stall and both fresh nodes to clone off it
   # sequentially (MySQL caps concurrent clones per donor at one) — full
   # datadir replace + container restart per node. The existing (unstalled,
   # single-clone-donor) conversion test already budgets 420s for one clone;
-  # this one can need two, after a 30s head start.
+  # this one can need two, after a 60s head start.
   wait_until 500 "converged group fully ONLINE" group_is_fully_online mysql-2 \
     || { bad "$t" "group never reached 3 ONLINE after the stall elapsed"; return; }
 
   local primary
-  primary="$(current_primary mysql-2)"
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)"
   [ -n "$primary" ] || { bad "$t" "no primary elected"; return; }
 
   local v
