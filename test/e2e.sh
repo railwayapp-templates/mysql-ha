@@ -176,6 +176,19 @@ online_members() {
 
 has_n_online() { [ "$(online_members "$1" | tr -d '[:space:]')" = "$2" ]; }
 
+# group_online_excluding <probe-node> <n> <excluded-host> — exactly <n>
+# members ONLINE and <excluded-host> is not one of them. Plain "N online"
+# can't tell a bad 2-node group (the fresh pair, without the adopted node)
+# from a GOOD partial convergence (the adopted node plus one fresh node,
+# the other still mid-clone) — both report the same count.
+group_online_excluding() {
+  local probe="$1" n="$2" excluded="$3"
+  [ "$(online_members "$probe" | tr -d '[:space:]')" = "$n" ] || return 1
+  ! sql "$probe" \
+    "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_STATE='ONLINE'" \
+    | grep -qx "$excluded"
+}
+
 # wait_until <timeout-s> <description> <command...>
 wait_until() {
   local timeout="$1" desc="$2"; shift 2
@@ -363,6 +376,124 @@ t_conversion_adopts_standalone_volume() {
     ok "adopting node is the primary (/role 200)"
   else
     bad "adopting node is not the primary"
+  fi
+}
+
+# gr_state_field <from-node> <target-node> <json-field> — value of one field
+# from the target's /gr/state, probed from another node's container (no host
+# networking assumed). Empty string on any non-200/unreachable/unparseable
+# answer.
+gr_state_field() {
+  local body
+  body="$(docker exec "$1" wget -q -O - "http://$2:8080/gr/state" 2>/dev/null)" || return 0
+  echo "$body" | grep -o "\"$3\":[a-zA-Z0-9]*" | head -1 | cut -d: -f2
+}
+
+# gr_state_code <from-node> <target-node> — like role_code, for /gr/state:
+# "200" or "not-200" (connection-refused, not-yet-listening, and 503 are all
+# indistinguishable via wget's exit code alone, and all equally count as
+# "did not leak a premature answer" for this test's purposes).
+gr_state_code() {
+  if docker exec "$1" wget -q -O /dev/null "http://$2:8080/gr/state" 2>/dev/null; then
+    echo 200
+  else
+    echo not-200
+  fi
+}
+
+# t_adoption_survives_seed_disadvantaged_race — the adopted node is placed
+# LAST in seed order (worst possible tie-break priority) and its adoption
+# detection is artificially stalled well past the fresh pair's poll cadence
+# and bootstrap dwell. Reproduces the exact race the pre-GTID-data tie-break
+# exists to prevent: an about-to-be-adopted node's own /gr/state answering
+# "empty dataset, no pre-GTID data" (true, until its one-time detection step
+# runs) instead of "not ready" — which used to let the fresh nodes, seeing
+# every peer "answer", form a group before ever comparing against the real
+# data. The fix (adoption_checked gating /gr/state) refuses to answer AT ALL
+# until detection completes, forcing the fresh pair through Undecidable
+# instead. Assertion is against the PRIMARY specifically — that's the node
+# every client actually talks to.
+t_adoption_survives_seed_disadvantaged_race() {
+  local t=t_adoption_survives_seed_disadvantaged_race
+  teardown_trio
+  # Adopted node (mysql-1) declared LAST — seed_rank 2, the worst priority.
+  # A tie-break that (incorrectly) fell back to seed order alone would hand
+  # bootstrap candidacy to mysql-2 (rank 0), never to the adopted node.
+  local SEEDS="mysql-2:3306,mysql-3:3306,mysql-1:3306"
+
+  docker volume create --label "$LABEL" mysql-ha-e2e-vol-1 >/dev/null
+  docker run -d --label "$LABEL" --name seed-mysql --network "$NET" \
+    -v mysql-ha-e2e-vol-1:/var/lib/mysql \
+    -e MYSQL_ROOT_PASSWORD="$ROOT_PW" -e MYSQL_DATABASE=railway \
+    "mysql:${MYSQL_VERSION}" \
+    mysqld --disable-log-bin --performance_schema=0 >/dev/null
+  wait_until 240 "standalone seed mysqld up" \
+    bash -c 'docker exec seed-mysql mysql -uroot -p'"$ROOT_PW"' -e "SELECT 1" >/dev/null 2>&1' \
+    || { bad "$t" "standalone seed never came up"; return; }
+  docker exec seed-mysql mysql -uroot -p"$ROOT_PW" -e \
+    "CREATE TABLE railway.legacy (id INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO railway.legacy VALUES (1, 'pre-conversion');" 2>/dev/null
+  docker stop seed-mysql >/dev/null && docker rm seed-mysql >/dev/null
+  ok "standalone volume seeded (binlog off, 1 row of base data)"
+
+  # Stall mysql-1's adoption detection well past BOOTSTRAP_DWELL_SECONDS (5s)
+  # and several POLL_INTERVAL (3s) cycles, so the fresh pair has every
+  # opportunity to observe a stable (wrong, pre-fix) verdict and act on it.
+  start_node 1 -e RAILWAY_TEST_ADOPTION_DETECTION_DELAY_MS=60000
+  start_node 2
+  start_node 3
+
+  # Mechanism-level check, direct: mysql-1's own /gr/state must never answer
+  # 200 for the whole stall — the gate this test exists to pin. Bounded to
+  # 45s (comfortably inside the 60s stall, wide margin on both sides) so it
+  # can only observe pre-gate behavior, not the legitimate 200 that follows
+  # once the stall elapses.
+  local leaked_early_answer=1 elapsed=0
+  while [ "$elapsed" -lt 45 ]; do
+    if [ "$(gr_state_code mysql-2 mysql-1)" = "200" ]; then
+      leaked_early_answer=0
+      break
+    fi
+    sleep 2
+    elapsed=$((elapsed+2))
+  done
+  if [ "$leaked_early_answer" -eq 0 ]; then
+    bad "$t" "mysql-1's /gr/state answered 200 during the stall — adoption_checked gate did not hold"
+  else
+    ok "mysql-1's /gr/state stayed non-200 for the whole probed stall window"
+  fi
+
+  # Wide margin on purpose: mysqld for the fresh pair is typically reachable
+  # within ~10s of container start, leaving the rest of this 45s budget for
+  # several full POLL_INTERVAL (3s) cycles to satisfy BOOTSTRAP_DWELL_SECONDS
+  # (5s) well before the 60s stall lifts — no ambiguity between "the race
+  # didn't have time to manifest" and "the fix actually holds".
+  wait_until 45 "a 2-node group forms from the fresh pair, excluding mysql-1, while it is stalled" \
+    group_online_excluding mysql-2 2 mysql-1
+  local fresh_pair_bootstrapped=$?
+  if [ "$fresh_pair_bootstrapped" -eq 0 ]; then
+    bad "$t" "mysql-2/mysql-3 formed a 2-node group WITHOUT the adopted node while it was still stalled"
+  fi
+
+  # Generous on purpose: the stall alone is 60s, and if the fresh pair did
+  # bootstrap early, correcting requires the adopted node to bootstrap ITS
+  # OWN group after the stall and both fresh nodes to clone off it
+  # sequentially (MySQL caps concurrent clones per donor at one) — full
+  # datadir replace + container restart per node. The existing (unstalled,
+  # single-clone-donor) conversion test already budgets 420s for one clone;
+  # this one can need two, after a 60s head start.
+  wait_until 500 "converged group fully ONLINE" group_is_fully_online mysql-2 \
+    || { bad "$t" "group never reached 3 ONLINE after the stall elapsed"; return; }
+
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)"
+  [ -n "$primary" ] || { bad "$t" "no primary elected"; return; }
+
+  local v
+  v="$(sql "$primary" "SELECT v FROM railway.legacy WHERE id=1" 2>/dev/null)"
+  if [ "$v" = "pre-conversion" ]; then
+    ok "pre-conversion data present on the primary ($primary)"
+  else
+    bad "$t" "pre-conversion data MISSING on the primary ($primary) (got: '$v') — adopted data orphaned or lost"
   fi
 }
 
@@ -1769,7 +1900,7 @@ t_binlog_expiry_silently_loses_unshipped_data() {
 # t_binlog_expiry_silently_loses_unshipped_data — same self-contained shape;
 # born RED to prove the silent-loss bugs, green since the gap-refusal and
 # lost-binlog-signal fixes), with only the cross-version finale last.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_adoption_survives_seed_disadvantaged_race t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

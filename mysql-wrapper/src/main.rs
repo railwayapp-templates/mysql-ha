@@ -172,12 +172,17 @@ async fn main() -> Result<()> {
         // history is init noise that must be purged (see gr::orchestrate).
         let fresh_datadir = !config.datadir_is_initialized();
 
+        // Shared with orchestrate: /gr/state refuses to answer until
+        // orchestrate raises this, right after its one-time adoption
+        // detection completes — see AppState::adoption_checked.
+        let adoption_checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: false,
                 data_dir: config.data_dir.clone(),
+                adoption_checked: adoption_checked.clone(),
             }),
             telemetry.clone(),
         ));
@@ -211,6 +216,7 @@ async fn main() -> Result<()> {
             group_name,
             fresh_datadir,
             healing,
+            adoption_checked,
         ));
     } else {
         // Restore-on-boot runs before anything else in standalone mode: on
@@ -259,6 +265,9 @@ async fn main() -> Result<()> {
                 sql: sql.clone(),
                 standalone: true,
                 data_dir: config.data_dir.clone(),
+                // No orchestrate task runs in standalone mode to raise this
+                // — pre-set so /gr/state behaves exactly as before here.
+                adoption_checked: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }),
             telemetry.clone(),
         ));
