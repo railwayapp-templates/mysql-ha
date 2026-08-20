@@ -1886,6 +1886,16 @@ t_binlog_expiry_silently_loses_unshipped_data() {
   docker volume rm mysql-ha-e2e-vol-mysql-pitr-expiry-src mysql-ha-e2e-minio-data >/dev/null 2>&1
 }
 
+# t_adoption_survives_seed_disadvantaged_race is also self-contained (its own
+# teardown_trio + fresh 'pre-conversion' seed, same shape as the
+# cross-version/outage/self-heal tests below) and for the same reason must
+# not sit inside the adopts→scale→partition chain — it previously sat between
+# t_scale_up_to_five and t_minority_partition_write_fence, tearing the
+# chain's 5-node group down to its own fresh 3-node trio and never scaling
+# back up, so the very next test (which reuses that 5-node group) failed
+# with "no 5-node group to partition". Sits right before the chain starts
+# instead, alongside the other early self-contained tests.
+#
 # t_conversion_cross_version_upgrade runs LAST: it teardown_trio's at the start
 # and seeds its own 'pre-upgrade' dataset, so it must not sit inside the
 # adopts→scale→partition chain that reuses one shared trio + 'pre-conversion'
@@ -1900,7 +1910,7 @@ t_binlog_expiry_silently_loses_unshipped_data() {
 # t_binlog_expiry_silently_loses_unshipped_data — same self-contained shape;
 # born RED to prove the silent-loss bugs, green since the gap-refusal and
 # lost-binlog-signal fixes), with only the cross-version finale last.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_conversion_adopts_standalone_volume t_scale_up_to_five t_adoption_survives_seed_disadvantaged_race t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image
