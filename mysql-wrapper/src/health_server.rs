@@ -34,6 +34,7 @@ use axum::{
 };
 use common::{Telemetry, TelemetryEvent};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -42,6 +43,15 @@ pub struct AppState {
     pub standalone: bool,
     /// Datadir path — /gr/state reads the pre-GTID-data marker from it.
     pub data_dir: String,
+    /// Raised by `gr::orchestrate` once its one-time adoption detection
+    /// (the pre-GTID-data marker write / fresh-instance GTID reset) has
+    /// completed. `/gr/state` refuses to answer before that — see its own
+    /// doc comment above and `adoption_checked`'s own doc comment in gr.rs
+    /// for why: `local_gr_state` reads that marker LIVE off disk, and
+    /// mysqld answering queries does not imply the marker is written yet.
+    /// Pre-set `true` in standalone mode, where no orchestrate task ever
+    /// runs to raise it.
+    pub adoption_checked: Arc<AtomicBool>,
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -75,6 +85,20 @@ async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn gr_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if !state.adoption_checked.load(Ordering::Acquire) {
+        // mysqld answering queries does not mean this node's identity is
+        // fully known yet: adoption detection (has this datadir got
+        // pre-GTID data?) is a one-time SQL round trip orchestrate() still
+        // has to run. Answering early here would report "empty dataset"
+        // for a node that is, in fact, an unmarked adopted volume —
+        // indistinguishable to a peer from a genuinely fresh node. See
+        // AppState::adoption_checked.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "adoption detection not yet complete",
+        )
+            .into_response();
+    }
     match local_gr_state(&state.sql, &state.data_dir).await {
         Ok(s) => (StatusCode::OK, Json(s)).into_response(),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "state unavailable").into_response(),

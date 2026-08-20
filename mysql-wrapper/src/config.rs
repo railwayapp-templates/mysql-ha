@@ -113,6 +113,16 @@ pub struct Config {
     /// (SELF_HEAL_BACKOFF_BASE_SECONDS): attempt N+1 waits base * 2^(N-1).
     /// A clone is heavy on the donor — repeated attempts must space out.
     pub self_heal_backoff_base_seconds: u64,
+    /// TEST-ONLY fault injection, default 0/off
+    /// (RAILWAY_TEST_ADOPTION_DETECTION_DELAY_MS): artificially widens the
+    /// gap between "mysqld is answering" and orchestrate's adoption
+    /// detection completing, so an e2e test can deterministically land a
+    /// peer's bootstrap query inside that window instead of racing a
+    /// naturally sub-second gap. Never set outside test harnesses — it only
+    /// makes this node's own /gr/state block longer before answering
+    /// (adoption_checked; see health_server::AppState), never weakens a
+    /// check.
+    pub test_adoption_detection_delay_ms: u64,
 
     // --- PITR: archive gate (BINLOG_ARCHIVE_*) ---
     pub binlog_archive_bucket: Option<String>,
@@ -179,6 +189,10 @@ impl Config {
             stuck_member_dwell_seconds: u64::env_parse("STUCK_MEMBER_DWELL_SECONDS", 900),
             self_heal_attempt_cap: u32::env_parse("SELF_HEAL_ATTEMPT_CAP", 5),
             self_heal_backoff_base_seconds: u64::env_parse("SELF_HEAL_BACKOFF_BASE_SECONDS", 60),
+            test_adoption_detection_delay_ms: u64::env_parse(
+                "RAILWAY_TEST_ADOPTION_DETECTION_DELAY_MS",
+                0,
+            ),
 
             binlog_archive_bucket: non_empty(std::env::var("BINLOG_ARCHIVE_BUCKET").ok()),
             binlog_archive_key: non_empty(std::env::var("BINLOG_ARCHIVE_KEY").ok()),

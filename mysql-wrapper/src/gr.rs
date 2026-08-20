@@ -51,6 +51,15 @@
 //!     generation always separates the two sides cleanly.
 //!   - The bootstrap decision must hold stable for a dwell period before it
 //!     is acted on, so a slow-starting peer gets a window to contradict it.
+//!   - This node's OWN /gr/state must not answer at all until adoption
+//!     detection (2a below) has run: `has_pre_gtid_data` reads a marker off
+//!     disk, and mysqld answering SQL does not imply that one-time
+//!     detection step has completed. A peer querying in that gap would read
+//!     an about-to-be-adopted node as an ordinary fresh one — the exact
+//!     "stale dataset becomes the source of truth" failure the first
+//!     invariant above exists to prevent, just at start-up instead of at a
+//!     partition. Gated by `adoption_checked` (health_server::AppState),
+//!     raised right after 2a below, before anything else.
 //!   - Joining is the default: any peer reporting a live group means this
 //!     node joins it, candidate or not.
 //!   - A joiner whose server_uuid already lives in the group (a restored
@@ -459,6 +468,12 @@ fn decide(my_pre_gtid: bool, my_seed_rank: usize, peers: &[PeerStanding]) -> Boo
 /// for the duration of its stop-plugin-then-clone sequence: a START
 /// GROUP_REPLICATION issued in between would make the recipient refuse the
 /// clone, so this loop holds while the flag is up.
+///
+/// `adoption_checked` — shared with `health_server::AppState`. `/gr/state`
+/// refuses to answer while this is false; raised here immediately after
+/// step 2a (adoption detection / fresh-instance GTID reset) completes, so
+/// no peer can ever observe this node before its pre-GTID-data marker
+/// reflects the truth.
 pub async fn orchestrate(
     config: Arc<Config>,
     sql: Sql,
@@ -466,6 +481,7 @@ pub async fn orchestrate(
     mut group_name: String,
     fresh_datadir: bool,
     healing: Arc<std::sync::atomic::AtomicBool>,
+    adoption_checked: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // 1. Wait for the FINAL mysqld. docker-entrypoint's first-boot
     //    initialization runs setup SQL against a temp server whose socket is
@@ -491,6 +507,18 @@ pub async fn orchestrate(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     info!("mysqld is answering");
+
+    if config.test_adoption_detection_delay_ms > 0 {
+        warn!(
+            delay_ms = config.test_adoption_detection_delay_ms,
+            "RAILWAY_TEST_ADOPTION_DETECTION_DELAY_MS set — stalling before adoption detection \
+             (test-only fault injection, never expected in production)"
+        );
+        tokio::time::sleep(Duration::from_millis(
+            config.test_adoption_detection_delay_ms,
+        ))
+        .await;
+    }
 
     // 2a. Fresh instance: purge the GTIDs docker-entrypoint's own init SQL
     //     just minted (they're local-only noise under this node's uuid, and
@@ -528,6 +556,12 @@ pub async fn orchestrate(
             Err(e) => warn!(error = %e, "could not read GTID set for adoption detection"),
         }
     }
+
+    // This node's identity (fresh vs. adopted) is now settled on disk —
+    // /gr/state may answer truthfully from here on. Release pairs with the
+    // handler's Acquire load: once a peer observes `true`, it is guaranteed
+    // to see the marker file this same sequence of steps just wrote.
+    adoption_checked.store(true, std::sync::atomic::Ordering::Release);
 
     // 2b. Recovery user, on EVERY node, unlogged, BEFORE the write fence:
     //     the MYSQL communication stack authenticates inbound group
@@ -1580,6 +1614,7 @@ mod tests {
             stuck_member_dwell_seconds: 900,
             self_heal_attempt_cap: 5,
             self_heal_backoff_base_seconds: 60,
+            test_adoption_detection_delay_ms: 0,
             binlog_archive_bucket: None,
             binlog_archive_key: None,
             binlog_archive_secret: None,
