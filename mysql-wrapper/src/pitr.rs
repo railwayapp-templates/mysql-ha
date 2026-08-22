@@ -154,6 +154,110 @@ pub fn newest_qualifying_full(
         })
 }
 
+/// How far short of the requested target an achieved recovery point may fall
+/// before the restore must refuse (seconds). Reaching the EXACT target is
+/// structurally impossible: everything after the last shipped rotation still
+/// lives in the active binlog, which is never uploaded (see
+/// `binlog_is_closed`), so the check is bounded by the archiver's rotation
+/// cadence — two full rotation intervals (the last window itself, plus one
+/// interval of shipping lag) plus a fixed 60s of clock/upload slop.
+pub fn achieved_lag_bound_seconds(rotate_interval_seconds: u64) -> u64 {
+    rotate_interval_seconds.saturating_mul(2).saturating_add(60)
+}
+
+/// True when the achieved recovery point is at/past the target, or short of
+/// it by no more than `bound_seconds` (see `achieved_lag_bound_seconds`).
+pub fn achieved_point_within_bound(
+    target: DateTime<Utc>,
+    achieved: DateTime<Utc>,
+    bound_seconds: u64,
+) -> bool {
+    target.signed_duration_since(achieved).num_seconds()
+        <= i64::try_from(bound_seconds).unwrap_or(i64::MAX)
+}
+
+/// Parse one `mysqlbinlog` text-output event header into its timestamp:
+///
+/// ```text
+/// #260813 14:00:02 server id 1  end_log_pos 157 ...
+/// #260813  1:02:03 server id 1  end_log_pos 157 ...
+/// ```
+///
+/// Every event prints one of these — user transactions, and the trailing
+/// Rotate/Stop event mysqld writes when it closes the file — which is what
+/// makes the LAST header the archive's coverage point even for an idle tail.
+/// mysqlbinlog formats the timestamp in ITS OWN local time zone (there is no
+/// flag to choose one), so callers must pin `TZ=UTC` on the subprocess for
+/// this UTC interpretation to hold. The two-digit year follows MySQL's own
+/// window (70–99 → 19xx, 00–69 → 20xx); the hour is space-padded (`%2d`).
+/// `None` for anything else — including an artificial event's zero timestamp
+/// (`#700101  0:00:00`), which is never a real coverage point.
+pub fn parse_binlog_event_header_utc(line: &str) -> Option<DateTime<Utc>> {
+    use chrono::TimeZone;
+
+    let rest = line.strip_prefix('#')?;
+    let date = rest.get(0..6)?;
+    if !date.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut parts = rest.get(6..)?.split_whitespace();
+    let time = parts.next()?;
+    // Require the ` server id ` marker so an unrelated comment line that
+    // happens to start with six digits can never be misread as a header.
+    if parts.next()? != "server" || parts.next()? != "id" {
+        return None;
+    }
+    let yy: i32 = date[0..2].parse().ok()?;
+    let year = if yy >= 70 { 1900 + yy } else { 2000 + yy };
+    let month: u32 = date[2..4].parse().ok()?;
+    let day: u32 = date[4..6].parse().ok()?;
+    let mut hms = time.split(':');
+    let hour: u32 = hms.next()?.parse().ok()?;
+    let minute: u32 = hms.next()?.parse().ok()?;
+    let second: u32 = hms.next()?.parse().ok()?;
+    if hms.next().is_some() {
+        return None;
+    }
+    let ts = Utc
+        .with_ymd_and_hms(year, month, day, hour, minute, second)
+        .single()?;
+    (ts.timestamp() > 0).then_some(ts)
+}
+
+/// The other discovered full backups, newest first, formatted for restore
+/// errors — the operator's concrete fallback options when the selected
+/// full's lineage cannot reach the requested target: restore from one of
+/// these instead (usually by adjusting MYSQL_RECOVERY_TARGET_TIME to a point
+/// that full's lineage covers). Listing only — full SELECTION stays
+/// `newest_qualifying_full`; automatically falling back across lineages
+/// would resurrect replaced data.
+pub fn describe_fallback_fulls(fulls: &[FullBackupRef], selected: &FullBackupRef) -> String {
+    let mut others: Vec<&FullBackupRef> = fulls
+        .iter()
+        .filter(|f| f.dump_key != selected.dump_key)
+        .collect();
+    if others.is_empty() {
+        return "none (this is the only full backup discovered in the bucket)".to_string();
+    }
+    others.sort_by(|a, b| {
+        b.meta
+            .taken_at
+            .cmp(&a.meta.taken_at)
+            .then_with(|| a.server_uuid.cmp(&b.server_uuid))
+    });
+    others
+        .iter()
+        .map(|f| {
+            format!(
+                "server-{} full taken at {}",
+                f.server_uuid,
+                format_rfc3339_millis(f.meta.taken_at)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Which `mysqldump` coordinate flag to use: MySQL 8.0.23+ renamed
 /// `--master-data` to `--source-data` (and the emitted comment from
 /// `CHANGE MASTER TO` to `CHANGE REPLICATION SOURCE TO`) as part of the
@@ -504,6 +608,112 @@ mod tests {
         assert_eq!(
             newest_qualifying_full(&fulls, target).unwrap().server_uuid,
             "z"
+        );
+    }
+
+    #[test]
+    fn achieved_lag_bound_is_two_rotations_plus_slack() {
+        assert_eq!(achieved_lag_bound_seconds(60), 180);
+        assert_eq!(achieved_lag_bound_seconds(30), 120);
+        assert_eq!(achieved_lag_bound_seconds(0), 60);
+        // A pathological knob value saturates instead of wrapping.
+        assert_eq!(achieved_lag_bound_seconds(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn achieved_point_bound_accepts_within_and_rejects_past() {
+        let target = parse_target_time("2026-08-13T14:00:00.000Z").unwrap();
+        let bound = achieved_lag_bound_seconds(60); // 180s
+
+        // At or past the target always qualifies.
+        assert!(achieved_point_within_bound(target, target, bound));
+        let past = parse_target_time("2026-08-13T14:05:00.000Z").unwrap();
+        assert!(achieved_point_within_bound(target, past, bound));
+
+        // Short of the target by exactly the bound still qualifies —
+        // reaching the exact target is impossible within the last rotation
+        // window, so the boundary itself must be inclusive.
+        let at_bound = parse_target_time("2026-08-13T13:57:00.000Z").unwrap();
+        assert!(achieved_point_within_bound(target, at_bound, bound));
+
+        // One second past the bound does not.
+        let too_short = parse_target_time("2026-08-13T13:56:59.000Z").unwrap();
+        assert!(!achieved_point_within_bound(target, too_short, bound));
+
+        // An hour short (the "archive ends long before the target" shape
+        // this check exists for) is rejected loudly.
+        let way_short = parse_target_time("2026-08-13T13:00:00.000Z").unwrap();
+        assert!(!achieved_point_within_bound(target, way_short, bound));
+
+        // A huge bound never panics/overflows the comparison.
+        assert!(achieved_point_within_bound(target, way_short, u64::MAX));
+    }
+
+    #[test]
+    fn parses_a_binlog_event_header_as_utc() {
+        let line =
+            "#260813 14:00:02 server id 1  end_log_pos 157 CRC32 0xabcd1234 \tQuery\tthread_id=8";
+        assert_eq!(
+            parse_binlog_event_header_utc(line),
+            Some(parse_target_time("2026-08-13T14:00:02.000Z").unwrap())
+        );
+        // mysqlbinlog space-pads the hour (`%2d`).
+        let padded = "#260813  1:02:03 server id 1  end_log_pos 200 \tRotate to binlog.000005";
+        assert_eq!(
+            parse_binlog_event_header_utc(padded),
+            Some(parse_target_time("2026-08-13T01:02:03.000Z").unwrap())
+        );
+        // MySQL's own two-digit-year window: 70–99 → 19xx.
+        let last_century = "#991231 23:59:59 server id 1  end_log_pos 4";
+        assert_eq!(
+            parse_binlog_event_header_utc(last_century),
+            Some(parse_target_time("1999-12-31T23:59:59.000Z").unwrap())
+        );
+    }
+
+    #[test]
+    fn non_header_lines_and_artificial_events_parse_as_none() {
+        for line in [
+            "",
+            "# at 4",
+            "#comment",
+            "SET TIMESTAMP=1755093602/*!*/;",
+            "#260813 14:00:02 not a header",
+            "#26081 14:00:02 server id 1",     // date too short
+            "#260813 14:00 server id 1",       // time missing seconds
+            "#260813 14:00:02:99 server id 1", // too many time fields
+            "#261340 14:00:02 server id 1",    // month 13 is not a date
+            "insert into t values ('#260813 14:00:02 server id 1')",
+        ] {
+            assert_eq!(parse_binlog_event_header_utc(line), None, "line {line:?}");
+        }
+        // An artificial event's zero timestamp is never a coverage point.
+        assert_eq!(
+            parse_binlog_event_header_utc("#700101  0:00:00 server id 1  end_log_pos 0"),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_fulls_listing_excludes_the_selected_and_sorts_newest_first() {
+        let fulls = vec![
+            full("a", "2026-08-13T10:00:00.000Z"),
+            full("b", "2026-08-13T13:00:00.000Z"),
+            full("a", "2026-08-13T12:00:00.000Z"),
+        ];
+        let selected = fulls[2].clone();
+        assert_eq!(
+            describe_fallback_fulls(&fulls, &selected),
+            "server-b full taken at 2026-08-13T13:00:00.000Z, \
+             server-a full taken at 2026-08-13T10:00:00.000Z"
+        );
+
+        // The only full in the bucket has no fallbacks — said explicitly,
+        // never as an empty string.
+        let only = vec![full("a", "2026-08-13T10:00:00.000Z")];
+        assert_eq!(
+            describe_fallback_fulls(&only, &only[0]),
+            "none (this is the only full backup discovered in the bucket)"
         );
     }
 
