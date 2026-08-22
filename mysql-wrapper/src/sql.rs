@@ -15,6 +15,14 @@ use tokio::sync::RwLock;
 
 const SHORT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const PASSWORD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for `SET GLOBAL super_read_only = ON`, the boot-time write fence.
+/// Enabling super_read_only legitimately waits for in-flight transactions to
+/// drain (the server blocks the SET behind open write transactions), so a
+/// live server under client load — an HA conversion of a busy standalone
+/// root — routinely needs far more than SHORT_QUERY_TIMEOUT here. A generous
+/// dedicated budget keeps an expected lock wait from being misread as a hung
+/// mysqld.
+const FENCE_STATEMENT_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberRow {
@@ -134,13 +142,18 @@ impl Sql {
     /// Deliberately a runtime action, not a my.cnf directive — the rendered
     /// config is also read by docker-entrypoint's first-boot init, whose
     /// setup SQL must stay writable.
+    ///
+    /// Runs under FENCE_STATEMENT_TIMEOUT, not `short()`: the SET blocks
+    /// behind in-flight transactions by design, and it is idempotent — the
+    /// caller (gr::orchestrate) retries it in a bounded loop.
     pub async fn set_super_read_only(&self) -> Result<()> {
-        self.short(async {
+        tokio::time::timeout(FENCE_STATEMENT_TIMEOUT, async {
             let mut conn = self.conn().await?;
             conn.query_drop("SET GLOBAL super_read_only = ON").await?;
             Ok(())
         })
         .await
+        .map_err(|_| anyhow!("query timed out after {FENCE_STATEMENT_TIMEOUT:?}"))?
     }
 
     /// Purge this instance's local binlog/GTID history. ONLY safe on a
