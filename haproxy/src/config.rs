@@ -43,3 +43,31 @@ impl Config {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G11 pinned the idle-session timeouts to 1d (above mysqld's
+    /// wait_timeout) — the test fixture in template.rs still uses 30m, so
+    /// nothing unit-level notices if the production default regresses to
+    /// the old 30m. This reads the real `from_env` defaults.
+    #[test]
+    fn production_defaults_keep_idle_sessions_at_1d() {
+        for var in [
+            "HAPROXY_TIMEOUT_CONNECT",
+            "HAPROXY_TIMEOUT_CLIENT",
+            "HAPROXY_TIMEOUT_SERVER",
+            "HAPROXY_TIMEOUT_CHECK",
+        ] {
+            std::env::remove_var(var);
+        }
+        std::env::set_var("MYSQL_NODES", "mysql-1.railway.internal:3306");
+        let config = Config::from_env().expect("from_env with only MYSQL_NODES set");
+        std::env::remove_var("MYSQL_NODES");
+        assert_eq!(config.timeout_client, "1d");
+        assert_eq!(config.timeout_server, "1d");
+        assert_eq!(config.timeout_connect, "10s");
+        assert_eq!(config.timeout_check, "3s");
+    }
+}
