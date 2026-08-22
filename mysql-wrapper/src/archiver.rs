@@ -498,12 +498,21 @@ fn read_upload_state(data_dir: &str) -> UploadState {
 }
 
 fn write_upload_state(data_dir: &str, state: &UploadState) -> Result<()> {
+    use std::io::Write;
+
     let path = upload_state_path(data_dir);
     let json = serde_json::to_string(state).context("serializing PITR upload state")?;
     // Publish atomically: a torn write reads back as JSON garbage, and the
-    // default-on-parse-failure silently forgets every recorded upload.
+    // default-on-parse-failure silently forgets every recorded upload. The
+    // sync_all before the rename keeps a power cut from publishing an empty
+    // tmp file (same discipline as password_pin::write_pin).
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(json.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(file);
     std::fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))
 }
 

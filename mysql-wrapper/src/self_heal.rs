@@ -136,12 +136,20 @@ pub fn read_ledger(data_dir: &str) -> HealLedger {
 }
 
 fn persist_ledger(data_dir: &str, ledger: HealLedger) -> Result<()> {
+    use std::io::Write;
+
     let path = ledger_path(data_dir);
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, format!("{} {}\n", ledger.attempts, ledger.last_unix))
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(format!("{} {}\n", ledger.attempts, ledger.last_unix).as_bytes())
+        .and_then(|()| file.sync_all())
         .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(file);
     // Publish atomically: a torn in-place write is exactly what makes
-    // read_ledger see garbage and re-open the wipe budget.
+    // read_ledger see garbage and re-open the wipe budget. The sync_all
+    // above keeps a power cut from publishing an empty tmp file through the
+    // rename (same discipline as password_pin::write_pin).
     std::fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))
 }
 
