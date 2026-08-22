@@ -149,6 +149,20 @@ impl Telemetry {
     }
 
     pub fn send(&self, event: TelemetryEvent) {
+        self.send_with_attempts(event, SEND_ATTEMPTS);
+    }
+
+    /// Single-attempt send for exit and boot paths: `send`'s delayed retry
+    /// costs up to ~12s of blocking (5s timeout + 2s sleep + 5s retry), and a
+    /// caller that is about to shut the node down — or is holding up boot
+    /// during the very egress race the retry exists for — must not stall on
+    /// it. Best-effort by design: the action always comes first, the report
+    /// is one attempt on the wire.
+    pub fn send_once(&self, event: TelemetryEvent) {
+        self.send_with_attempts(event, 1);
+    }
+
+    fn send_with_attempts(&self, event: TelemetryEvent, attempts: u32) {
         if !self.enabled {
             tracing::debug!(event = event.event_type(), "telemetry disabled off-Railway");
             return;
@@ -167,7 +181,7 @@ impl Telemetry {
         // bounded to one because `send` is synchronous by design: callers
         // like the boot guards emit an event and then exit(1), so the event
         // has to be on the wire before the process goes away.
-        for attempt in 1..=SEND_ATTEMPTS {
+        for attempt in 1..=attempts {
             match self
                 .client
                 .post(&self.endpoint)
@@ -188,7 +202,7 @@ impl Telemetry {
                     }
                     return;
                 }
-                Err(e) if attempt < SEND_ATTEMPTS => {
+                Err(e) if attempt < attempts => {
                     warn!(event = %event.event_type(), attempt, error = %e, "telemetry send failed, retrying");
                     std::thread::sleep(RETRY_DELAY);
                 }
@@ -383,6 +397,22 @@ mod tests {
     fn retry_budget_stays_bounded() {
         assert_eq!(SEND_ATTEMPTS, 2);
         assert!(RETRY_DELAY <= Duration::from_secs(3));
+    }
+
+    /// `send_once` exists for exit/boot paths that cannot afford `send`'s
+    /// delayed retry: one transport failure must return immediately, never
+    /// sleep RETRY_DELAY and try again.
+    #[test]
+    fn send_once_never_sleeps_into_a_retry() {
+        let telemetry = telemetry_for_tests();
+        let started = std::time::Instant::now();
+        // Port 0 is unconnectable: the one attempt fails at once.
+        telemetry.send_once(TelemetryEvent::ComponentError {
+            component: "mysql-wrapper".into(),
+            error: "boom".into(),
+            context: "exit_path".into(),
+        });
+        assert!(started.elapsed() < RETRY_DELAY, "send_once must not retry");
     }
 
     #[test]

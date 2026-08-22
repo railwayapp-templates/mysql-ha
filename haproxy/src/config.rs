@@ -48,12 +48,18 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// Process env is global and `cargo test` runs tests on parallel
+    /// threads: every test that reads or mutates env vars must hold this
+    /// for its whole body, so env tests can never race each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// G11 pinned the idle-session timeouts to 1d (above mysqld's
     /// wait_timeout) — the test fixture in template.rs still uses 30m, so
     /// nothing unit-level notices if the production default regresses to
     /// the old 30m. This reads the real `from_env` defaults.
     #[test]
     fn production_defaults_keep_idle_sessions_at_1d() {
+        let _env = ENV_LOCK.lock().unwrap();
         for var in [
             "HAPROXY_TIMEOUT_CONNECT",
             "HAPROXY_TIMEOUT_CLIENT",

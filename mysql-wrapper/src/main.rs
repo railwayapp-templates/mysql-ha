@@ -84,7 +84,12 @@ async fn main() -> Result<()> {
                 config.data_dir
             );
             tracing::error!("{error}");
-            telemetry.send(TelemetryEvent::ComponentError {
+            // Single attempt, no retry: this runs at the very start of boot,
+            // inside the egress-not-ready window where telemetry's own retry
+            // exists to paper over transport failures — retrying here would
+            // stall every FailedOpen boot ~12s for a send that consistently
+            // fails anyway. Best-effort report, then get on with booting.
+            telemetry.send_once(TelemetryEvent::ComponentError {
                 component: "volume-lock".to_string(),
                 error,
                 context: "startup".to_string(),
@@ -295,7 +300,11 @@ async fn main() -> Result<()> {
         });
 
         if archiving {
-            tokio::spawn(archiver::run(config.clone(), sql.clone(), telemetry.clone()));
+            tokio::spawn(archiver::run(
+                config.clone(),
+                sql.clone(),
+                telemetry.clone(),
+            ));
         }
     }
 

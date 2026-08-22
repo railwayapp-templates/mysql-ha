@@ -86,6 +86,24 @@ const PRE_GTID_DATA_MARKER: &str = ".railway_pre_gtid_data";
 const WAIVER_GENERATION_MARKER: &str = ".railway_gr_waiver_generation";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Bounds for the boot-time write-fence retry (step 2c): the SET is
+/// idempotent and legitimately slow under load (it waits out in-flight
+/// transactions — see Sql::set_super_read_only), so it gets a few attempts
+/// within a hard wall-clock deadline before the node fails closed.
+const FENCE_ATTEMPTS: u32 = 3;
+const FENCE_RETRY_SLEEP: Duration = Duration::from_secs(5);
+const FENCE_TOTAL_DEADLINE: Duration = Duration::from_secs(180);
+/// How long a fence-failure shutdown watches mysqld actually go away before
+/// concluding the graceful path failed and falling back to a process exit.
+const FENCE_SHUTDOWN_CONFIRM: Duration = Duration::from_secs(30);
+
+/// Whether the fence loop may try again after a failed attempt — bounded by
+/// both the attempt cap and the wall-clock deadline. Pure, so the bounds are
+/// unit-tested; the statement itself needs a live mysqld (test/e2e.sh).
+fn fence_should_retry(attempt: u32, now: Instant, deadline: Instant) -> bool {
+    attempt < FENCE_ATTEMPTS && now < deadline
+}
+
 fn marker_path(config: &Config) -> PathBuf {
     Path::new(&config.data_dir).join(GROUP_NAME_MARKER)
 }
@@ -587,19 +605,80 @@ pub async fn orchestrate(
 
     // 2c. Fence writes: nothing may write to this node until the group
     //    decides its role. GR lifts this on the elected primary.
-    if let Err(e) = sql.set_super_read_only().await {
+    //
+    //    The SET legitimately blocks behind in-flight transactions (an HA
+    //    conversion of a live standalone root with clients writing), so it
+    //    runs under a generous dedicated budget and a bounded retry — it is
+    //    idempotent. The fence stays fail-closed: on final failure this node
+    //    must not serve unfenced, but it goes down through mysqld's own
+    //    clean shutdown (same path as the uuid-collision remediation below)
+    //    rather than exit(1) — killing PID 1 SIGKILLs a busy mysqld into
+    //    dirty InnoDB crash recovery, and repeated rounds of that walk the
+    //    boot-loop self-heal toward wiping the datadir.
+    let fence_deadline = Instant::now() + FENCE_TOTAL_DEADLINE;
+    let mut fence_attempt = 0u32;
+    let fence_err = loop {
+        fence_attempt += 1;
+        match sql.set_super_read_only().await {
+            Ok(()) => {
+                if fence_attempt > 1 {
+                    info!(
+                        attempt = fence_attempt,
+                        "write fence (super_read_only) set after retrying"
+                    );
+                }
+                break None;
+            }
+            Err(e) => {
+                warn!(
+                    attempt = fence_attempt,
+                    error = %e,
+                    "could not set super_read_only (an in-flight-transaction wait is expected under load)"
+                );
+                if !fence_should_retry(fence_attempt, Instant::now(), fence_deadline) {
+                    break Some(e);
+                }
+                tokio::time::sleep(FENCE_RETRY_SLEEP).await;
+            }
+        }
+    };
+    if let Some(e) = fence_err {
         error!(
             error = %e,
-            "could not set super_read_only before the group decides this node's role"
+            attempts = fence_attempt,
+            "could not set super_read_only before the group decides this node's role; shutting mysqld down cleanly (fail closed — this node must not serve unfenced)"
         );
-        telemetry.send(TelemetryEvent::ComponentError {
+        // Act first, report after: telemetry's synchronous send would widen
+        // the very unfenced-writes window it is reporting. Issue the clean
+        // shutdown, then report with a single non-retried attempt.
+        let shutdown = sql.shutdown_server().await;
+        telemetry.send_once(TelemetryEvent::ComponentError {
             component: "mysql-wrapper".to_string(),
             error: e.to_string(),
             context: "set_super_read_only".to_string(),
         });
-        // Failing open would leave the local 3306 socket accepting writes
-        // pre-GR — the one window this fence exists to close. Exit hard;
-        // the restart policy retries the boot.
+        if let Err(shutdown_err) = &shutdown {
+            // The connection routinely drops while SHUTDOWN executes, so an
+            // Err does not prove failure — prove it by watching whether
+            // mysqld actually goes away.
+            info!(error = %shutdown_err, "shutdown issued (connection drop on the way down is expected)");
+        }
+        // By now mysqld has been provably up for the whole fence budget, so
+        // boot_watch (self_heal.rs) has long since reset the pre-counted
+        // failed-boot marker — this clean shutdown does not walk the node
+        // toward the boot-loop wipe threshold. The next boot pre-counts and
+        // resets again as every boot does.
+        let confirm_deadline = Instant::now() + FENCE_SHUTDOWN_CONFIRM;
+        while Instant::now() < confirm_deadline {
+            if sql.ping().await.is_err() {
+                info!("mysqld is going down; the supervisor exits the container with it");
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        // mysqld is still answering: the graceful path itself failed. The
+        // hard exit is the last resort that keeps the fence fail-closed.
+        error!("mysqld is still answering after the clean shutdown was issued; exiting hard to keep the fence fail-closed");
         std::process::exit(1);
     }
 
@@ -1288,6 +1367,37 @@ mod tests {
 
     fn equal(pre_gtid_data: bool) -> PeerRelation {
         PeerRelation::Equal { pre_gtid_data }
+    }
+
+    #[test]
+    fn fence_retry_is_bounded_by_attempts_and_deadline() {
+        let t0 = Instant::now();
+        let deadline = t0 + FENCE_TOTAL_DEADLINE;
+
+        // Within both bounds: retry.
+        assert!(fence_should_retry(1, t0, deadline));
+        assert!(fence_should_retry(FENCE_ATTEMPTS - 1, t0, deadline));
+
+        // The attempt cap is hard: no retry at or past it, however much
+        // deadline is left.
+        assert!(!fence_should_retry(FENCE_ATTEMPTS, t0, deadline));
+        assert!(!fence_should_retry(FENCE_ATTEMPTS + 1, t0, deadline));
+
+        // The wall-clock deadline is hard too: no retry at or past it,
+        // however few attempts were spent.
+        assert!(!fence_should_retry(1, deadline, deadline));
+        assert!(!fence_should_retry(
+            1,
+            deadline + Duration::from_secs(1),
+            deadline
+        ));
+
+        // The bounds themselves: a handful of generous attempts inside a
+        // few-minute budget, never a single 2s shot and never unbounded
+        // (mirrors telemetry's retry_budget_stays_bounded pin).
+        assert_eq!(FENCE_ATTEMPTS, 3);
+        assert!(FENCE_TOTAL_DEADLINE >= Duration::from_secs(120));
+        assert!(FENCE_TOTAL_DEADLINE <= Duration::from_secs(600));
     }
 
     #[test]
