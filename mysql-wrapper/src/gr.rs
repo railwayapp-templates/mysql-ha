@@ -102,10 +102,28 @@ fn waiver_generation_path(data_dir: &str) -> PathBuf {
 /// marker. None before the first persist (a first boot pre-orchestration) —
 /// peers only consume this from group-active nodes, which have long since
 /// persisted theirs.
+///
+/// Validated: every group name is a UUID (env-pinned, derived, or the waiver
+/// fence's random mint), and the name is baked into every GTID the group
+/// ever mints — adopting a torn or corrupted marker's content would bake the
+/// corruption in permanently. A non-UUID marker is warned about and read as
+/// absent, so callers fall through to derivation instead (availability
+/// posture: a torn marker must never block boot; the next persist rewrites
+/// it, atomically).
 pub(crate) fn read_group_name_marker(data_dir: &str) -> Option<String> {
     let content = std::fs::read_to_string(Path::new(data_dir).join(GROUP_NAME_MARKER)).ok()?;
     let trimmed = content.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    if trimmed.is_empty() {
+        return None;
+    }
+    if Uuid::parse_str(trimmed).is_err() {
+        warn!(
+            "group-name marker does not hold a UUID (torn or corrupted write); ignoring it \
+             and falling back to derivation"
+        );
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// How many waiver bootstraps this volume's history has been through. 0 for
@@ -119,9 +137,27 @@ pub fn read_waiver_generation(data_dir: &str) -> u64 {
 }
 
 fn persist_waiver_generation(data_dir: &str, generation: u64) -> Result<()> {
-    let path = waiver_generation_path(data_dir);
-    std::fs::write(&path, format!("{generation}\n"))
-        .with_context(|| format!("writing {}", path.display()))
+    persist_atomically(
+        &waiver_generation_path(data_dir),
+        &format!("{generation}\n"),
+    )
+}
+
+/// Persist a marker via tmp-in-the-same-dir + fsync + rename (the same
+/// pattern as password_pin::write_pin): these markers decide group identity
+/// and the divergence tie-break, so a torn in-place write must never be
+/// readable as a half-written value.
+fn persist_atomically(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    let tmp = path.with_extension("tmp");
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("opening {}", tmp.display()))?;
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming {} into place", path.display()))
 }
 
 /// Does this node hold data that predates its GTID history? True for an
@@ -144,11 +180,11 @@ pub fn resolve_group_name(config: &Config) -> String {
     if let Some(name) = &config.gr_group_name {
         return name.clone();
     }
-    if let Ok(persisted) = std::fs::read_to_string(marker_path(config)) {
-        let persisted = persisted.trim();
-        if !persisted.is_empty() {
-            return persisted.to_string();
-        }
+    // Shares the validating reader: a torn/corrupted marker reads as absent
+    // (warned), so this falls through to the deterministic derivation
+    // instead of adopting garbage as a group identity.
+    if let Some(persisted) = read_group_name_marker(&config.data_dir) {
+        return persisted;
     }
     Uuid::new_v5(
         &Uuid::NAMESPACE_DNS,
@@ -167,8 +203,7 @@ pub fn persist_group_name(config: &Config, group_name: &str) -> Result<()> {
             return Ok(());
         }
     }
-    std::fs::write(&path, format!("{group_name}\n"))
-        .with_context(|| format!("writing {}", path.display()))
+    persist_atomically(&path, &format!("{group_name}\n"))
 }
 
 /// This node's own Group Replication state, in the same shape peers report.
@@ -1480,6 +1515,10 @@ mod tests {
 
         persist_waiver_generation(&data_dir, 3).unwrap();
         assert_eq!(read_waiver_generation(&data_dir), 3);
+        // Published atomically: the tmp staging file never survives.
+        assert!(!waiver_generation_path(&data_dir)
+            .with_extension("tmp")
+            .exists());
 
         // A blank/garbage marker degrades to 0, never panics.
         std::fs::write(waiver_generation_path(&data_dir), "  \n").unwrap();
@@ -1487,6 +1526,35 @@ mod tests {
         std::fs::write(waiver_generation_path(&data_dir), "not-a-number").unwrap();
         assert_eq!(read_waiver_generation(&data_dir), 0);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn torn_group_name_marker_is_ignored_never_adopted() {
+        let dir =
+            std::env::temp_dir().join(format!("mysql-ha-torn-marker-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_dir = dir.to_string_lossy().into_owned();
+        let mut config = test_config();
+        config.data_dir = data_dir.clone();
+
+        // A torn/corrupted marker (not a UUID) must never be adopted as the
+        // group identity — it reads as absent and resolution falls through
+        // to derivation, which always yields a UUID. Boot is never blocked.
+        std::fs::write(dir.join(GROUP_NAME_MARKER), "99999999-8888-tor").unwrap();
+        assert_eq!(read_group_name_marker(&data_dir), None);
+        let resolved = resolve_group_name(&config);
+        assert!(Uuid::parse_str(&resolved).is_ok());
+
+        // A healthy UUID marker still round-trips (and publishes with no
+        // tmp staging file left behind).
+        persist_group_name(&config, "99999999-8888-7777-6666-555555555555").unwrap();
+        assert!(!dir.join(GROUP_NAME_MARKER).with_extension("tmp").exists());
+        assert_eq!(
+            read_group_name_marker(&data_dir).as_deref(),
+            Some("99999999-8888-7777-6666-555555555555")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
