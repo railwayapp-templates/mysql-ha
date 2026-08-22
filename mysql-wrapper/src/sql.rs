@@ -503,20 +503,30 @@ impl Sql {
         // the fence re-applied by the orchestrator on the post-clone boot.
         conn.query_drop("SET GLOBAL super_read_only = OFF").await?;
         conn.query_drop("SET GLOBAL read_only = OFF").await?;
-        conn.query_drop(format!(
-            "SET GLOBAL clone_valid_donor_list = {}",
-            sql_string_literal(&donor)
-        ))
-        .await?;
-        conn.query_drop(format!(
-            "CLONE INSTANCE FROM {}@{}:{} IDENTIFIED BY {} REQUIRE SSL",
-            sql_string_literal(user),
-            sql_string_literal(donor_host),
-            donor_port,
-            sql_string_literal(password),
-        ))
-        .await?;
-        Ok(())
+        let clone = async {
+            conn.query_drop(format!(
+                "SET GLOBAL clone_valid_donor_list = {}",
+                sql_string_literal(&donor)
+            ))
+            .await?;
+            conn.query_drop(format!(
+                "CLONE INSTANCE FROM {}@{}:{} IDENTIFIED BY {} REQUIRE SSL",
+                sql_string_literal(user),
+                sql_string_literal(donor_host),
+                donor_port,
+                sql_string_literal(password),
+            ))
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if clone.is_err() {
+            // Clone did not take the server down — put the write fence back.
+            // Success shuts mysqld, so restoring SRO there is a no-op.
+            let _ = conn.query_drop("SET GLOBAL super_read_only = ON").await;
+            let _ = conn.query_drop("SET GLOBAL read_only = ON").await;
+        }
+        clone
     }
 
     /// `@@version`, for the PITR full-backup meta record.

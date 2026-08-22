@@ -589,6 +589,9 @@ pub async fn orchestrate(
                 });
             }
         }
+        // Fresh identity is settled even if the GTID reset failed — peers
+        // may observe /gr/state. Do not leave the gate closed forever.
+        adoption_checked.store(true, std::sync::atomic::Ordering::Release);
     } else if !has_pre_gtid_data(&config.data_dir) {
         // Adoption detection: a NON-fresh datadir with an EMPTY GTID set is
         // pre-existing data that was never binlogged — an adopted standalone
@@ -600,21 +603,33 @@ pub async fn orchestrate(
         match sql.executed_gtid_set().await {
             Ok(set) if set.is_empty() => {
                 if let Err(e) = std::fs::write(pre_gtid_marker_path(&config.data_dir), "1\n") {
-                    warn!(error = %e, "could not persist pre-GTID data marker");
+                    error!(error = %e, "could not persist pre-GTID data marker; /gr/state stays closed");
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "mysql-wrapper".to_string(),
+                        error: e.to_string(),
+                        context: "pre_gtid_marker".to_string(),
+                    });
+                    // Do not raise adoption_checked: peers would treat this
+                    // adopted volume as a fresh empty node.
                 } else {
                     info!("adopted volume detected (data present, no GTID history)");
+                    adoption_checked.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "could not read GTID set for adoption detection"),
+            Ok(_) => {
+                adoption_checked.store(true, std::sync::atomic::Ordering::Release);
+            }
+            Err(e) => {
+                warn!(error = %e, "could not read GTID set for adoption detection; /gr/state stays closed");
+            }
         }
+    } else {
+        // This node's identity (fresh vs. adopted) is now settled on disk —
+        // /gr/state may answer truthfully from here on. Release pairs with the
+        // handler's Acquire load: once a peer observes `true`, it is guaranteed
+        // to see the marker file this same sequence of steps just wrote.
+        adoption_checked.store(true, std::sync::atomic::Ordering::Release);
     }
-
-    // This node's identity (fresh vs. adopted) is now settled on disk —
-    // /gr/state may answer truthfully from here on. Release pairs with the
-    // handler's Acquire load: once a peer observes `true`, it is guaranteed
-    // to see the marker file this same sequence of steps just wrote.
-    adoption_checked.store(true, std::sync::atomic::Ordering::Release);
 
     // 2b. Recovery user, on EVERY node, unlogged, BEFORE the write fence:
     //     the MYSQL communication stack authenticates inbound group
@@ -996,8 +1011,16 @@ pub async fn orchestrate(
             // For an ordinary returning member (subset GTID) this is two cheap
             // reads that no-op.
             let my_gtid_now = sql.executed_gtid_set().await.unwrap_or_default();
+            // Authority is the PRIMARY's GTID set (the group's committed
+            // history), not the first ONLINE/RECOVERING peer in seed order —
+            // a lagging replica would look like a fork and trigger a
+            // destructive reclone of a healthy joiner.
             let live_peer_gtid = answers.iter().find_map(|(_, a)| match a {
-                PeerAnswer::State(s) if s.group_active => s.gtid_executed.clone(),
+                PeerAnswer::State(s)
+                    if s.group_active && s.member_role.as_deref() == Some("PRIMARY") =>
+                {
+                    s.gtid_executed.clone()
+                }
                 _ => None,
             });
             if !my_gtid_now.is_empty() {
@@ -1061,11 +1084,18 @@ pub async fn orchestrate(
                 |(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active && s.pre_gtid_data),
             );
             let i_hold_pre_gtid_data = has_pre_gtid_data(&config.data_dir);
-            let my_gtid_is_empty = sql
-                .executed_gtid_set()
-                .await
-                .map(|s| s.is_empty())
-                .unwrap_or(false);
+            // Fail closed: a read error is treated as empty so we clone
+            // rather than START GROUP_REPLICATION without the adopted base.
+            let my_gtid_is_empty = match sql.executed_gtid_set().await {
+                Ok(s) => s.is_empty(),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "could not read local GTID set; treating as empty so clone is not skipped"
+                    );
+                    true
+                }
+            };
 
             if group_has_pre_gtid_data && !i_hold_pre_gtid_data && my_gtid_is_empty {
                 if let Some(donor) = pick_donor(&answers) {
