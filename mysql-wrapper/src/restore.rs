@@ -31,7 +31,12 @@
 //!      the target time. A sequence gap with binlogs still present past it
 //!      FAILS the restore loudly (see replay_binlogs) — replaying short of
 //!      the target and reporting success would silently lose everything
-//!      after the hole.
+//!      after the hole. The ACHIEVED recovery point is then verified against
+//!      the target (see verify_achieved_point): mysqlbinlog exits 0 when the
+//!      logs simply end before --stop-datetime, so an archive that stopped
+//!      shipping hours before the target would otherwise "succeed" silently;
+//!      more than a rotation-bounded lag behind the target fails as loudly
+//!      as the gap check, and the point reached is recorded in the marker.
 //!   6. Shut the restore-phase mysqld down cleanly and return — main.rs's
 //!      normal flow starts the real, fully-networked, long-lived instance
 //!      right after this, against the now-restored (and already
@@ -65,6 +70,11 @@ pub enum RestoreStatus {
 pub struct RestoreMarker {
     pub status: RestoreStatus,
     pub target_time: String,
+    /// The recovery point the restore actually reached (Completed markers
+    /// only) — at most `achieved_lag_bound_seconds` behind `target_time`,
+    /// verified before the marker is written (see `verify_achieved_point`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub achieved_time: Option<String>,
     pub updated_at: String,
 }
 
@@ -72,9 +82,39 @@ fn restore_marker_path(data_dir: &str) -> PathBuf {
     Path::new(data_dir).join(RESTORE_STATE_FILE)
 }
 
-pub fn read_restore_marker(data_dir: &str) -> Option<RestoreMarker> {
-    let content = std::fs::read_to_string(restore_marker_path(data_dir)).ok()?;
-    serde_json::from_str(&content).ok()
+/// The three states the marker FILE can be in — `Absent` and
+/// present-but-unparseable mean opposite things for the crash check below,
+/// so they must never collapse into one.
+enum MarkerFile {
+    Absent,
+    Unparseable,
+    Present(RestoreMarker),
+}
+
+fn read_marker_file(data_dir: &str) -> MarkerFile {
+    let path = restore_marker_path(data_dir);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MarkerFile::Absent,
+        // A file that exists but cannot even be read is as untrustworthy as
+        // one that doesn't parse.
+        Err(_) => return MarkerFile::Unparseable,
+    };
+    match serde_json::from_str(&content) {
+        Ok(marker) => MarkerFile::Present(marker),
+        Err(_) => MarkerFile::Unparseable,
+    }
+}
+
+/// Test-facing view of the marker. Production reads go through
+/// `read_marker_file`/`crashed_mid_restore`, which must keep unparseable
+/// distinct from absent — this collapses both to None.
+#[cfg(test)]
+fn read_restore_marker(data_dir: &str) -> Option<RestoreMarker> {
+    match read_marker_file(data_dir) {
+        MarkerFile::Present(marker) => Some(marker),
+        MarkerFile::Absent | MarkerFile::Unparseable => None,
+    }
 }
 
 /// True when a previous restore attempt marked itself in-progress and never
@@ -83,13 +123,24 @@ pub fn read_restore_marker(data_dir: &str) -> Option<RestoreMarker> {
 /// when `restore_enabled()`), because the recover env vars themselves may
 /// have been removed after the crash.
 pub fn crashed_mid_restore(data_dir: &str) -> bool {
-    matches!(
-        read_restore_marker(data_dir),
-        Some(RestoreMarker {
-            status: RestoreStatus::InProgress,
-            ..
-        })
-    )
+    match read_marker_file(data_dir) {
+        MarkerFile::Absent => false,
+        MarkerFile::Present(marker) => marker.status == RestoreStatus::InProgress,
+        // A marker that EXISTS but cannot be parsed is a torn write or disk
+        // decay on the very file that records whether a restore completed —
+        // never a fresh volume (nothing else writes this path). Defaulting
+        // open here would boot a vanilla mysqld on a possibly half-restored
+        // datadir; treat it as in-progress instead (fail closed, the same
+        // rationale as self_heal::read_ledger) and let main.rs's existing
+        // wipe-and-retry / refuse logic take it from there.
+        MarkerFile::Unparseable => {
+            warn!(
+                "PITR restore marker is present but unparseable; treating it as a crashed \
+                 mid-restore (fail closed)"
+            );
+            true
+        }
+    }
 }
 
 /// Reset a datadir left behind by a crashed mid-restore attempt so the
@@ -126,15 +177,32 @@ fn write_restore_marker(
     data_dir: &str,
     status: RestoreStatus,
     target: DateTime<Utc>,
+    achieved: Option<DateTime<Utc>>,
 ) -> Result<()> {
+    use std::io::Write;
+
     let marker = RestoreMarker {
         status,
         target_time: pitr::format_rfc3339_millis(target),
+        achieved_time: achieved.map(pitr::format_rfc3339_millis),
         updated_at: pitr::format_rfc3339_millis(Utc::now()),
     };
-    let path = restore_marker_path(data_dir);
     let json = serde_json::to_string(&marker).context("serializing the PITR restore marker")?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))
+    // Publish atomically — tmp in the same dir + fsync + rename, the same
+    // pattern as password_pin::write_pin: the reader deliberately fails
+    // closed on a present-but-unparseable marker (see crashed_mid_restore),
+    // so a torn in-place write here would either fabricate a crashed
+    // restore out of a completed one or, worse, tear the very InProgress
+    // record the crash check depends on.
+    let path = restore_marker_path(data_dir);
+    let tmp = Path::new(data_dir).join(format!("{RESTORE_STATE_FILE}.tmp"));
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("opening {}", tmp.display()))?;
+    file.write_all(json.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming {} into place", path.display()))
 }
 
 /// Run the whole restore end-to-end. Only ever called by main.rs when
@@ -193,10 +261,14 @@ pub async fn run(config: &Config) -> Result<()> {
         .context("loading the full backup")?;
     info!("full backup loaded");
 
-    replay_binlogs(&s3, &location, &full, target, config)
+    let achieved = replay_binlogs(&s3, &location, &fulls, &full, target, config)
         .await
         .context("replaying binlogs")?;
-    info!("binlog replay complete");
+    info!(
+        achieved = %pitr::format_rfc3339_millis(achieved),
+        target = %pitr::format_rfc3339_millis(target),
+        "binlog replay complete"
+    );
 
     let _ = sql.shutdown_server().await;
     match child.wait().await {
@@ -207,8 +279,9 @@ pub async fn run(config: &Config) -> Result<()> {
         Err(e) => warn!(error = %e, "error waiting for the restore-phase mysqld to exit"),
     }
 
-    write_restore_marker(&data_dir, RestoreStatus::Completed, target)?;
+    write_restore_marker(&data_dir, RestoreStatus::Completed, target, Some(achieved))?;
     info!(
+        achieved = %pitr::format_rfc3339_millis(achieved),
         "point-in-time restore completed; the normal boot flow starts mysqld in serving mode next"
     );
     Ok(())
@@ -237,7 +310,7 @@ async fn write_marker_once_datadir_exists(
                     .map(|mut d| d.next().is_some())
                     .unwrap_or(false);
                 if non_empty {
-                    write_restore_marker(data_dir, RestoreStatus::InProgress, target)?;
+                    write_restore_marker(data_dir, RestoreStatus::InProgress, target, None)?;
                     return Ok(());
                 }
             }
@@ -382,15 +455,22 @@ async fn load_full_backup(s3: &S3Client, full: &FullBackupRef, config: &Config) 
 /// `--stop-datetime`. `mysqlbinlog` needs real files on disk (it doesn't
 /// support multiple stdin streams), so these ARE staged locally, in a
 /// scratch directory removed once replay finishes.
+///
+/// Returns the ACHIEVED recovery point, verified against the target: with an
+/// empty run it is the full's own `taken_at`; otherwise the last event
+/// timestamp of the last replayed binlog (capped at the target — everything
+/// past `--stop-datetime` was deliberately not applied). `mysqlbinlog` exits
+/// 0 when the logs simply end before `--stop-datetime`, so exit codes alone
+/// would report success for a restore that silently stopped hours short of
+/// the request — `verify_achieved_point` is what closes that hole.
 async fn replay_binlogs(
     s3: &S3Client,
     location: &S3Location,
+    fulls: &[FullBackupRef],
     full: &FullBackupRef,
     target: DateTime<Utc>,
     config: &Config,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
+) -> Result<DateTime<Utc>> {
     let prefix = pitr::binlog_prefix(location, &full.server_uuid);
     let keys = s3
         .list_keys_with_prefix(&prefix)
@@ -420,13 +500,15 @@ async fn replay_binlogs(
             "binlog lineage gap: no binlog follows {:?} but {:?} exists past the hole — \
              the archive is missing at least one binlog (expired, deleted, or lost before \
              upload), so a restore to the requested target is impossible; pick a target \
-             at or before the gap, or restore from a newer full backup",
+             at or before the gap, or restore from another full backup \
+             (other discovered full backups: {})",
             if gap.after.is_empty() {
                 full.meta.binlog_file.as_str()
             } else {
                 gap.after.as_str()
             },
             gap.next_present,
+            pitr::describe_fallback_fulls(fulls, full),
         );
     }
     let to_replay = plan.run;
@@ -436,7 +518,13 @@ async fn replay_binlogs(
             "no binlogs to replay beyond the full backup (none were shipped yet, or \
              everything after the dump coordinate is still in the active binlog)"
         );
-        return Ok(());
+        // With nothing to replay, the dump itself is the whole restore — the
+        // achieved point is the instant it was taken, and it must still sit
+        // within the rotation bound of the target: an old full with no
+        // shipped binlogs behind it can be hours short of the request.
+        let achieved = full.meta.taken_at;
+        verify_achieved_point(achieved, target, config, fulls, full)?;
+        return Ok(achieved);
     }
     info!(files = ?to_replay, start_position = full.meta.binlog_pos, "replaying binlogs");
 
@@ -452,12 +540,39 @@ async fn replay_binlogs(
         local_paths.push(local);
     }
 
+    // The achieved-point pass below reads the last staged file, so it must
+    // run before the scratch dir is removed — and the dir must be removed on
+    // the failure paths too, hence the inner-result shape.
+    let result = replay_downloaded(&local_paths, full, target, config).await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    let achieved = result?;
+    verify_achieved_point(achieved, target, config, fulls, full)?;
+    Ok(achieved)
+}
+
+/// The `mysqlbinlog | mysql` replay over the already-staged files, followed
+/// by the local achieved-point pass over the last of them. Split out of
+/// `replay_binlogs` so the caller can clean the scratch directory up on
+/// every path.
+async fn replay_downloaded(
+    local_paths: &[PathBuf],
+    full: &FullBackupRef,
+    target: DateTime<Utc>,
+    config: &Config,
+) -> Result<DateTime<Utc>> {
+    use tokio::io::AsyncWriteExt;
+
     let stop_dt = target.format("%Y-%m-%d %H:%M:%S").to_string();
     let mut mysqlbinlog_cmd = Command::new("mysqlbinlog");
     mysqlbinlog_cmd
         .arg(format!("--start-position={}", full.meta.binlog_pos))
-        .arg(format!("--stop-datetime={stop_dt}"));
-    for path in &local_paths {
+        .arg(format!("--stop-datetime={stop_dt}"))
+        // mysqlbinlog interprets --stop-datetime in ITS local time zone, and
+        // stop_dt above is the UTC target formatted without one: pin TZ so
+        // the replay's cut-off and the achieved-point pass below (which pins
+        // TZ the same way) agree with the UTC target on any container TZ.
+        .env("TZ", "UTC");
+    for path in local_paths {
         mysqlbinlog_cmd.arg(path);
     }
     let mut mysqlbinlog = mysqlbinlog_cmd
@@ -494,7 +609,6 @@ async fn replay_binlogs(
         .await
         .context("waiting for mysqlbinlog")?;
     let mysql_status = mysql.wait().await.context("waiting for mysql")?;
-    let _ = std::fs::remove_dir_all(&scratch);
 
     relay_result
         .context("relay task panicked")?
@@ -505,7 +619,117 @@ async fn replay_binlogs(
     if !mysql_status.success() {
         anyhow::bail!("mysql (replaying binlogs) exited with {mysql_status}");
     }
-    Ok(())
+
+    // How far the archive's history actually extends: the last event of the
+    // last replayed binlog. Capped at the target — events past the
+    // --stop-datetime were deliberately not applied, so a tail that runs
+    // beyond the target means the target itself was reached exactly.
+    let last_local = local_paths
+        .last()
+        .expect("replay_downloaded is only called with a non-empty run");
+    let last_event = last_binlog_event_time(last_local).await.with_context(|| {
+        format!(
+            "reading the achieved recovery point from {}",
+            last_local.display()
+        )
+    })?;
+    Ok(last_event.min(target))
+}
+
+/// The timestamp of the LAST event in a staged binlog file, via a local
+/// `mysqlbinlog` pass (`--base64-output=decode-rows` suppresses the base64
+/// event bodies, leaving the headers). Every event prints a
+/// `#YYMMDD HH:MM:SS server id N ...` header — including the trailing
+/// Rotate/Stop event mysqld writes when it closes the file — so the last
+/// header marks the archive's coverage even when the tail carries no user
+/// transactions. `SET TIMESTAMP` lines would be timezone-proof but only
+/// query events emit them (an idle tail has none), so the headers are the
+/// robust choice, with TZ pinned to UTC because mysqlbinlog formats them in
+/// its own local zone (see pitr::parse_binlog_event_header_utc).
+async fn last_binlog_event_time(path: &Path) -> Result<DateTime<Utc>> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut mysqlbinlog = Command::new("mysqlbinlog")
+        .arg("--base64-output=decode-rows")
+        .arg(path)
+        .env("TZ", "UTC")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning mysqlbinlog (achieved recovery point pass)")?;
+    let stdout = mysqlbinlog
+        .stdout
+        .take()
+        .context("mysqlbinlog stdout was not piped")?;
+
+    let mut last = None;
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("reading mysqlbinlog output (achieved recovery point pass)")?
+    {
+        if let Some(ts) = pitr::parse_binlog_event_header_utc(&line) {
+            last = Some(ts);
+        }
+    }
+
+    let status = mysqlbinlog
+        .wait()
+        .await
+        .context("waiting for mysqlbinlog (achieved recovery point pass)")?;
+    if !status.success() {
+        anyhow::bail!("mysqlbinlog (achieved recovery point pass) exited with {status}");
+    }
+    last.with_context(|| format!("no event header found in {}", path.display()))
+}
+
+/// The recovery-target check itself: the achieved point may trail the target
+/// by at most the rotation-bounded window (`pitr::achieved_lag_bound_seconds`
+/// over the archiver's own BINLOG_ROTATE_INTERVAL_SECONDS knob — reaching
+/// the exact target is impossible, everything inside the last rotation
+/// window still lives in the never-uploaded active binlog). Anything worse
+/// fails exactly like the lineage-gap check: loudly, with the InProgress
+/// marker left in place, naming what was asked, what was reached, and the
+/// other discovered fulls as fallback options.
+fn verify_achieved_point(
+    achieved: DateTime<Utc>,
+    target: DateTime<Utc>,
+    config: &Config,
+    fulls: &[FullBackupRef],
+    full: &FullBackupRef,
+) -> Result<()> {
+    let bound = pitr::achieved_lag_bound_seconds(config.binlog_rotate_interval_seconds);
+    if pitr::achieved_point_within_bound(target, achieved, bound) {
+        info!(
+            achieved = %pitr::format_rfc3339_millis(achieved),
+            target = %pitr::format_rfc3339_millis(target),
+            bound_seconds = bound,
+            "achieved recovery point is within the rotation bound of the target"
+        );
+        return Ok(());
+    }
+    error!(
+        achieved = %pitr::format_rfc3339_millis(achieved),
+        target = %pitr::format_rfc3339_millis(target),
+        bound_seconds = bound,
+        "the archive ends short of the requested point-in-time target: replay ran out of \
+         binlogs well before the target instant — reporting success would silently serve a \
+         database missing everything in between"
+    );
+    anyhow::bail!(
+        "recovery target not reached: requested {} but the selected full backup's archive \
+         only reaches {} (more than the allowed {}s rotation-bounded lag behind the target) \
+         — the binlogs covering the rest were never shipped (archiver stopped, or the target \
+         lies inside/beyond the never-uploaded active binlog); pick a target at or before \
+         the achieved point, or restore from another full backup \
+         (other discovered full backups: {})",
+        pitr::format_rfc3339_millis(target),
+        pitr::format_rfc3339_millis(achieved),
+        bound,
+        pitr::describe_fallback_fulls(fulls, full),
+    )
 }
 
 #[cfg(test)]
@@ -537,27 +761,54 @@ mod tests {
     #[test]
     fn in_progress_marker_reads_as_crashed() {
         let dir = temp_dir("in-progress");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t()).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None).unwrap();
         assert!(crashed_mid_restore(&dir));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn completed_marker_is_not_a_crash() {
+    fn completed_marker_is_not_a_crash_and_records_the_achieved_point() {
         let dir = temp_dir("completed");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t()).unwrap();
-        write_restore_marker(&dir, RestoreStatus::Completed, t()).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None).unwrap();
+        let achieved = pitr::parse_target_time("2026-08-13T13:59:10.000Z").unwrap();
+        write_restore_marker(&dir, RestoreStatus::Completed, t(), Some(achieved)).unwrap();
         assert!(!crashed_mid_restore(&dir));
         let marker = read_restore_marker(&dir).unwrap();
         assert_eq!(marker.status, RestoreStatus::Completed);
         assert_eq!(marker.target_time, "2026-08-13T14:00:00.000Z");
+        assert_eq!(
+            marker.achieved_time.as_deref(),
+            Some("2026-08-13T13:59:10.000Z")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn marker_write_publishes_atomically() {
+        let dir = temp_dir("atomic");
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None).unwrap();
+        // The tmp staging file must never survive a successful publish — a
+        // stray one would mean the rename pattern regressed to two files.
+        assert!(!Path::new(&dir)
+            .join(format!("{RESTORE_STATE_FILE}.tmp"))
+            .exists());
+        assert!(crashed_mid_restore(&dir));
+        // A pre-achieved-time marker (no achieved_time field) still parses.
+        std::fs::write(
+            restore_marker_path(&dir),
+            r#"{"status":"completed","target_time":"2026-08-13T14:00:00.000Z","updated_at":"2026-08-13T14:05:00.000Z"}"#,
+        )
+        .unwrap();
+        let marker = read_restore_marker(&dir).unwrap();
+        assert_eq!(marker.status, RestoreStatus::Completed);
+        assert_eq!(marker.achieved_time, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn reset_partial_restore_wipes_everything_but_the_runtime_lock() {
         let dir = temp_dir("reset");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t()).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None).unwrap();
         std::fs::create_dir_all(Path::new(&dir).join("mysql")).unwrap();
         std::fs::write(Path::new(&dir).join("mysql").join("ibdata1"), "junk").unwrap();
         std::fs::write(Path::new(&dir).join("binlog.000001"), "junk").unwrap();
@@ -581,11 +832,27 @@ mod tests {
     }
 
     #[test]
-    fn garbage_marker_file_degrades_to_absent() {
+    fn garbage_marker_file_fails_closed_as_crashed_mid_restore() {
+        // A marker that EXISTS but doesn't parse is a torn write on the one
+        // file recording whether a restore completed — never a fresh volume.
+        // Degrading it to "absent" (the old behavior) booted a vanilla
+        // mysqld straight onto a half-restored datadir; it must read as a
+        // crash so main.rs's wipe-and-retry/refuse logic runs instead.
         let dir = temp_dir("garbage");
         std::fs::write(restore_marker_path(&dir), "not json").unwrap();
         assert!(read_restore_marker(&dir).is_none());
-        assert!(!crashed_mid_restore(&dir));
+        assert!(crashed_mid_restore(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_marker_file_fails_closed_as_crashed_mid_restore() {
+        // The classic torn-write shape: the file was created but nothing
+        // (durable) ever landed in it. Same fail-closed posture as garbage.
+        let dir = temp_dir("empty-marker");
+        std::fs::write(restore_marker_path(&dir), "").unwrap();
+        assert!(read_restore_marker(&dir).is_none());
+        assert!(crashed_mid_restore(&dir));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
