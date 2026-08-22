@@ -588,12 +588,19 @@ pub async fn orchestrate(
     // 2c. Fence writes: nothing may write to this node until the group
     //    decides its role. GR lifts this on the elected primary.
     if let Err(e) = sql.set_super_read_only().await {
-        warn!(error = %e, "could not set super_read_only");
+        error!(
+            error = %e,
+            "could not set super_read_only before the group decides this node's role"
+        );
         telemetry.send(TelemetryEvent::ComponentError {
             component: "mysql-wrapper".to_string(),
             error: e.to_string(),
             context: "set_super_read_only".to_string(),
         });
+        // Failing open would leave the local 3306 socket accepting writes
+        // pre-GR — the one window this fence exists to close. Exit hard;
+        // the restart policy retries the boot.
+        std::process::exit(1);
     }
 
     if let Err(e) = persist_group_name(&config, &group_name) {

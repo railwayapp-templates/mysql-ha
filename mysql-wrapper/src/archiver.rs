@@ -217,10 +217,22 @@ async fn take_full_backup(
     let data_flag = probe_dump_data_flag(sql).await;
     info!(data_flag, %dump_key, "starting full backup");
 
+    // mysqldump is a separate process and cannot ride the pool's
+    // resolved credential: a drifted MYSQL_ROOT_PASSWORD edit would keep
+    // the pool working (it starts on the pinned password) while every
+    // full backup fails in a loop. Resolve the pinned password the same
+    // way the boot pool does, at every attempt so a rotated pin is picked
+    // up without restarting the archiver.
+    let dump_pin = crate::password_pin::read_pin(&config.data_dir);
+    let dump_password = crate::password_pin::initial_password(
+        &config.mysql_root_password,
+        dump_pin.as_deref(),
+    );
+
     let mut mysqldump = Command::new("mysqldump")
         .arg(format!("--socket={}", config.socket_path))
         .arg("-uroot")
-        .env("MYSQL_PWD", &config.mysql_root_password)
+        .env("MYSQL_PWD", &dump_password)
         .arg("--single-transaction")
         .arg("--routines")
         .arg("--events")
@@ -488,7 +500,11 @@ fn read_upload_state(data_dir: &str) -> UploadState {
 fn write_upload_state(data_dir: &str, state: &UploadState) -> Result<()> {
     let path = upload_state_path(data_dir);
     let json = serde_json::to_string(state).context("serializing PITR upload state")?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))
+    // Publish atomically: a torn write reads back as JSON garbage, and the
+    // default-on-parse-failure silently forgets every recorded upload.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))
 }
 
 /// Startup-only: a locally-recorded "uploaded" entry that the bucket doesn't

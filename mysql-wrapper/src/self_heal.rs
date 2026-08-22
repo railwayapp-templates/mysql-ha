@@ -105,8 +105,9 @@ impl HealLedger {
 }
 
 pub fn read_ledger(data_dir: &str) -> HealLedger {
-    let Ok(raw) = std::fs::read_to_string(ledger_path(data_dir)) else {
-        return HealLedger::default();
+    let raw = match std::fs::read_to_string(ledger_path(data_dir)) {
+        Ok(raw) => raw,
+        Err(_) => return HealLedger::default(),
     };
     let mut parts = raw.split_whitespace();
     let attempts = parts.next().and_then(|s| s.parse().ok());
@@ -116,14 +117,32 @@ pub fn read_ledger(data_dir: &str) -> HealLedger {
             attempts,
             last_unix,
         },
-        _ => HealLedger::default(),
+        // A present-but-unparseable ledger is a torn write or disk decay,
+        // not a first boot: defaulting to attempts=0 would re-open the
+        // wipe budget this ledger exists to cap. Fail closed — report the
+        // budget as spent and leave the data for inspection (an operator
+        // clears the file to resume self-heal).
+        _ => {
+            warn!(
+                "self-heal ledger is present but unparseable; treating the attempt budget as \
+                 spent until the file is removed or fixed"
+            );
+            HealLedger {
+                attempts: u32::MAX,
+                last_unix: now_unix(),
+            }
+        }
     }
 }
 
 fn persist_ledger(data_dir: &str, ledger: HealLedger) -> Result<()> {
     let path = ledger_path(data_dir);
-    std::fs::write(&path, format!("{} {}\n", ledger.attempts, ledger.last_unix))
-        .with_context(|| format!("writing {}", path.display()))
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{} {}\n", ledger.attempts, ledger.last_unix))
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    // Publish atomically: a torn in-place write is exactly what makes
+    // read_ledger see garbage and re-open the wipe budget.
+    std::fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))
 }
 
 fn now_unix() -> u64 {
@@ -743,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn ledger_roundtrips_and_degrades() {
+    fn ledger_roundtrips_and_fails_closed_on_garbage() {
         let dir = temp_dir("ledger");
         assert_eq!(read_ledger(&dir), HealLedger::default());
         let ledger = HealLedger {
@@ -752,10 +771,18 @@ mod tests {
         };
         persist_ledger(&dir, ledger).unwrap();
         assert_eq!(read_ledger(&dir), ledger);
+        // A present-but-unparseable ledger must not re-open the wipe
+        // budget: it reads as "budget spent" (CapReached for any cap),
+        // keeping the data safe until the healthy-ONLINE reset clears it.
         std::fs::write(ledger_path(&dir), "not numbers at all").unwrap();
-        assert_eq!(read_ledger(&dir), HealLedger::default());
+        let garbage = read_ledger(&dir);
+        assert_eq!(garbage.attempts, u32::MAX);
+        assert_eq!(
+            heal_gate(garbage, u32::MAX, 60, u64::MAX),
+            HealGate::CapReached
+        );
         std::fs::write(ledger_path(&dir), "5").unwrap();
-        assert_eq!(read_ledger(&dir), HealLedger::default());
+        assert_eq!(read_ledger(&dir).attempts, u32::MAX);
         std::fs::remove_dir_all(&dir).ok();
     }
 

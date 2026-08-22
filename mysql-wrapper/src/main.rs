@@ -71,8 +71,26 @@ async fn main() -> Result<()> {
     // previous container's supervisor to release the volume before anything
     // below (the password pin, GR config, mysqld) touches the data directory
     // (see volume_lock for the overlap rationale). Fail-stop on timeout —
-    // the restart policy retries the boot.
-    volume_lock::acquire_volume_runtime_lock(&config.data_dir)?;
+    // the restart policy retries the boot. A lock file that cannot be opened
+    // keeps the documented fail-open boot, but the lost overlap protection
+    // is reported, not just warned.
+    match volume_lock::acquire_volume_runtime_lock(&config.data_dir)? {
+        volume_lock::VolumeLockOutcome::Held => {}
+        volume_lock::VolumeLockOutcome::FailedOpen => {
+            let error = format!(
+                "could not open the runtime lock file under {}; booting WITHOUT the volume \
+                 lock — if a previous container is still alive on this volume, two mysqld \
+                 engines may now touch the same datadir",
+                config.data_dir
+            );
+            tracing::error!("{error}");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "volume-lock".to_string(),
+                error,
+                context: "startup".to_string(),
+            });
+        }
+    }
 
     // A PITR restore that crashed mid-way leaves the datadir in an unknown,
     // partially-loaded state. Everything in that datadir is derived from the
