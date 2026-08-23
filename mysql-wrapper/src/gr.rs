@@ -273,6 +273,24 @@ fn uuid_collision_peer(my_uuid: &str, answers: &[(String, PeerAnswer)]) -> Optio
     })
 }
 
+/// The live group's authoritative executed-GTID set: the PRIMARY's advert.
+/// Divergence must be judged against the group's committed history, not the
+/// first group-active answer in seed order — group_active includes
+/// RECOVERING, and a lagging or still-recovering secondary is missing
+/// transactions the group HAS committed, so a healthy returning member
+/// holding those would look like a fork and get destructively recloned.
+/// No PRIMARY answering this round means no authority to judge against:
+/// the caller skips the divergence check and the next pass retries (a
+/// truly diverged joiner is refused by GR itself in the meantime).
+fn live_primary_gtid(answers: &[(String, PeerAnswer)]) -> Option<String> {
+    answers.iter().find_map(|(_, a)| match a {
+        PeerAnswer::State(s) if s.group_active && s.member_role.as_deref() == Some("PRIMARY") => {
+            s.gtid_executed.clone()
+        }
+        _ => None,
+    })
+}
+
 /// How long each unreachable peer's NAME has been authoritatively gone.
 ///
 /// The bootstrap guard refuses to decide while any declared peer is
@@ -600,29 +618,58 @@ pub async fn orchestrate(
         // condition becomes unobservable, and joiners need it forever to
         // know that binlog-based recovery can never reconstruct this node's
         // base data (see the clone path below).
-        match sql.executed_gtid_set().await {
-            Ok(set) if set.is_empty() => {
-                if let Err(e) = std::fs::write(pre_gtid_marker_path(&config.data_dir), "1\n") {
-                    error!(error = %e, "could not persist pre-GTID data marker; /gr/state stays closed");
-                    telemetry.send(TelemetryEvent::ComponentError {
-                        component: "mysql-wrapper".to_string(),
-                        error: e.to_string(),
-                        context: "pre_gtid_marker".to_string(),
-                    });
-                    // Do not raise adoption_checked: peers would treat this
-                    // adopted volume as a fresh empty node.
-                } else {
-                    info!("adopted volume detected (data present, no GTID history)");
-                    adoption_checked.store(true, std::sync::atomic::Ordering::Release);
+        // Fail closed, but never forever: /gr/state must not answer before
+        // this settles (an unmarked adopted volume is indistinguishable from
+        // a fresh empty node to a peer), so a GTID-read or marker-write
+        // failure RETRIES here instead of being skipped. The alternatives
+        // are both worse. Proceeding with the gate closed would make this
+        // node permanently NotReady to every peer round (peers.rs maps the
+        // 503 to Unknown), which wedges the peers' bootstrap guard on
+        // Undecidable and hides this node's group from joiners for the rest
+        // of the process lifetime. A clean shutdown is no better — this
+        // runs seconds after mysqld first answers, racing boot_watch's
+        // failed-boot reset, and repeated rounds would walk the boot-loop
+        // self-heal toward wiping the very datadir whose un-replicated base
+        // data this marker exists to protect. mysqld dying under the retry
+        // resolves the same way as in step 1: the supervisor exits the
+        // container with it.
+        let mut adoption_attempts = 0u32;
+        let mut adoption_reported = false;
+        loop {
+            let failure = match sql.executed_gtid_set().await {
+                Ok(set) if set.is_empty() => {
+                    match persist_atomically(&pre_gtid_marker_path(&config.data_dir), "1\n") {
+                        Ok(()) => {
+                            info!("adopted volume detected (data present, no GTID history)");
+                            break;
+                        }
+                        Err(e) => format!("could not persist pre-GTID data marker: {e:#}"),
+                    }
                 }
+                // GTID history exists — an ordinary returning member, not an
+                // adopted volume. Nothing to persist.
+                Ok(_) => break,
+                Err(e) => format!("could not read GTID set for adoption detection: {e:#}"),
+            };
+            if adoption_attempts.is_multiple_of(10) {
+                warn!(
+                    attempts = adoption_attempts,
+                    %failure,
+                    "adoption detection failed; /gr/state stays closed while it retries"
+                );
             }
-            Ok(_) => {
-                adoption_checked.store(true, std::sync::atomic::Ordering::Release);
+            if !adoption_reported {
+                adoption_reported = true;
+                telemetry.send(TelemetryEvent::ComponentError {
+                    component: "mysql-wrapper".to_string(),
+                    error: failure,
+                    context: "adoption_detection".to_string(),
+                });
             }
-            Err(e) => {
-                warn!(error = %e, "could not read GTID set for adoption detection; /gr/state stays closed");
-            }
+            adoption_attempts += 1;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
+        adoption_checked.store(true, std::sync::atomic::Ordering::Release);
     } else {
         // This node's identity (fresh vs. adopted) is now settled on disk —
         // /gr/state may answer truthfully from here on. Release pairs with the
@@ -1008,21 +1055,24 @@ pub async fn orchestrate(
             // nodes healing off the same primary collide — and the retry has
             // to keep coming until the donor frees up. Gating this on
             // "identity just changed" wedged the loser of that race forever.
-            // For an ordinary returning member (subset GTID) this is two cheap
-            // reads that no-op.
-            let my_gtid_now = sql.executed_gtid_set().await.unwrap_or_default();
-            // Authority is the PRIMARY's GTID set (the group's committed
-            // history), not the first ONLINE/RECOVERING peer in seed order —
-            // a lagging replica would look like a fork and trigger a
-            // destructive reclone of a healthy joiner.
-            let live_peer_gtid = answers.iter().find_map(|(_, a)| match a {
-                PeerAnswer::State(s)
-                    if s.group_active && s.member_role.as_deref() == Some("PRIMARY") =>
-                {
-                    s.gtid_executed.clone()
+            // For an ordinary returning member (subset GTID) this is a cheap
+            // read and compare that no-op.
+            //
+            // One read serves both this divergence check and the clone-first
+            // gate below (nothing in between mints local GTIDs — the fence is
+            // up and the plugin is not started). A read error collapses to
+            // empty, which is fail-safe at both uses: the divergence check is
+            // skipped (never reclone on a blind read; the next pass retries)
+            // and the clone-first gate biases toward cloning rather than a
+            // binlog join that would silently skip the adopted base data.
+            let my_gtid_now = match sql.executed_gtid_set().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "could not read the local GTID set; treating it as empty this pass");
+                    String::new()
                 }
-                _ => None,
-            });
+            };
+            let live_peer_gtid = live_primary_gtid(&answers);
             if !my_gtid_now.is_empty() {
                 if let Some(peer_gtid) = live_peer_gtid {
                     match sql.gtid_compare(&my_gtid_now, &peer_gtid).await {
@@ -1084,18 +1134,10 @@ pub async fn orchestrate(
                 |(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active && s.pre_gtid_data),
             );
             let i_hold_pre_gtid_data = has_pre_gtid_data(&config.data_dir);
-            // Fail closed: a read error is treated as empty so we clone
-            // rather than START GROUP_REPLICATION without the adopted base.
-            let my_gtid_is_empty = match sql.executed_gtid_set().await {
-                Ok(s) => s.is_empty(),
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "could not read local GTID set; treating as empty so clone is not skipped"
-                    );
-                    true
-                }
-            };
+            // Fail closed: my_gtid_now collapsed a read error to empty above,
+            // so an unreadable local GTID set clones rather than START
+            // GROUP_REPLICATION without the adopted base.
+            let my_gtid_is_empty = my_gtid_now.is_empty();
 
             if group_has_pre_gtid_data && !i_hold_pre_gtid_data && my_gtid_is_empty {
                 if let Some(donor) = pick_donor(&answers) {
@@ -1736,6 +1778,83 @@ mod tests {
             group_name: None,
             waiver_generation: 0,
         })
+    }
+
+    fn peer_role(role: Option<&str>, gtid: &str) -> PeerAnswer {
+        PeerAnswer::State(GrState {
+            group_active: true,
+            member_state: Some(
+                if role.is_some() {
+                    "ONLINE"
+                } else {
+                    "RECOVERING"
+                }
+                .to_string(),
+            ),
+            member_role: role.map(str::to_string),
+            gtid_executed: Some(gtid.to_string()),
+            members_total: 2,
+            members_reachable: 2,
+            pre_gtid_data: false,
+            server_uuid: None,
+            group_name: None,
+            waiver_generation: 0,
+        })
+    }
+
+    #[test]
+    fn divergence_authority_is_the_primary_not_the_first_active_peer() {
+        // A lagging secondary answers first in seed order; the primary's
+        // (longer) committed history is the authority regardless.
+        let answers = vec![
+            (
+                "mysql-1".to_string(),
+                peer_role(Some("SECONDARY"), "uuid:1-5"),
+            ),
+            (
+                "mysql-2".to_string(),
+                peer_role(Some("PRIMARY"), "uuid:1-9"),
+            ),
+        ];
+        assert_eq!(live_primary_gtid(&answers).as_deref(), Some("uuid:1-9"));
+    }
+
+    #[test]
+    fn divergence_check_has_no_authority_without_a_primary_answer() {
+        // Only secondaries / recovering members answered — no authority this
+        // round; the caller must skip the destructive check, not judge
+        // against a peer that may simply be behind.
+        let answers = vec![
+            (
+                "mysql-1".to_string(),
+                peer_role(Some("SECONDARY"), "uuid:1-5"),
+            ),
+            ("mysql-2".to_string(), peer_role(None, "uuid:1-3")),
+            ("mysql-3".to_string(), PeerAnswer::NotReady),
+        ];
+        assert_eq!(live_primary_gtid(&answers), None);
+    }
+
+    #[test]
+    fn divergence_authority_ignores_an_inactive_primary_claim() {
+        // A peer still advertising PRIMARY from a dead group (group_active
+        // false) is not an authority.
+        let answers = vec![(
+            "mysql-1".to_string(),
+            PeerAnswer::State(GrState {
+                group_active: false,
+                member_state: Some("OFFLINE".to_string()),
+                member_role: Some("PRIMARY".to_string()),
+                gtid_executed: Some("uuid:1-9".to_string()),
+                members_total: 1,
+                members_reachable: 0,
+                pre_gtid_data: false,
+                server_uuid: None,
+                group_name: None,
+                waiver_generation: 0,
+            }),
+        )];
+        assert_eq!(live_primary_gtid(&answers), None);
     }
 
     #[test]

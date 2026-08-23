@@ -501,9 +501,9 @@ impl Sql {
         // HAProxy fails its /role closed, so no external writes can land in
         // the window; and the clone shuts the server down on success, with
         // the fence re-applied by the orchestrator on the post-clone boot.
-        conn.query_drop("SET GLOBAL super_read_only = OFF").await?;
-        conn.query_drop("SET GLOBAL read_only = OFF").await?;
         let clone = async {
+            conn.query_drop("SET GLOBAL super_read_only = OFF").await?;
+            conn.query_drop("SET GLOBAL read_only = OFF").await?;
             conn.query_drop(format!(
                 "SET GLOBAL clone_valid_donor_list = {}",
                 sql_string_literal(&donor)
@@ -521,10 +521,26 @@ impl Sql {
         }
         .await;
         if clone.is_err() {
-            // Clone did not take the server down — put the write fence back.
-            // Success shuts mysqld, so restoring SRO there is a no-op.
-            let _ = conn.query_drop("SET GLOBAL super_read_only = ON").await;
-            let _ = conn.query_drop("SET GLOBAL read_only = ON").await;
+            // Any failure past the first lift leaves the node writable —
+            // put the write fence back. Setting super_read_only back ON
+            // implies read_only, and re-fencing an already-fenced server is
+            // a no-op, so this is safe from every failure point, first lift
+            // included. Best-effort by design: an Err from CLONE is most
+            // often the dropped connection of a clone that DID start and is
+            // shutting mysqld down, where this restore can only fail (and
+            // doesn't matter). Never silent, though — if mysqld were in
+            // fact still up, the node runs unfenced until the post-clone
+            // boot re-fences it, and that deserves a trace.
+            if let Err(e) = conn.query_drop("SET GLOBAL super_read_only = ON").await {
+                tracing::warn!(
+                    error = %e,
+                    "could not restore the write fence after a failed clone (expected when \
+                     the clone completed and mysqld is shutting down; if mysqld is still \
+                     up, it is unfenced until the next boot)"
+                );
+            } else if let Err(e) = conn.query_drop("SET GLOBAL read_only = ON").await {
+                tracing::warn!(error = %e, "could not restore read_only after a failed clone");
+            }
         }
         clone
     }
