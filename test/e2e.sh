@@ -1106,8 +1106,9 @@ t_clean_double_stop_keeps_fence() {
   docker start "$victim" "$primary" >/dev/null
   wait_until 420 "group back to 3 ONLINE" group_is_fully_online "$survivor" \
     || { bad "clean-stop: group did not reform after both members returned"; return; }
-  docker logs "$survivor" 2>&1 | grep -q "membership majority restored" \
-    || { bad "clean-stop: group reformed but the fence never reported lifting"; return; }
+  fence_lift_logged() { docker logs "$survivor" 2>&1 | grep -q "membership majority restored"; }
+  wait_until 60 "the membership fence reports lifting" fence_lift_logged \
+    || { bad "clean-stop: group reformed but the fence never lifted"; return; }
 
   clean_writable_primary() { current_primary "$survivor" mysql-1 mysql-2 mysql-3 >/dev/null; }
   wait_until 90 "a writable primary after the fence lifts" clean_writable_primary \
