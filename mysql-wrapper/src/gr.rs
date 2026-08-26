@@ -283,9 +283,9 @@ pub(crate) enum MajorityVerdict {
     /// Majority is lost but the departure proof is incomplete — stay fenced.
     /// Carries the first blocking reason, for wait_log_once.
     Hold(String),
-    /// Every unreachable view member is PROVABLY back, out of the group, and
-    /// carrying this group's identity: force the view down to the reachable
-    /// members so they can rejoin.
+    /// This lone survivor's every unreachable view member is PROVABLY back,
+    /// out of the group, and carrying this group's identity: re-form the
+    /// group from this node so they can rejoin.
     Force,
 }
 
@@ -316,6 +316,16 @@ pub(crate) fn majority_loss_recovery_verdict(
     let reachable = members.iter().filter(|m| m.state != "UNREACHABLE").count();
     if reachable * 2 > members.len() {
         return MajorityVerdict::Healthy;
+    }
+    // Single-survivor only: with two or more reachable members sharing the
+    // blocked view, a per-survivor re-bootstrap would fork the group (each
+    // survivor forming its own single-member group under the same name).
+    // That shape stays fenced until a human picks the survivor to keep.
+    if reachable != 1 {
+        return MajorityVerdict::Hold(format!(
+            "{reachable} reachable members share this blocked view; automatic recovery is \
+             single-survivor only — run group_replication_force_members manually"
+        ));
     }
     let Some(group_name) = group_name else {
         return MajorityVerdict::Hold(
@@ -382,9 +392,6 @@ const FORCE_DWELL_ROUNDS: u32 = 6;
 /// this into a view chainsaw. Past the cap the node stays fenced and logs
 /// the manual escape hatch.
 const FORCE_MAX_ATTEMPTS: u32 = 3;
-/// How long the forced view gets to install before the attempt is written
-/// off (the variable is cleared either way).
-const FORCE_VIEW_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Runtime watcher an ACTIVE member runs for the rest of its life (spawned
 /// by orchestrate the moment the node is in a group — orchestrate itself
@@ -523,70 +530,56 @@ pub async fn majority_watch(config: Arc<Config>, sql: Sql, telemetry: Arc<Teleme
                 }
                 attempts += 1;
 
-                // Keep every reachable view member. XCom addresses are
-                // rendered uniformly as {host}:{port} (see mysql_conf.rs),
-                // so the port comes off this node's own local_address.
-                let my_addr = match sql.gr_local_address().await {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        warn!(error = %e, "could not read own XCom address; retrying next round");
-                        consecutive_force = 0;
-                        continue;
-                    }
-                };
-                let port = my_addr.rsplit(':').next().unwrap_or("3306").to_string();
-                let keep = members
-                    .iter()
-                    .filter(|m| m.state != "UNREACHABLE")
-                    .map(|m| format!("{}:{}", m.host, port))
-                    .collect::<Vec<_>>()
-                    .join(",");
                 warn!(
-                    %keep,
                     attempt = attempts,
                     "majority-lost view with every missing member provably departed — \
-                     forcing the view down to the reachable members"
+                     re-forming the group from this lone survivor"
                 );
-                if let Err(e) = sql.set_force_members(&keep).await {
-                    error!(error = %e, "SET group_replication_force_members failed");
+                // group_replication_force_members was the first mechanism
+                // here and proved unreliable in exactly this state: mysqld's
+                // own 60s wait for the forced view (MY-011723) times out
+                // while returning members' join attempts hammer XCom —
+                // 1 install in 4 across docker e2e runs. A stop + bootstrap
+                // under the SAME persisted group identity is deterministic:
+                // no consensus with the ghost view is needed, and the
+                // returning members' normal join path finds the re-formed
+                // group under the identity they already trust.
+                if let Err(e) = sql.stop_group_replication().await {
+                    error!(error = %e, "STOP GROUP_REPLICATION failed; retrying next round");
                     telemetry.send(TelemetryEvent::ComponentError {
                         component: "mysql-wrapper".to_string(),
                         error: e.to_string(),
                         context: "majority_loss_recovery".to_string(),
                     });
-                    // Clear defensively even on failure — a partially-applied
-                    // value must never linger.
-                    let _ = sql.clear_force_members().await;
                     consecutive_force = 0;
                     continue;
                 }
-
-                let deadline = Instant::now() + FORCE_VIEW_DEADLINE;
-                let mut installed = false;
-                while Instant::now() < deadline {
-                    if let Ok(view) = sql.group_members().await {
-                        if !view.is_empty() && view.iter().all(|m| m.state != "UNREACHABLE") {
-                            installed = true;
-                            break;
-                        }
+                match sql.bootstrap_group().await {
+                    Ok(()) => {
+                        info!(
+                            "group re-formed from the lone survivor; departed members can now \
+                             rejoin normally"
+                        );
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                if let Err(e) = sql.clear_force_members().await {
-                    error!(error = %e, "could not clear group_replication_force_members");
-                    telemetry.send(TelemetryEvent::ComponentError {
-                        component: "mysql-wrapper".to_string(),
-                        error: e.to_string(),
-                        context: "majority_loss_recovery".to_string(),
-                    });
-                }
-                if installed {
-                    info!("forced view installed; departed members can now rejoin normally");
-                } else {
-                    warn!(
-                        deadline = ?FORCE_VIEW_DEADLINE,
-                        "forced view did not install within the deadline"
-                    );
+                    Err(e) => {
+                        // Stranded: GR is stopped and orchestrate returned
+                        // long ago, so nothing else would ever restart it.
+                        // The guarded BOOT path owns exactly this shape
+                        // (reachable peers, all OFFLINE under our identity,
+                        // our dataset outranks or equals theirs) — hand it
+                        // the whole problem via a fresh boot.
+                        error!(
+                            error = %e,
+                            "re-bootstrap after stop failed; restarting so the guarded boot \
+                             path recovers"
+                        );
+                        telemetry.send(TelemetryEvent::ComponentError {
+                            component: "mysql-wrapper".to_string(),
+                            error: e.to_string(),
+                            context: "majority_loss_recovery".to_string(),
+                        });
+                        let _ = sql.shutdown_server().await;
+                    }
                 }
                 consecutive_force = 0;
                 last_hold.clear();
@@ -2000,7 +1993,10 @@ mod tests {
     }
 
     #[test]
-    fn five_node_triple_loss_forces_when_all_proven() {
+    fn multi_survivor_blocked_view_holds_even_with_full_proof() {
+        // Two reachable members share the blocked view: a per-survivor
+        // re-bootstrap would fork the group, so this stays fenced for a
+        // human even though every missing member is provably departed.
         let members = vec![
             member("a", "mysql-1", "ONLINE", "PRIMARY"),
             member("b", "mysql-2", "ONLINE", "SECONDARY"),
@@ -2012,6 +2008,27 @@ mod tests {
             ("mysql-3".to_string(), departed(GROUP)),
             ("mysql-4".to_string(), departed(GROUP)),
             ("mysql-5".to_string(), departed(GROUP)),
+        ];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn five_node_lone_survivor_forces_when_all_proven() {
+        let members = vec![
+            member("a", "mysql-1", "ONLINE", "PRIMARY"),
+            member("c", "mysql-3", "UNREACHABLE", "SECONDARY"),
+            member("d", "mysql-4", "UNREACHABLE", "SECONDARY"),
+            member("e", "mysql-5", "UNREACHABLE", "SECONDARY"),
+            member("f", "mysql-2", "UNREACHABLE", "SECONDARY"),
+        ];
+        let answers = vec![
+            ("mysql-3".to_string(), departed(GROUP)),
+            ("mysql-4".to_string(), departed(GROUP)),
+            ("mysql-5".to_string(), departed(GROUP)),
+            ("mysql-2".to_string(), departed(GROUP)),
         ];
         assert_eq!(
             majority_loss_recovery_verdict(Some(GROUP), &members, &answers),

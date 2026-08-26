@@ -1034,7 +1034,7 @@ t_graceful_double_stop_reforms() {
   docker start "$victim" "$primary" >/dev/null
   wait_until 420 "group self-reforms to 3 ONLINE with no manual step" group_is_fully_online "$survivor" \
     || { bad "double-stop: group never reformed after both members returned (issue #31 wedge)"; return; }
-  docker logs "$survivor" 2>&1 | grep -q "forcing the view down to the reachable members" \
+  docker logs "$survivor" 2>&1 | grep -q "re-forming the group from this lone survivor" \
     && ok "survivor's majority-loss recovery forced the blocked view down" \
     || bad "group reformed but not through majority_watch (no force log line) — the wedge fix was not what resolved it"
 
