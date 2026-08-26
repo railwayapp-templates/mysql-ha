@@ -199,6 +199,9 @@ async fn main() -> Result<()> {
         // orchestrate raises this, right after its one-time adoption
         // detection completes — see AppState::adoption_checked.
         let adoption_checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Shared between the health server (/role answers 503 while raised)
+        // and gr::majority_watch, which owns it — see issue #33.
+        let membership_fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
             Arc::new(AppState {
@@ -206,6 +209,7 @@ async fn main() -> Result<()> {
                 standalone: false,
                 data_dir: config.data_dir.clone(),
                 adoption_checked: adoption_checked.clone(),
+                membership_fenced: membership_fenced.clone(),
             }),
             telemetry.clone(),
         ));
@@ -240,6 +244,7 @@ async fn main() -> Result<()> {
             fresh_datadir,
             healing,
             adoption_checked,
+            membership_fenced,
         ));
     } else {
         // Restore-on-boot runs before anything else in standalone mode: on
@@ -287,6 +292,7 @@ async fn main() -> Result<()> {
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: true,
+                membership_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 data_dir: config.data_dir.clone(),
                 // No orchestrate task runs in standalone mode to raise this
                 // — pre-set so /gr/state behaves exactly as before here.

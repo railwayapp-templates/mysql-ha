@@ -156,6 +156,21 @@ impl Sql {
         .map_err(|_| anyhow!("query timed out after {FENCE_STATEMENT_TIMEOUT:?}"))?
     }
 
+    /// Lift the write fence on a node that IS the group's elected primary —
+    /// the membership fence's disengage path (gr::majority_watch), restoring
+    /// what Group Replication's own election action would have left in
+    /// place. Clears read_only too: super_read_only = ON forces read_only =
+    /// ON, but turning super_read_only OFF does not clear it back.
+    pub async fn clear_super_read_only(&self) -> Result<()> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            conn.query_drop("SET GLOBAL super_read_only = OFF").await?;
+            conn.query_drop("SET GLOBAL read_only = OFF").await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Purge this instance's local binlog/GTID history. ONLY safe on a
     /// provably-fresh instance (the datadir was empty when this boot
     /// started): docker-entrypoint's first-boot init runs with binlog+GTID

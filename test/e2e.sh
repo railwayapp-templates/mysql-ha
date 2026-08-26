@@ -1039,14 +1039,87 @@ t_graceful_double_stop_reforms() {
     || bad "group reformed but not through majority_watch (no force log line) — the wedge fix was not what resolved it"
 
   # Data written before the double stop survives, and writes flow again.
+  writable_primary_appears() { current_primary "$survivor" mysql-1 mysql-2 mysql-3 >/dev/null; }
+  wait_until 90 "a writable primary after the fence lifts" writable_primary_appears \
+    || { bad "double-stop: no writable primary after reform"; return; }
   local new_primary
-  new_primary="$(current_primary "$survivor" mysql-1 mysql-2 mysql-3)" \
-    || { bad "double-stop: no primary after reform"; return; }
+  new_primary="$(current_primary "$survivor" mysql-1 mysql-2 mysql-3)"
   [ "$(sql "$new_primary" "SELECT v FROM t.kv WHERE k=40")" = "pre-double-stop" ] \
     || { bad "double-stop: pre-failure row lost across the reform"; return; }
   sql "$new_primary" "INSERT INTO t.kv VALUES (42,'post-reform') ON DUPLICATE KEY UPDATE v='post-reform';" \
     || { bad "double-stop: post-reform write failed on $new_primary"; return; }
   ok "graceful double stop: fence held alone, group self-reformed, data intact"
+}
+
+# The clean-leave sibling of the scenario above (issue #33): both departures
+# get a FULL stop grace, so mysqld completes each Group Replication leave
+# handshake and the view legitimately shrinks 3 -> 2 -> 1. Without the
+# membership fence the lone survivor is then a writable single-member group
+# at 1 of 3 declared members — /role 200 and direct writes landing. The
+# fence must hold writes however the peers left, and lift on its own once
+# the group is back above a declared majority.
+t_clean_double_stop_keeps_fence() {
+  log "t_clean_double_stop_keeps_fence (clean leaves shrink the view; the membership fence must still hold)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" \
+    || { bad "no primary to stop"; return; }
+  local victim survivor
+  case "$primary" in
+    mysql-1) victim=mysql-2; survivor=mysql-3 ;;
+    mysql-2) victim=mysql-1; survivor=mysql-3 ;;
+    *)       victim=mysql-1; survivor=mysql-2 ;;
+  esac
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (50,'pre-clean-stop') ON DUPLICATE KEY UPDATE v='pre-clean-stop';"
+  log "primary=$primary victim=$victim survivor=$survivor — stopping both with full grace"
+
+  # Full grace on BOTH: each departure is a completed clean leave, the shape
+  # that shrinks the survivor's view instead of blocking it.
+  docker stop -t 60 "$victim" >/dev/null
+  docker stop -t 60 "$primary" >/dev/null
+
+  # The membership fence engages within a watch poll; after a settle window
+  # the survivor must refuse primacy and writes on every sample.
+  sleep 15
+  local i
+  for i in 1 2 3 4; do
+    if [ "$(role_code "$survivor" "$survivor")" = "200" ]; then
+      bad "clean-stop: survivor answered /role 200 while standing alone (issue #33 gap)"
+      return
+    fi
+    sleep 5
+  done
+  if timeout 15 docker exec "$survivor" mysql -uroot -p"$ROOT_PW" \
+      -e "INSERT INTO t.kv VALUES (51,'must-not-land')" >/dev/null 2>&1; then
+    bad "clean-stop: survivor ACCEPTED a direct write while standing alone (issue #33 gap)"
+    return
+  fi
+  docker logs "$survivor" 2>&1 | grep -q "engaging the membership write fence" \
+    || { bad "clean-stop: fence held but not through the membership fence (no engage log line)"; return; }
+  ok "membership fence held the lone survivor after clean leaves"
+
+  # Both return and simply REJOIN the live (fenced) group — no recovery
+  # needed here; the fence must lift on its own at declared majority.
+  docker start "$victim" "$primary" >/dev/null
+  wait_until 420 "group back to 3 ONLINE" group_is_fully_online "$survivor" \
+    || { bad "clean-stop: group did not reform after both members returned"; return; }
+  fence_lift_logged() { docker logs "$survivor" 2>&1 | grep -q "membership majority restored"; }
+  wait_until 60 "the membership fence reports lifting" fence_lift_logged \
+    || { bad "clean-stop: group reformed but the fence never lifted"; return; }
+
+  clean_writable_primary() { current_primary "$survivor" mysql-1 mysql-2 mysql-3 >/dev/null; }
+  wait_until 90 "a writable primary after the fence lifts" clean_writable_primary \
+    || { bad "clean-stop: no writable primary after the fence lifted"; return; }
+  local newp
+  newp="$(current_primary "$survivor" mysql-1 mysql-2 mysql-3)"
+  [ "$(sql "$newp" "SELECT v FROM t.kv WHERE k=50")" = "pre-clean-stop" ] \
+    || { bad "clean-stop: pre-stop row lost"; return; }
+  sql "$newp" "INSERT INTO t.kv VALUES (52,'post-lift') ON DUPLICATE KEY UPDATE v='post-lift';" \
+    || { bad "clean-stop: write failed after the fence lifted"; return; }
+  ok "clean double stop: fence held alone, lifted at majority, data intact"
 }
 
 # Both waiver scenarios run their trios under the reserved `.invalid` TLD
@@ -1992,7 +2065,7 @@ t_binlog_expiry_silently_loses_unshipped_data() {
 # t_binlog_expiry_silently_loses_unshipped_data — same self-contained shape;
 # born RED to prove the silent-loss bugs, green since the gap-refusal and
 # lost-binlog-signal fixes), with only the cross-version finale last.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image
