@@ -52,6 +52,11 @@ pub struct AppState {
     /// Pre-set `true` in standalone mode, where no orchestrate task ever
     /// runs to raise it.
     pub adoption_checked: Arc<AtomicBool>,
+    /// Raised by gr::majority_watch while the group sits below a majority of
+    /// its DECLARED members (issue #33): /role answers 503 so HAProxy stops
+    /// routing writes, matching the super_read_only fence the watch imposes.
+    /// Always `false` in standalone mode.
+    pub membership_fenced: Arc<AtomicBool>,
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -78,7 +83,19 @@ async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     .await;
 
     match verdict {
-        Ok(true) => (StatusCode::OK, "primary"),
+        Ok(true) => {
+            // The membership fence outranks the view: a lone survivor of a
+            // graceful double stop IS its own view's writable primary, and
+            // is exactly the node that must not take writes.
+            if state.membership_fenced.load(Ordering::Acquire) {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "fenced: group below a majority of its declared members",
+                )
+            } else {
+                (StatusCode::OK, "primary")
+            }
+        }
         Ok(false) => (StatusCode::SERVICE_UNAVAILABLE, "not primary"),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "state unavailable"),
     }

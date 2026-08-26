@@ -161,6 +161,27 @@ fn persist_waiver_generation(data_dir: &str, generation: u64) -> Result<()> {
     )
 }
 
+fn membership_high_water_path(data_dir: &str) -> PathBuf {
+    Path::new(data_dir).join(".railway_gr_high_water")
+}
+
+/// The highest simultaneous ONLINE member count this volume's group has ever
+/// reached — the membership fence's arming condition (see majority_watch).
+/// Absent (0) on fresh volumes and pre-fence builds: a group that never
+/// reached a declared majority is still forming, and fencing it would turn a
+/// fresh conversion (root serving alone while replicas clone-provision) into
+/// a write outage.
+pub(crate) fn read_membership_high_water(data_dir: &str) -> usize {
+    std::fs::read_to_string(membership_high_water_path(data_dir))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn persist_membership_high_water(data_dir: &str, count: usize) -> Result<()> {
+    persist_atomically(&membership_high_water_path(data_dir), &format!("{count}\n"))
+}
+
 /// Persist a marker via tmp-in-the-same-dir + fsync + rename (the same
 /// pattern as password_pin::write_pin): these markers decide group identity
 /// and the divergence tie-break, so a torn in-place write must never be
@@ -384,6 +405,18 @@ pub(crate) fn majority_loss_recovery_verdict(
     MajorityVerdict::Force
 }
 
+/// The membership fence's core rule (issue #33), pure for unit tests: below
+/// or at half of the effective declared membership, writes stop — but only
+/// once ARMED (the group has reached a declared majority before, see the
+/// high-water marker), so a still-forming group is never fenced.
+pub(crate) fn membership_fence_wanted(
+    online: usize,
+    effective_configured: usize,
+    armed: bool,
+) -> bool {
+    armed && online * 2 <= effective_configured.max(1)
+}
+
 const MAJORITY_WATCH_POLL: Duration = Duration::from_secs(5);
 /// Consecutive Force verdicts required before acting — the proof must hold
 /// continuously, so a member observed mid-rejoin never triggers a force.
@@ -397,12 +430,25 @@ const FORCE_MAX_ATTEMPTS: u32 = 3;
 /// by orchestrate the moment the node is in a group — orchestrate itself
 /// returns then, so without this nothing observes majority loss). See
 /// majority_loss_recovery_verdict for the trigger contract.
-pub async fn majority_watch(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
+pub async fn majority_watch(
+    config: Arc<Config>,
+    sql: Sql,
+    telemetry: Arc<Telemetry>,
+    membership_fenced: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
     let http = reqwest::Client::new();
     let peer_timeout = Duration::from_millis(config.peer_query_timeout_ms);
+    let dns_deadline = Duration::from_millis(config.peer_query_timeout_ms);
+    let gone_dwell = Duration::from_secs(config.peer_gone_dwell_seconds);
+    let configured = config.seed_hosts().len().max(1);
+    let mut high_water = read_membership_high_water(&config.data_dir);
+    let mut seed_gone = GoneTracker::new();
     let mut consecutive_force = 0u32;
     let mut attempts = 0u32;
     let mut last_hold = String::new();
+    let mut last_fence_note = String::new();
 
     loop {
         tokio::time::sleep(MAJORITY_WATCH_POLL).await;
@@ -430,6 +476,99 @@ pub async fn majority_watch(config: Arc<Config>, sql: Sql, telemetry: Arc<Teleme
             consecutive_force = 0;
             continue;
         }
+
+        // ===== Membership fence (issue #33) =====
+        // Group Replication fences a view that LOST members it cannot expel
+        // (no majority) — but a view that SHRANK through clean leaves is its
+        // own majority, so a lone survivor of a graceful double stop stays
+        // writable at 1 of 3 declared members. The contract is
+        // membership-based, not view-based: below a majority of the DECLARED
+        // cluster, writes stop, however the peers left. Armed only once the
+        // group has reached that majority (high-water marker on the volume),
+        // so a fresh conversion serving alone while its replicas
+        // clone-provision never trips it; declared members whose NAME is
+        // authoritatively gone (continuous NXDOMAIN through the dwell — a
+        // deletion, provably not a partition, see dns_probe.rs) stop
+        // counting toward the denominator, the bootstrap guard's own waiver
+        // reasoning.
+        let online = members.iter().filter(|m| m.state == "ONLINE").count();
+        if online > high_water {
+            high_water = online;
+            if let Err(e) = persist_membership_high_water(&config.data_dir, high_water) {
+                warn!(error = %e, "could not persist membership high-water marker");
+            }
+        }
+        let armed = high_water * 2 > configured;
+        let mut effective = configured;
+        if armed && online * 2 <= configured {
+            let now = Instant::now();
+            let online_hosts: Vec<&str> = members
+                .iter()
+                .filter(|m| m.state == "ONLINE")
+                .map(|m| m.host.as_str())
+                .collect();
+            for seed in config.seed_hosts() {
+                if online_hosts.iter().any(|h| h.eq_ignore_ascii_case(&seed)) {
+                    seed_gone.observe_reachable(&seed);
+                    continue;
+                }
+                let (verdict, _) = probe_name_detailed(&seed, dns_deadline).await;
+                seed_gone.observe(&seed, verdict, now);
+                if seed_gone.is_waived(&seed, now, gone_dwell) {
+                    effective = effective.saturating_sub(1);
+                }
+            }
+        }
+        let want_fence = membership_fence_wanted(online, effective, armed);
+        if want_fence {
+            if !membership_fenced.swap(true, Ordering::AcqRel) {
+                warn!(
+                    online,
+                    configured,
+                    effective,
+                    "group is below a majority of its declared members — engaging the \
+                     membership write fence"
+                );
+                telemetry.send(TelemetryEvent::ComponentError {
+                    component: "mysql-wrapper".to_string(),
+                    error: format!(
+                        "membership fence engaged: {online} of {effective} declared members ONLINE"
+                    ),
+                    context: "membership_fence".to_string(),
+                });
+            }
+            // Re-imposed every round: Group Replication's own election
+            // action lifts super_read_only on a primary (a re-formed
+            // single-member group included), which would reopen DIRECT
+            // writes even while /role answers 503.
+            if let Err(e) = sql.set_super_read_only().await {
+                error!(error = %e, "could not impose the membership write fence");
+            }
+        } else if membership_fenced.swap(false, Ordering::AcqRel) {
+            let me_primary = members.iter().any(|m| {
+                m.member_id.eq_ignore_ascii_case(&self_uuid)
+                    && m.state == "ONLINE"
+                    && m.role == "PRIMARY"
+            });
+            if me_primary {
+                if let Err(e) = sql.clear_super_read_only().await {
+                    error!(error = %e, "could not lift the membership write fence; retrying");
+                    membership_fenced.store(true, Ordering::Release);
+                    continue;
+                }
+            }
+            info!(
+                online,
+                configured, "membership majority restored — write fence lifted"
+            );
+            last_fence_note.clear();
+        }
+        if want_fence {
+            let note =
+                format!("membership fence holding: {online}/{effective} declared members ONLINE");
+            wait_log_once(&mut last_fence_note, &note);
+        }
+
         let reachable = members.iter().filter(|m| m.state != "UNREACHABLE").count();
         if reachable * 2 > members.len() {
             consecutive_force = 0;
@@ -556,6 +695,16 @@ pub async fn majority_watch(config: Arc<Config>, sql: Sql, telemetry: Arc<Teleme
                 }
                 match sql.bootstrap_group().await {
                     Ok(()) => {
+                        // The election on the re-formed single-member group
+                        // lifts super_read_only; the membership fence still
+                        // applies (1 of N declared) and the next watch round
+                        // is up to a poll away — close the direct-write
+                        // window right here.
+                        if membership_fenced.load(std::sync::atomic::Ordering::Acquire) {
+                            if let Err(e) = sql.set_super_read_only().await {
+                                error!(error = %e, "could not re-impose the membership fence after re-forming");
+                            }
+                        }
                         info!(
                             "group re-formed from the lone survivor; departed members can now \
                              rejoin normally"
@@ -868,6 +1017,7 @@ pub async fn orchestrate(
     fresh_datadir: bool,
     healing: Arc<std::sync::atomic::AtomicBool>,
     adoption_checked: Arc<std::sync::atomic::AtomicBool>,
+    membership_fenced: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // 1. Wait for the FINAL mysqld. docker-entrypoint's first-boot
     //    initialization runs setup SQL against a temp server whose socket is
@@ -1175,6 +1325,7 @@ pub async fn orchestrate(
                     config.clone(),
                     sql.clone(),
                     telemetry.clone(),
+                    membership_fenced.clone(),
                 ));
                 return;
             }
@@ -1925,6 +2076,28 @@ mod tests {
             majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
             MajorityVerdict::Hold(_)
         ));
+    }
+
+    #[test]
+    fn membership_fence_arms_and_trips_on_declared_minority() {
+        // Never fences while unarmed (a still-forming group: conversion root
+        // alone, replicas still provisioning).
+        assert!(!membership_fence_wanted(1, 3, false));
+        assert!(!membership_fence_wanted(2, 3, false));
+        // Armed: a lone survivor of 3 declared is fenced, a 2-of-3 view is
+        // its own legitimate majority, full strength is untouched.
+        assert!(membership_fence_wanted(1, 3, true));
+        assert!(!membership_fence_wanted(2, 3, true));
+        assert!(!membership_fence_wanted(3, 3, true));
+        // Deletion waivers shrink the denominator: with both peers provably
+        // deleted (effective 1), the survivor serves again.
+        assert!(!membership_fence_wanted(1, 1, true));
+        assert!(membership_fence_wanted(1, 2, true));
+        // Five declared: 2 ONLINE is below majority, 3 is not.
+        assert!(membership_fence_wanted(2, 5, true));
+        assert!(!membership_fence_wanted(3, 5, true));
+        // Degenerate zero-denominator never divides or panics.
+        assert!(!membership_fence_wanted(1, 0, true));
     }
 
     #[test]
