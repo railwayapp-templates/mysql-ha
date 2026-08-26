@@ -967,6 +967,88 @@ t_sigterm_primary_demotes_before_exit() {
   ok "rejoined node caught up with the away-window write"
 }
 
+# The platform's graceful double failure (issue #31): a secondary and then
+# the primary stop the way removeDeployment stops them (SIGTERM). The
+# survivor must fence every write while it stands alone — and once both
+# members RETURN, the wrapper's majority-loss recovery must force the
+# blocked view down and let them rejoin with no human step. Born RED on the
+# pre-fix wrapper: the survivor waits forever for a majority that can never
+# form, the joiners loop on failed joins, and only a manual
+# group_replication_force_members unwedges it.
+t_graceful_double_stop_reforms() {
+  log "t_graceful_double_stop_reforms (survivor fences alone, group self-reforms on return)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" \
+    || { bad "no primary to stop"; return; }
+  local victim survivor
+  case "$primary" in
+    mysql-1) victim=mysql-2; survivor=mysql-3 ;;
+    mysql-2) victim=mysql-1; survivor=mysql-3 ;;
+    *)       victim=mysql-1; survivor=mysql-2 ;;
+  esac
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (40,'pre-double-stop') ON DUPLICATE KEY UPDATE v='pre-double-stop';"
+  log "primary=$primary victim=$victim survivor=$survivor — stopping the victim, then the primary"
+
+  # Stagger like the production flow: the secondary first (the live majority
+  # expels it cleanly), the primary second. The primary goes down HARD
+  # (SIGKILL): the platform's stop grace is short enough that the GR leave
+  # handshake doesn't complete, so the survivor keeps the dead primary in
+  # its view as UNREACHABLE and loses majority — the exact live-probed shape
+  # of issue #31. (A stop with generous grace instead completes a clean
+  # leave, the view shrinks to one, and the survivor becomes a legitimately
+  # writable single-member group — a DIFFERENT contract gap, tracked
+  # separately: the platform fence must hold there too.)
+  docker stop -t 60 "$victim" >/dev/null
+  wait_until 120 "victim's departure settles to a 2-member view" \
+    bash -c '[ "$(docker exec '"$survivor"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT COUNT(*) FROM performance_schema.replication_group_members" 2>/dev/null | tr -d "[:space:]")" = "2" ]' \
+    || { bad "double-stop: victim was never expelled from the view"; return; }
+  docker kill "$primary" >/dev/null
+
+  # Alone, the survivor must refuse primacy and writes for as long as the
+  # peers stay gone (this is t_paused_peer_keeps_the_fence's property, held
+  # here through a DEPARTURE instead of a pause).
+  sleep 10
+  local i
+  for i in 1 2 3; do
+    if [ "$(role_code "$survivor" "$survivor")" = "200" ]; then
+      bad "double-stop: survivor answered /role 200 while standing alone"
+      return
+    fi
+    sleep 5
+  done
+  if timeout 15 docker exec "$survivor" mysql -uroot -p"$ROOT_PW" \
+      -e "INSERT INTO t.kv VALUES (41,'must-not-land')" >/dev/null 2>&1; then
+    bad "double-stop: survivor ACCEPTED a write while standing alone"
+    return
+  fi
+  ok "survivor stayed fenced while both peers were gone"
+
+  # Both return. The survivor's majority_watch needs each returning wrapper
+  # to answer /gr/state under this group's identity, dwells on the proof,
+  # forces the view down, and the joiners then rejoin normally. Budget:
+  # wrapper boot + proof dwell (30s) + join/recovery.
+  docker start "$victim" "$primary" >/dev/null
+  wait_until 420 "group self-reforms to 3 ONLINE with no manual step" group_is_fully_online "$survivor" \
+    || { bad "double-stop: group never reformed after both members returned (issue #31 wedge)"; return; }
+  docker logs "$survivor" 2>&1 | grep -q "forcing the view down to the reachable members" \
+    && ok "survivor's majority-loss recovery forced the blocked view down" \
+    || bad "group reformed but not through majority_watch (no force log line) — the wedge fix was not what resolved it"
+
+  # Data written before the double stop survives, and writes flow again.
+  local new_primary
+  new_primary="$(current_primary "$survivor" mysql-1 mysql-2 mysql-3)" \
+    || { bad "double-stop: no primary after reform"; return; }
+  [ "$(sql "$new_primary" "SELECT v FROM t.kv WHERE k=40")" = "pre-double-stop" ] \
+    || { bad "double-stop: pre-failure row lost across the reform"; return; }
+  sql "$new_primary" "INSERT INTO t.kv VALUES (42,'post-reform') ON DUPLICATE KEY UPDATE v='post-reform';" \
+    || { bad "double-stop: post-reform write failed on $new_primary"; return; }
+  ok "graceful double stop: fence held alone, group self-reformed, data intact"
+}
+
 # Both waiver scenarios run their trios under the reserved `.invalid` TLD
 # (see start_node's NODE_SUFFIX comment) with a short PEER_GONE_DWELL so the
 # dwell fits a test run. They restore the globals and tear down their
@@ -1910,7 +1992,7 @@ t_binlog_expiry_silently_loses_unshipped_data() {
 # t_binlog_expiry_silently_loses_unshipped_data — same self-contained shape;
 # born RED to prove the silent-loss bugs, green since the gap-refusal and
 # lost-binlog-signal fixes), with only the cross-version finale last.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

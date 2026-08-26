@@ -70,7 +70,7 @@
 use crate::config::Config;
 use crate::dns_probe::{probe_name_detailed, NameVerdict};
 use crate::peers::{query_peer, GrState, PeerAnswer};
-use crate::sql::{role_is_writable_primary, Sql};
+use crate::sql::{role_is_writable_primary, MemberRow, Sql};
 use anyhow::{Context, Result};
 use common::{RailwayEnv, Telemetry, TelemetryEvent};
 use std::collections::HashMap;
@@ -271,6 +271,328 @@ fn uuid_collision_peer(my_uuid: &str, answers: &[(String, PeerAnswer)]) -> Optio
         }) if peer_uuid.eq_ignore_ascii_case(my_uuid) => Some(host.clone()),
         _ => None,
     })
+}
+
+/// What one majority-loss recovery round decided (issue #31). Pure over its
+/// inputs so every branch is unit-testable without a group.
+#[derive(Debug, PartialEq)]
+pub(crate) enum MajorityVerdict {
+    /// The view holds a reachable majority (or is trivially single-member):
+    /// nothing to recover.
+    Healthy,
+    /// Majority is lost but the departure proof is incomplete — stay fenced.
+    /// Carries the first blocking reason, for wait_log_once.
+    Hold(String),
+    /// Every unreachable view member is PROVABLY back, out of the group, and
+    /// carrying this group's identity: force the view down to the reachable
+    /// members so they can rejoin.
+    Force,
+}
+
+/// The graceful double-failure wedge this resolves: stopping 2 of 3 nodes
+/// leaves the survivor in a majority-lost view (the second departure can't
+/// be expelled without a majority), and a majority-blocked group cannot
+/// admit joiners — so when the stopped nodes come back they loop on failed
+/// joins forever while the survivor waits for a majority that can never
+/// form. Group Replication's designed exit is
+/// `group_replication_force_members`; this verdict decides when the wrapper
+/// may apply it on the survivor's behalf.
+///
+/// The trigger demands POSITIVE proof for EVERY unreachable view member —
+/// its wrapper answers /gr/state as `group_active: false` under THIS group's
+/// identity. A real partition cannot fake that answer: the far side is
+/// either unreachable (no answer) or still an active member of its own view
+/// (`group_active: true`), and either observation holds the fence. Same
+/// act-only-on-proof reasoning as the bootstrap guard's deletion waiver
+/// above — mere unreachability never triggers anything.
+pub(crate) fn majority_loss_recovery_verdict(
+    group_name: Option<&str>,
+    members: &[MemberRow],
+    answers: &[(String, PeerAnswer)],
+) -> MajorityVerdict {
+    if members.len() < 2 {
+        return MajorityVerdict::Healthy;
+    }
+    let reachable = members.iter().filter(|m| m.state != "UNREACHABLE").count();
+    if reachable * 2 > members.len() {
+        return MajorityVerdict::Healthy;
+    }
+    let Some(group_name) = group_name else {
+        return MajorityVerdict::Hold(
+            "own group identity marker is unreadable; staying fenced".to_string(),
+        );
+    };
+    for member in members.iter().filter(|m| m.state == "UNREACHABLE") {
+        let answer = answers
+            .iter()
+            .find(|(host, _)| *host == member.host)
+            .map(|(_, a)| a);
+        match answer {
+            // A join attempt in flight reads as group_active (RECOVERING),
+            // and a joiner knocking on THIS blocked group's door retries for
+            // minutes — without this arm its attempts flap the proof and
+            // reset the dwell forever (observed: 1 of 2 docker e2e runs).
+            // RECOVERING with a single-member "view" cannot be an operating
+            // group: a real group's RECOVERING member observes the full view
+            // (>= 2 members), and a single-member OPERATING group is ONLINE,
+            // never RECOVERING. So under OUR identity it is a departed
+            // member mid-rejoin — exactly as departed as OFFLINE.
+            Some(PeerAnswer::State(state))
+                if state.group_active
+                    && state.member_state.as_deref() == Some("RECOVERING")
+                    && state.members_total <= 1
+                    && state.group_name.as_deref() == Some(group_name) => {}
+            Some(PeerAnswer::State(state)) if state.group_active => {
+                return MajorityVerdict::Hold(format!(
+                    "{} reports an ACTIVE group — a partition, not a departure; staying fenced",
+                    member.host
+                ));
+            }
+            Some(PeerAnswer::State(state)) => match state.group_name.as_deref() {
+                Some(name) if name == group_name => {}
+                _ => {
+                    return MajorityVerdict::Hold(format!(
+                        "{} answers under a different or unknown group identity; staying fenced",
+                        member.host
+                    ));
+                }
+            },
+            Some(PeerAnswer::NotReady) => {
+                return MajorityVerdict::Hold(format!(
+                    "{} answered but its mysqld is not ready; staying fenced",
+                    member.host
+                ));
+            }
+            Some(PeerAnswer::Unreachable) | None => {
+                return MajorityVerdict::Hold(format!(
+                    "{} is not answering — indistinguishable from a partition; staying fenced",
+                    member.host
+                ));
+            }
+        }
+    }
+    MajorityVerdict::Force
+}
+
+const MAJORITY_WATCH_POLL: Duration = Duration::from_secs(5);
+/// Consecutive Force verdicts required before acting — the proof must hold
+/// continuously, so a member observed mid-rejoin never triggers a force.
+const FORCE_DWELL_ROUNDS: u32 = 6;
+/// Lifetime cap on forced reconfigurations: a flapping network must not turn
+/// this into a view chainsaw. Past the cap the node stays fenced and logs
+/// the manual escape hatch.
+const FORCE_MAX_ATTEMPTS: u32 = 3;
+/// How long the forced view gets to install before the attempt is written
+/// off (the variable is cleared either way).
+const FORCE_VIEW_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Runtime watcher an ACTIVE member runs for the rest of its life (spawned
+/// by orchestrate the moment the node is in a group — orchestrate itself
+/// returns then, so without this nothing observes majority loss). See
+/// majority_loss_recovery_verdict for the trigger contract.
+pub async fn majority_watch(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
+    let http = reqwest::Client::new();
+    let peer_timeout = Duration::from_millis(config.peer_query_timeout_ms);
+    let mut consecutive_force = 0u32;
+    let mut attempts = 0u32;
+    let mut last_hold = String::new();
+
+    loop {
+        tokio::time::sleep(MAJORITY_WATCH_POLL).await;
+
+        let members = match sql.group_members().await {
+            Ok(members) => members,
+            Err(_) => {
+                consecutive_force = 0;
+                continue;
+            }
+        };
+        let self_uuid = match sql.server_uuid().await {
+            Ok(uuid) => uuid,
+            Err(_) => {
+                consecutive_force = 0;
+                continue;
+            }
+        };
+        // Only an ONLINE member of a blocked view has the authority to act:
+        // its dataset carries every transaction the group ever acked.
+        let me_online = members
+            .iter()
+            .any(|m| m.member_id.eq_ignore_ascii_case(&self_uuid) && m.state == "ONLINE");
+        if !me_online {
+            consecutive_force = 0;
+            continue;
+        }
+        let reachable = members.iter().filter(|m| m.state != "UNREACHABLE").count();
+        if reachable * 2 > members.len() {
+            consecutive_force = 0;
+            last_hold.clear();
+            continue;
+        }
+
+        // Majority lost: ask every unreachable view member's wrapper who it
+        // is now. (The health port is uniform across the cluster.)
+        let group_name = read_group_name_marker(&config.data_dir);
+        let unreachable: Vec<String> = members
+            .iter()
+            .filter(|m| m.state == "UNREACHABLE")
+            .map(|m| m.host.clone())
+            .collect();
+        let futures: Vec<_> = unreachable
+            .iter()
+            .map(|host| query_peer(&http, host, config.health_port, peer_timeout))
+            .collect();
+        let mut answers = Vec::with_capacity(unreachable.len());
+        for (host, answer) in unreachable.iter().zip(futures_join_all(futures).await) {
+            answers.push((host.clone(), answer));
+        }
+
+        match majority_loss_recovery_verdict(group_name.as_deref(), &members, &answers) {
+            MajorityVerdict::Healthy => {
+                consecutive_force = 0;
+            }
+            MajorityVerdict::Hold(reason) => {
+                consecutive_force = 0;
+                wait_log_once(&mut last_hold, &reason);
+            }
+            MajorityVerdict::Force => {
+                consecutive_force += 1;
+                if consecutive_force < FORCE_DWELL_ROUNDS {
+                    info!(
+                        round = consecutive_force,
+                        needed = FORCE_DWELL_ROUNDS,
+                        "every missing member is provably departed; dwelling before forcing the view"
+                    );
+                    continue;
+                }
+
+                // Final gate: no returning member may hold transactions this
+                // node lacks. The fence has refused every write since the
+                // majority fell, so anything extra on a peer would mean a
+                // fork — divergence is the bootstrap guard's territory,
+                // never force_members'.
+                let mine = match sql.executed_gtid_set().await {
+                    Ok(set) => set,
+                    Err(_) => {
+                        consecutive_force = 0;
+                        continue;
+                    }
+                };
+                let mut blocked_by = None;
+                for (host, answer) in &answers {
+                    let PeerAnswer::State(state) = answer else {
+                        blocked_by = Some(format!("{host} stopped answering"));
+                        break;
+                    };
+                    let Some(peer_set) = state.gtid_executed.as_deref() else {
+                        blocked_by = Some(format!("{host} advertises no GTID set"));
+                        break;
+                    };
+                    match sql.gtid_compare(&mine, peer_set).await {
+                        Ok((peer_sub_mine, _)) if peer_sub_mine => {}
+                        Ok(_) => {
+                            blocked_by = Some(format!(
+                                "{host} holds transactions this node lacks (diverged)"
+                            ));
+                            break;
+                        }
+                        Err(e) => {
+                            blocked_by = Some(format!("{host} GTID comparison failed: {e:#}"));
+                            break;
+                        }
+                    }
+                }
+                if let Some(reason) = blocked_by {
+                    error!(%reason, "refusing to force the view");
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "mysql-wrapper".to_string(),
+                        error: reason,
+                        context: "majority_loss_recovery".to_string(),
+                    });
+                    consecutive_force = 0;
+                    continue;
+                }
+
+                if attempts >= FORCE_MAX_ATTEMPTS {
+                    wait_log_once(
+                        &mut last_hold,
+                        "majority-loss recovery attempts exhausted; run SET GLOBAL \
+                         group_replication_force_members manually on this node",
+                    );
+                    continue;
+                }
+                attempts += 1;
+
+                // Keep every reachable view member. XCom addresses are
+                // rendered uniformly as {host}:{port} (see mysql_conf.rs),
+                // so the port comes off this node's own local_address.
+                let my_addr = match sql.gr_local_address().await {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        warn!(error = %e, "could not read own XCom address; retrying next round");
+                        consecutive_force = 0;
+                        continue;
+                    }
+                };
+                let port = my_addr.rsplit(':').next().unwrap_or("3306").to_string();
+                let keep = members
+                    .iter()
+                    .filter(|m| m.state != "UNREACHABLE")
+                    .map(|m| format!("{}:{}", m.host, port))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                warn!(
+                    %keep,
+                    attempt = attempts,
+                    "majority-lost view with every missing member provably departed — \
+                     forcing the view down to the reachable members"
+                );
+                if let Err(e) = sql.set_force_members(&keep).await {
+                    error!(error = %e, "SET group_replication_force_members failed");
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "mysql-wrapper".to_string(),
+                        error: e.to_string(),
+                        context: "majority_loss_recovery".to_string(),
+                    });
+                    // Clear defensively even on failure — a partially-applied
+                    // value must never linger.
+                    let _ = sql.clear_force_members().await;
+                    consecutive_force = 0;
+                    continue;
+                }
+
+                let deadline = Instant::now() + FORCE_VIEW_DEADLINE;
+                let mut installed = false;
+                while Instant::now() < deadline {
+                    if let Ok(view) = sql.group_members().await {
+                        if !view.is_empty() && view.iter().all(|m| m.state != "UNREACHABLE") {
+                            installed = true;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                if let Err(e) = sql.clear_force_members().await {
+                    error!(error = %e, "could not clear group_replication_force_members");
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "mysql-wrapper".to_string(),
+                        error: e.to_string(),
+                        context: "majority_loss_recovery".to_string(),
+                    });
+                }
+                if installed {
+                    info!("forced view installed; departed members can now rejoin normally");
+                } else {
+                    warn!(
+                        deadline = ?FORCE_VIEW_DEADLINE,
+                        "forced view did not install within the deadline"
+                    );
+                }
+                consecutive_force = 0;
+                last_hold.clear();
+            }
+        }
+    }
 }
 
 /// The live group's authoritative executed-GTID set: the PRIMARY's advert.
@@ -852,6 +1174,15 @@ pub async fn orchestrate(
                         .unwrap_or_else(|| "unknown".to_string())
                         .to_lowercase(),
                 });
+                // Orchestration ends here, so an active member would
+                // otherwise run nothing that observes majority loss — the
+                // graceful double-stop wedge (issue #31). The watcher owns
+                // that for the rest of this member's life.
+                tokio::spawn(majority_watch(
+                    config.clone(),
+                    sql.clone(),
+                    telemetry.clone(),
+                ));
                 return;
             }
             Ok(_) => {}
@@ -1463,6 +1794,230 @@ mod tests {
     // The GTID comparisons themselves run inside mysqld (classify_round →
     // Sql::gtid_compare, exercised in test/e2e.sh); decide() is the pure
     // decision over those comparisons and is fully covered here.
+
+    fn member(id: &str, host: &str, state: &str, role: &str) -> MemberRow {
+        MemberRow {
+            member_id: id.to_string(),
+            host: host.to_string(),
+            state: state.to_string(),
+            role: role.to_string(),
+        }
+    }
+
+    fn departed(group_name: &str) -> PeerAnswer {
+        PeerAnswer::State(GrState {
+            group_active: false,
+            member_state: None,
+            member_role: None,
+            gtid_executed: Some("uuid:1-3".to_string()),
+            members_total: 1,
+            members_reachable: 1,
+            pre_gtid_data: false,
+            server_uuid: Some("someone".to_string()),
+            group_name: Some(group_name.to_string()),
+            waiver_generation: 0,
+        })
+    }
+
+    /// A partition's far side: still an operating member of its own retained
+    /// view (ONLINE, sees more than itself).
+    fn still_active(group_name: &str) -> PeerAnswer {
+        let PeerAnswer::State(mut s) = departed(group_name) else {
+            unreachable!()
+        };
+        s.group_active = true;
+        s.member_state = Some("ONLINE".to_string());
+        s.members_total = 2;
+        PeerAnswer::State(s)
+    }
+
+    /// A departed member mid-rejoin: START GROUP_REPLICATION in flight reads
+    /// as RECOVERING with a single-member "view".
+    fn joining_back(group_name: &str) -> PeerAnswer {
+        let PeerAnswer::State(mut s) = departed(group_name) else {
+            unreachable!()
+        };
+        s.group_active = true;
+        s.member_state = Some("RECOVERING".to_string());
+        s.members_total = 1;
+        PeerAnswer::State(s)
+    }
+
+    const GROUP: &str = "68e1868d-a9e1-5e26-aa5a-c27da2d700bd";
+
+    /// The issue #31 wedge shape: survivor ONLINE/PRIMARY in a 2-member view
+    /// with the departed peer's wrapper answering under our identity.
+    #[test]
+    fn provably_departed_view_is_forced() {
+        let members = vec![
+            member("me", "mysql-3", "ONLINE", "PRIMARY"),
+            member("gone", "mysql-1", "UNREACHABLE", "SECONDARY"),
+        ];
+        let answers = vec![("mysql-1".to_string(), departed(GROUP))];
+        assert_eq!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Force
+        );
+    }
+
+    #[test]
+    fn healthy_majority_is_left_alone() {
+        let members = vec![
+            member("a", "mysql-1", "ONLINE", "PRIMARY"),
+            member("b", "mysql-2", "ONLINE", "SECONDARY"),
+            member("c", "mysql-3", "UNREACHABLE", "SECONDARY"),
+        ];
+        // 2 of 3 reachable — GR can expel on its own; nothing to do, even
+        // with a departure proof in hand.
+        let answers = vec![("mysql-3".to_string(), departed(GROUP))];
+        assert_eq!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Healthy
+        );
+    }
+
+    #[test]
+    fn single_member_view_is_healthy() {
+        let members = vec![member("me", "mysql-3", "ONLINE", "PRIMARY")];
+        assert_eq!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &[]),
+            MajorityVerdict::Healthy
+        );
+    }
+
+    #[test]
+    fn silent_peer_holds_the_fence() {
+        // A partition looks exactly like this: the peer is gone from the
+        // view AND its wrapper doesn't answer. Never force.
+        let members = vec![
+            member("me", "mysql-3", "ONLINE", "PRIMARY"),
+            member("gone", "mysql-1", "UNREACHABLE", "SECONDARY"),
+        ];
+        let answers = vec![("mysql-1".to_string(), PeerAnswer::Unreachable)];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+    }
+
+    /// The flap the docker e2e caught (1 of 2 runs): a returning member's
+    /// join attempt reads group_active/RECOVERING for minutes — it must
+    /// count as departed, or its retries reset the dwell forever.
+    #[test]
+    fn member_mid_rejoin_counts_as_departed() {
+        let members = vec![
+            member("me", "mysql-3", "ONLINE", "PRIMARY"),
+            member("gone", "mysql-1", "UNREACHABLE", "SECONDARY"),
+        ];
+        let answers = vec![("mysql-1".to_string(), joining_back(GROUP))];
+        assert_eq!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Force
+        );
+        // ...but only under OUR identity.
+        let answers = vec![("mysql-1".to_string(), joining_back("some-other-group"))];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+        // ...and never for a RECOVERING member that observes a real view —
+        // that is an operating group's provisioning member, i.e. a
+        // partition's far side from where this node stands.
+        let PeerAnswer::State(mut s) = joining_back(GROUP) else {
+            unreachable!()
+        };
+        s.members_total = 2;
+        let answers = vec![("mysql-1".to_string(), PeerAnswer::State(s))];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn active_peer_is_a_partition_and_holds_the_fence() {
+        // The far side of a port-selective partition still runs its own
+        // view: group_active true. Forcing here could seed a split brain.
+        let members = vec![
+            member("me", "mysql-3", "ONLINE", "PRIMARY"),
+            member("gone", "mysql-1", "UNREACHABLE", "SECONDARY"),
+        ];
+        let answers = vec![("mysql-1".to_string(), still_active(GROUP))];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn foreign_identity_holds_the_fence() {
+        let members = vec![
+            member("me", "mysql-3", "ONLINE", "PRIMARY"),
+            member("gone", "mysql-1", "UNREACHABLE", "SECONDARY"),
+        ];
+        let answers = vec![("mysql-1".to_string(), departed("some-other-group"))];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn not_ready_and_missing_answers_hold_the_fence() {
+        let members = vec![
+            member("me", "mysql-3", "ONLINE", "PRIMARY"),
+            member("g1", "mysql-1", "UNREACHABLE", "SECONDARY"),
+            member("g2", "mysql-2", "UNREACHABLE", "SECONDARY"),
+        ];
+        // One proven, one merely NotReady: the round holds.
+        let answers = vec![
+            ("mysql-1".to_string(), departed(GROUP)),
+            ("mysql-2".to_string(), PeerAnswer::NotReady),
+        ];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+        // One proven, one with no probe row at all: the round holds.
+        let answers = vec![("mysql-1".to_string(), departed(GROUP))];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_own_identity_holds_the_fence() {
+        let members = vec![
+            member("me", "mysql-3", "ONLINE", "PRIMARY"),
+            member("gone", "mysql-1", "UNREACHABLE", "SECONDARY"),
+        ];
+        let answers = vec![("mysql-1".to_string(), departed(GROUP))];
+        assert!(matches!(
+            majority_loss_recovery_verdict(None, &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn five_node_triple_loss_forces_when_all_proven() {
+        let members = vec![
+            member("a", "mysql-1", "ONLINE", "PRIMARY"),
+            member("b", "mysql-2", "ONLINE", "SECONDARY"),
+            member("c", "mysql-3", "UNREACHABLE", "SECONDARY"),
+            member("d", "mysql-4", "UNREACHABLE", "SECONDARY"),
+            member("e", "mysql-5", "UNREACHABLE", "SECONDARY"),
+        ];
+        let answers = vec![
+            ("mysql-3".to_string(), departed(GROUP)),
+            ("mysql-4".to_string(), departed(GROUP)),
+            ("mysql-5".to_string(), departed(GROUP)),
+        ];
+        assert_eq!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Force
+        );
+    }
 
     fn standing(host: &str, seed_rank: usize, relation: PeerRelation) -> PeerStanding {
         PeerStanding {
