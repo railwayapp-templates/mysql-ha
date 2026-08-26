@@ -417,10 +417,14 @@ pub(crate) fn membership_fence_wanted(
     armed && online * 2 <= effective_configured.max(1)
 }
 
-const MAJORITY_WATCH_POLL: Duration = Duration::from_secs(5);
+/// Two seconds, not five: the membership fence engages on the round AFTER
+/// the survivor's election, and that gap is a real writable window on a
+/// node that must not take writes — the poll interval is its upper bound.
+const MAJORITY_WATCH_POLL: Duration = Duration::from_secs(2);
 /// Consecutive Force verdicts required before acting — the proof must hold
-/// continuously, so a member observed mid-rejoin never triggers a force.
-const FORCE_DWELL_ROUNDS: u32 = 6;
+/// continuously (~30s at the poll interval), so a member observed
+/// mid-rejoin never triggers a force.
+const FORCE_DWELL_ROUNDS: u32 = 15;
 /// Lifetime cap on forced reconfigurations: a flapping network must not turn
 /// this into a view chainsaw. Past the cap the node stays fenced and logs
 /// the manual escape hatch.

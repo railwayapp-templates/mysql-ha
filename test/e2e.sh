@@ -1081,16 +1081,19 @@ t_clean_double_stop_keeps_fence() {
   docker stop -t 60 "$victim" >/dev/null
   docker stop -t 60 "$primary" >/dev/null
 
-  # The membership fence engages within a watch poll; after a settle window
-  # the survivor must refuse primacy and writes on every sample.
-  sleep 15
+  # The fence engages on the watch round after the survivor's election —
+  # wait for it (the contract is engage-promptly-then-HOLD, same as the
+  # production battery's fence poll), then require it to hold every sample.
+  fence_engaged() { [ "$(role_code "$survivor" "$survivor")" != "200" ]; }
+  wait_until 60 "membership fence engages on the lone survivor" fence_engaged \
+    || { bad "clean-stop: survivor kept answering /role 200 alone (issue #33 gap)"; return; }
   local i
   for i in 1 2 3 4; do
+    sleep 5
     if [ "$(role_code "$survivor" "$survivor")" = "200" ]; then
-      bad "clean-stop: survivor answered /role 200 while standing alone (issue #33 gap)"
+      bad "clean-stop: fence did not HOLD — /role went back to 200 while alone"
       return
     fi
-    sleep 5
   done
   if timeout 15 docker exec "$survivor" mysql -uroot -p"$ROOT_PW" \
       -e "INSERT INTO t.kv VALUES (51,'must-not-land')" >/dev/null 2>&1; then
