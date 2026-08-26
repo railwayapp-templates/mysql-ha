@@ -248,6 +248,50 @@ impl Sql {
         .await
     }
 
+    /// This node's own XCom endpoint (`@@group_replication_local_address`) —
+    /// the address a forced view names to keep this member in it.
+    pub async fn gr_local_address(&self) -> Result<String> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            let addr: Option<String> = conn
+                .query_first("SELECT @@group_replication_local_address")
+                .await?;
+            addr.context("@@group_replication_local_address returned no row")
+        })
+        .await
+    }
+
+    /// Force a new group view containing exactly `members` (comma-separated
+    /// XCom addresses). Only valid on a member of a majority-lost view; the
+    /// caller (gr::majority_watch) owns every safety gate. The SET blocks
+    /// until the reconfiguration installs, so this gets its own generous
+    /// timeout instead of `short`'s. The variable MUST be cleared afterwards
+    /// (clear_force_members) per the Group Replication manual — a stale
+    /// value poisons the next legitimate view change.
+    pub async fn set_force_members(&self, members: &str) -> Result<()> {
+        let lit = sql_string_literal(members);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let mut conn = self.conn().await?;
+            conn.query_drop(format!(
+                "SET GLOBAL group_replication_force_members = {lit}"
+            ))
+            .await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow!("SET group_replication_force_members timed out after 60s"))?
+    }
+
+    pub async fn clear_force_members(&self) -> Result<()> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            conn.query_drop("SET GLOBAL group_replication_force_members = ''")
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Create/converge the distributed-recovery user and its grants, WITHOUT
     /// binlogging (`sql_log_bin = 0`, session-scoped).
     ///
@@ -567,13 +611,11 @@ impl Sql {
     pub async fn binary_log_status(&self) -> Result<(String, u64)> {
         self.short(async {
             let mut conn = self.conn().await?;
-            let row: Option<mysql_async::Row> = match conn
-                .query_first("SHOW BINARY LOG STATUS")
-                .await
-            {
-                Ok(row) => row,
-                Err(_) => conn.query_first("SHOW MASTER STATUS").await?,
-            };
+            let row: Option<mysql_async::Row> =
+                match conn.query_first("SHOW BINARY LOG STATUS").await {
+                    Ok(row) => row,
+                    Err(_) => conn.query_first("SHOW MASTER STATUS").await?,
+                };
             let row = row.context(
                 "SHOW BINARY LOG STATUS / SHOW MASTER STATUS returned no row (is log_bin enabled?)",
             )?;
@@ -601,11 +643,8 @@ impl Sql {
     pub async fn purge_binary_logs_to(&self, file: &str) -> Result<()> {
         self.short(async {
             let mut conn = self.conn().await?;
-            conn.query_drop(format!(
-                "PURGE BINARY LOGS TO {}",
-                sql_string_literal(file)
-            ))
-            .await?;
+            conn.query_drop(format!("PURGE BINARY LOGS TO {}", sql_string_literal(file)))
+                .await?;
             Ok(())
         })
         .await
