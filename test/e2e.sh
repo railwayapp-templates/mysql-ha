@@ -994,13 +994,19 @@ t_graceful_double_stop_reforms() {
   log "primary=$primary victim=$victim survivor=$survivor — stopping the victim, then the primary"
 
   # Stagger like the production flow: the secondary first (the live majority
-  # expels it cleanly), the primary second (its departure strands the
-  # survivor in a 2-member view it cannot expel from).
+  # expels it cleanly), the primary second. The primary goes down HARD
+  # (SIGKILL): the platform's stop grace is short enough that the GR leave
+  # handshake doesn't complete, so the survivor keeps the dead primary in
+  # its view as UNREACHABLE and loses majority — the exact live-probed shape
+  # of issue #31. (A stop with generous grace instead completes a clean
+  # leave, the view shrinks to one, and the survivor becomes a legitimately
+  # writable single-member group — a DIFFERENT contract gap, tracked
+  # separately: the platform fence must hold there too.)
   docker stop -t 60 "$victim" >/dev/null
   wait_until 120 "victim's departure settles to a 2-member view" \
     bash -c '[ "$(docker exec '"$survivor"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT COUNT(*) FROM performance_schema.replication_group_members" 2>/dev/null | tr -d "[:space:]")" = "2" ]' \
     || { bad "double-stop: victim was never expelled from the view"; return; }
-  docker stop -t 60 "$primary" >/dev/null
+  docker kill "$primary" >/dev/null
 
   # Alone, the survivor must refuse primacy and writes for as long as the
   # peers stay gone (this is t_paused_peer_keeps_the_fence's property, held
