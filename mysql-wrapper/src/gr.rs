@@ -328,6 +328,20 @@ pub(crate) fn majority_loss_recovery_verdict(
             .find(|(host, _)| *host == member.host)
             .map(|(_, a)| a);
         match answer {
+            // A join attempt in flight reads as group_active (RECOVERING),
+            // and a joiner knocking on THIS blocked group's door retries for
+            // minutes — without this arm its attempts flap the proof and
+            // reset the dwell forever (observed: 1 of 2 docker e2e runs).
+            // RECOVERING with a single-member "view" cannot be an operating
+            // group: a real group's RECOVERING member observes the full view
+            // (>= 2 members), and a single-member OPERATING group is ONLINE,
+            // never RECOVERING. So under OUR identity it is a departed
+            // member mid-rejoin — exactly as departed as OFFLINE.
+            Some(PeerAnswer::State(state))
+                if state.group_active
+                    && state.member_state.as_deref() == Some("RECOVERING")
+                    && state.members_total <= 1
+                    && state.group_name.as_deref() == Some(group_name) => {}
             Some(PeerAnswer::State(state)) if state.group_active => {
                 return MajorityVerdict::Hold(format!(
                     "{} reports an ACTIVE group — a partition, not a departure; staying fenced",
@@ -1805,11 +1819,27 @@ mod tests {
         })
     }
 
+    /// A partition's far side: still an operating member of its own retained
+    /// view (ONLINE, sees more than itself).
     fn still_active(group_name: &str) -> PeerAnswer {
         let PeerAnswer::State(mut s) = departed(group_name) else {
             unreachable!()
         };
         s.group_active = true;
+        s.member_state = Some("ONLINE".to_string());
+        s.members_total = 2;
+        PeerAnswer::State(s)
+    }
+
+    /// A departed member mid-rejoin: START GROUP_REPLICATION in flight reads
+    /// as RECOVERING with a single-member "view".
+    fn joining_back(group_name: &str) -> PeerAnswer {
+        let PeerAnswer::State(mut s) = departed(group_name) else {
+            unreachable!()
+        };
+        s.group_active = true;
+        s.member_state = Some("RECOVERING".to_string());
+        s.members_total = 1;
         PeerAnswer::State(s)
     }
 
@@ -1864,6 +1894,40 @@ mod tests {
             member("gone", "mysql-1", "UNREACHABLE", "SECONDARY"),
         ];
         let answers = vec![("mysql-1".to_string(), PeerAnswer::Unreachable)];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+    }
+
+    /// The flap the docker e2e caught (1 of 2 runs): a returning member's
+    /// join attempt reads group_active/RECOVERING for minutes — it must
+    /// count as departed, or its retries reset the dwell forever.
+    #[test]
+    fn member_mid_rejoin_counts_as_departed() {
+        let members = vec![
+            member("me", "mysql-3", "ONLINE", "PRIMARY"),
+            member("gone", "mysql-1", "UNREACHABLE", "SECONDARY"),
+        ];
+        let answers = vec![("mysql-1".to_string(), joining_back(GROUP))];
+        assert_eq!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Force
+        );
+        // ...but only under OUR identity.
+        let answers = vec![("mysql-1".to_string(), joining_back("some-other-group"))];
+        assert!(matches!(
+            majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
+            MajorityVerdict::Hold(_)
+        ));
+        // ...and never for a RECOVERING member that observes a real view —
+        // that is an operating group's provisioning member, i.e. a
+        // partition's far side from where this node stands.
+        let PeerAnswer::State(mut s) = joining_back(GROUP) else {
+            unreachable!()
+        };
+        s.members_total = 2;
+        let answers = vec![("mysql-1".to_string(), PeerAnswer::State(s))];
         assert!(matches!(
             majority_loss_recovery_verdict(Some(GROUP), &members, &answers),
             MajorityVerdict::Hold(_)
