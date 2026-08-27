@@ -1957,6 +1957,8 @@ mod tests {
             binlog_archive_path: "/binlog".to_string(),
             binlog_full_backup_interval_seconds: 86_400,
             binlog_rotate_interval_seconds: 60,
+            binlog_retention_days: None,
+            binlog_retention_dry_run: false,
             binlog_recover_from_bucket: None,
             binlog_recover_from_key: None,
             binlog_recover_from_secret: None,

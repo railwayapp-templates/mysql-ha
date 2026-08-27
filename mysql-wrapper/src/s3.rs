@@ -177,16 +177,57 @@ impl S3Client {
         Ok(())
     }
 
+    /// Last-modified time of one object, or `None` when it does not exist.
+    /// Retention needs this for orphan dumps, whose age cannot be recovered
+    /// from the key: a `.sql.gz` with no `.meta.json` has no recorded
+    /// `taken_at`, because the meta is exactly what is missing.
+    pub async fn last_modified(&self, key: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(out) => Ok(out.last_modified().and_then(|t| {
+                chrono::DateTime::from_timestamp(t.secs(), t.subsec_nanos())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            })),
+            Err(SdkError::ServiceError(err))
+                if matches!(err.err(), HeadObjectError::NotFound(_)) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(anyhow!(e).context(format!("HEAD {key}"))),
+        }
+    }
+
+    /// Delete one object. Deleting an absent key is success on S3, which is
+    /// what retention wants: a partial earlier pass must not turn into an
+    /// error on the next one.
+    ///
+    /// Single-key DeleteObject rather than batched DeleteObjects deliberately.
+    /// Retention deletes are rare, bounded, and individually logged, and a
+    /// batch call that partially succeeds is far harder to reason about when
+    /// the objects in question are someone's only backups.
+    pub async fn delete_object(&self, key: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("DELETE {key}"))?;
+        Ok(())
+    }
+
     /// Stream an unbounded-length source (the gzip'd mysqldump pipe) to S3
     /// via a multipart upload — plain PutObject needs a Content-Length that a
     /// live subprocess pipe can't provide ahead of time. Aborts the upload on
     /// any failure so a partial dump never lingers as an incomplete-but-
     /// billed multipart upload.
-    pub async fn upload_multipart(
-        &self,
-        key: &str,
-        mut src: impl AsyncRead + Unpin,
-    ) -> Result<()> {
+    pub async fn upload_multipart(&self, key: &str, mut src: impl AsyncRead + Unpin) -> Result<()> {
         let create = self
             .client
             .create_multipart_upload()
