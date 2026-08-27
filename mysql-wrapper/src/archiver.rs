@@ -487,8 +487,9 @@ async fn retention_pass(
     // The absolute age rail, enforced here because this is where an object's
     // real last-modified time is available. A policy bug upstream cannot get
     // past it: whatever the plan says, nothing younger than
-    // RETENTION_MIN_OBJECT_AGE_SECONDS is deleted.
-    let min_age = chrono::Duration::seconds(pitr::RETENTION_MIN_OBJECT_AGE_SECONDS);
+    // RETENTION_MIN_OBJECT_AGE_SECONDS is deleted (the config field defaults
+    // to exactly that constant; only a test workspace ever overrides it).
+    let min_age = chrono::Duration::seconds(config.test_retention_min_object_age_seconds);
     let mut deleted = 0usize;
     let mut spared_young = 0usize;
 
