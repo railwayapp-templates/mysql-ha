@@ -507,6 +507,15 @@ pub struct LineageObjects {
     pub server_uuid: String,
     /// Complete fulls (dump AND meta present), any order.
     pub fulls: Vec<FullBackupRef>,
+    /// How many full-backup `meta.json` objects the bucket actually holds for
+    /// this lineage, whether or not they could be read or parsed this pass.
+    ///
+    /// Load-bearing: without it an empty `fulls` is ambiguous between "this
+    /// lineage never had a full" and "its fulls exist but we could not read
+    /// them", and only the first of those makes its binlogs expirable. A
+    /// transient S3 error must never be able to turn a good lineage into an
+    /// unrestorable one.
+    pub full_objects_seen: usize,
     /// `.sql.gz` keys with no sibling `.meta.json`, with their upload time.
     pub orphan_dumps: Vec<(String, DateTime<Utc>)>,
     /// Bare binlog file names (e.g. `binlog.000007`), any order.
@@ -600,6 +609,23 @@ pub fn plan_retention(input: &RetentionInput) -> RetentionPlan {
     let cutoff = input.now - input.horizon;
     let orphan_grace = chrono::Duration::seconds(ORPHAN_DUMP_GRACE_SECONDS);
 
+    // Nothing expires until the active lineage can itself serve a restore. On
+    // a fresh volume the only fulls in the bucket belong to the lineage it
+    // replaced, and retiring those — even past the horizon — would leave
+    // nothing restorable at all until the first new full lands. Wait for the
+    // replacement to exist first.
+    let active_has_full = input
+        .lineages
+        .iter()
+        .any(|l| l.server_uuid == active_uuid && !l.fulls.is_empty());
+    if !active_has_full {
+        plan.notes.push(format!(
+            "the active lineage has no complete full backup yet ({active_uuid}); expiring nothing \
+             anywhere until it does, so the bucket is never left without a restorable full"
+        ));
+        return plan;
+    }
+
     // The active lineage must always remain restorable, so it never retires
     // whole and always honors the count floor. A dead lineage exists only to
     // serve targets inside the window (restoring to before a volume reset);
@@ -615,7 +641,18 @@ pub fn plan_retention(input: &RetentionInput) -> RetentionPlan {
         }
 
         if lineage.fulls.is_empty() {
-            // No complete full: nothing here is restorable at all, since a
+            if lineage.full_objects_seen > 0 {
+                // Its fulls exist; we just could not read them this pass.
+                // Expiring the binlogs now would leave those fulls
+                // unrestorable past their own coordinates — permanently.
+                plan.notes.push(format!(
+                    "lineage {}: {} full backup(s) exist but could not be read this pass; \
+                     expiring nothing in this lineage",
+                    lineage.server_uuid, lineage.full_objects_seen
+                ));
+                continue;
+            }
+            // Genuinely no full: nothing here is restorable at all, since a
             // lineage's binlogs are only ever replayed from its own full. Still
             // spare the active lineage, whose first full may simply not have
             // landed yet.
@@ -1263,9 +1300,11 @@ mod tests {
     }
 
     fn lineage(server_uuid: &str, fulls: Vec<FullBackupRef>, binlogs: &[&str]) -> LineageObjects {
+        let full_objects_seen = fulls.len();
         LineageObjects {
             server_uuid: server_uuid.to_string(),
             fulls,
+            full_objects_seen,
             orphan_dumps: Vec::new(),
             binlogs: binlogs.iter().map(|s| s.to_string()).collect(),
         }
@@ -1608,6 +1647,66 @@ mod tests {
             .notes
             .iter()
             .any(|n| n.contains("no parseable sequence")));
+    }
+
+    #[test]
+    fn retention_does_not_wipe_a_lineage_whose_fulls_merely_could_not_be_read() {
+        // The dangerous shape: a dead lineage that HAS good fulls in the
+        // bucket, but whose meta.json objects could not be read this pass (an
+        // S3 blip, or a corrupt/unparseable meta). The caller cannot express
+        // "keeping this full" by simply omitting it — an empty `fulls` list is
+        // indistinguishable from a lineage that never had one, and expiring
+        // its binlogs would make the surviving fulls unrestorable past their
+        // own coordinates. Irreversibly.
+        let mut dead = lineage("old", vec![], &["binlog.000001", "binlog.000002"]);
+        dead.full_objects_seen = 2; // two meta.json objects exist, unread
+        let live = lineage(
+            "new",
+            vec![full_at("new", "2026-08-27T00:00:00.000Z", "binlog.000001")],
+            &["binlog.000001"],
+        );
+        let plan = plan_retention(&input(
+            vec![dead, live],
+            Some("new"),
+            "2026-08-27T12:00:00.000Z",
+            7,
+        ));
+        assert!(
+            plan.expired_binlogs.is_empty(),
+            "unreadable fulls must never be treated as absent fulls: {:?}",
+            plan.expired_binlogs
+        );
+        assert!(plan.retired_lineages.is_empty());
+        assert!(plan.notes.iter().any(|n| n.contains("could not be read")));
+    }
+
+    #[test]
+    fn retention_waits_for_the_active_lineage_to_have_a_full_before_expiring_anything() {
+        // A fresh volume: the new server has archived nothing yet, and the
+        // only fulls in the bucket belong to the dead lineage it replaced.
+        // Retiring that lineage now — even though it is past the horizon —
+        // would leave the bucket with nothing restorable at all until the
+        // first new full lands. Wait for the replacement to exist.
+        let dead = lineage(
+            "old",
+            vec![full_at("old", "2026-08-01T00:00:00.000Z", "binlog.000010")],
+            &["binlog.000010"],
+        );
+        let fresh = lineage("new", vec![], &[]);
+        let plan = plan_retention(&input(
+            vec![dead, fresh],
+            Some("new"),
+            "2026-08-27T12:00:00.000Z",
+            7,
+        ));
+        assert!(
+            plan.is_empty(),
+            "must not expire the bucket's last fulls before the active lineage has one: {plan:?}"
+        );
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("active lineage has no complete full")));
     }
 
     #[test]

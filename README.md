@@ -161,6 +161,15 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     in `pitr::plan_retention` as pure logic, unit-tested without a bucket;
     `archiver.rs` only executes a plan.
 
+    Two rules exist because their absence was a data-loss bug, not because
+    they were designed up front — both are regression-tested: a lineage whose
+    fulls **exist but could not be read** this pass (an S3 blip, a corrupt
+    meta) is never treated as a lineage with no fulls, since expiring its
+    binlogs would leave those fulls unrestorable past their own coordinates;
+    and nothing expires anywhere until the ACTIVE lineage holds a complete
+    full, so a fresh volume never retires the bucket's last restorable full
+    before its replacement exists.
+
     Note there is no diff/incremental tier here as pgBackRest has: storage is
     (retained fulls x dump size) + (binlogs since the oldest retained full),
     and `BINLOG_FULL_BACKUP_INTERVAL_SECONDS` is the knob that trades storage
