@@ -603,9 +603,10 @@ async fn read_archive_lineages(
             let bytes = match s3.get_object_bytes(meta_key).await {
                 Ok(b) => b,
                 Err(e) => {
-                    // Unreadable meta: treat the full as present-but-unknown
-                    // by skipping it, which keeps it (it is neither counted as
-                    // retainable nor listed for deletion).
+                    // Unreadable meta: leave it out of `fulls` so it is
+                    // neither counted as retainable nor listed for deletion.
+                    // `full_objects_seen` below is what stops the planner
+                    // reading this omission as "the lineage has no fulls".
                     warn!(error = %e, %meta_key, "could not read a full-backup meta.json during retention; keeping this full");
                     paired_dumps.insert(dump_key);
                     continue;
@@ -645,6 +646,12 @@ async fn read_archive_lineages(
         out.push(pitr::LineageObjects {
             server_uuid: uuid,
             fulls,
+            // Every full-backup meta OBJECT the bucket holds, not just the
+            // ones parsed above. This is what lets the planner tell "no fulls
+            // here" apart from "its fulls exist but this pass could not read
+            // them" — the second must never make a lineage's binlogs
+            // expirable.
+            full_objects_seen: raw.metas.len(),
             orphan_dumps,
             binlogs: raw.binlogs,
         });
