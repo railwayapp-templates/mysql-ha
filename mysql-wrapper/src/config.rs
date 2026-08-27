@@ -138,6 +138,25 @@ pub struct Config {
     /// same role `archive_timeout` plays for a WAL archive
     /// (BINLOG_ROTATE_INTERVAL_SECONDS).
     pub binlog_rotate_interval_seconds: u64,
+    /// How far back the archive stays restorable, in days
+    /// (BINLOG_RETENTION_DAYS). `None` — the default — means the archive is
+    /// never expired and grows without bound, which is what every service had
+    /// before retention existed.
+    ///
+    /// Deliberately opt-in: a default horizon would turn an image bump into a
+    /// destructive change on every existing PITR service. Setting it is the
+    /// platform's explicit, visible decision (the mysql-pitr template stamps
+    /// it), the same way `WAL_BACKUP_RETENTION_FULL` is for postgres-pitr.
+    ///
+    /// The horizon is the promise ("restorable to any point in the last N
+    /// days"), not the whole rule: `pitr::MIN_ACTIVE_FULLS_KEPT` fulls survive
+    /// regardless of age, so a long archiver outage can never expire the
+    /// service into being unrestorable.
+    pub binlog_retention_days: Option<u64>,
+    /// Log what retention WOULD delete, and delete nothing
+    /// (BINLOG_RETENTION_DRY_RUN). For validating a horizon against a real
+    /// bucket before letting it act.
+    pub binlog_retention_dry_run: bool,
 
     // --- PITR: restore gate (BINLOG_RECOVER_FROM_* + MYSQL_RECOVERY_TARGET_TIME) ---
     pub binlog_recover_from_bucket: Option<String>,
@@ -156,9 +175,10 @@ impl Config {
         let mysql_root_password = String::env_required("MYSQL_ROOT_PASSWORD")
             .context("MYSQL_ROOT_PASSWORD must be set")?;
 
-        let mysql_recovery_target_time = non_empty(std::env::var("MYSQL_RECOVERY_TARGET_TIME").ok())
-            .map(|raw| crate::pitr::parse_target_time(&raw))
-            .transpose()?;
+        let mysql_recovery_target_time =
+            non_empty(std::env::var("MYSQL_RECOVERY_TARGET_TIME").ok())
+                .map(|raw| crate::pitr::parse_target_time(&raw))
+                .transpose()?;
 
         let config = Self {
             mysql_root_password,
@@ -205,10 +225,15 @@ impl Config {
                 86_400,
             ),
             binlog_rotate_interval_seconds: u64::env_parse("BINLOG_ROTATE_INTERVAL_SECONDS", 60),
+            // Absent, empty, unparseable, or 0 all mean "no retention". A
+            // malformed value must not silently become an aggressive horizon,
+            // and 0 must not mean "expire everything".
+            binlog_retention_days: non_empty(std::env::var("BINLOG_RETENTION_DAYS").ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|d| *d > 0),
+            binlog_retention_dry_run: bool::env_bool("BINLOG_RETENTION_DRY_RUN", false),
 
-            binlog_recover_from_bucket: non_empty(
-                std::env::var("BINLOG_RECOVER_FROM_BUCKET").ok(),
-            ),
+            binlog_recover_from_bucket: non_empty(std::env::var("BINLOG_RECOVER_FROM_BUCKET").ok()),
             binlog_recover_from_key: non_empty(std::env::var("BINLOG_RECOVER_FROM_KEY").ok()),
             binlog_recover_from_secret: non_empty(std::env::var("BINLOG_RECOVER_FROM_SECRET").ok()),
             binlog_recover_from_region: non_empty(std::env::var("BINLOG_RECOVER_FROM_REGION").ok()),
@@ -235,11 +260,10 @@ impl Config {
             );
         }
 
-        if config.binlog_recover_from_bucket.is_some() != config.mysql_recovery_target_time.is_some()
+        if config.binlog_recover_from_bucket.is_some()
+            != config.mysql_recovery_target_time.is_some()
         {
-            bail!(
-                "BINLOG_RECOVER_FROM_BUCKET and MYSQL_RECOVERY_TARGET_TIME must be set together"
-            );
+            bail!("BINLOG_RECOVER_FROM_BUCKET and MYSQL_RECOVERY_TARGET_TIME must be set together");
         }
         if config.binlog_recover_from_bucket.is_some()
             && (config.binlog_recover_from_key.is_none()
@@ -564,6 +588,51 @@ mod tests {
         assert_eq!(config.binlog_archive_path, "/binlog");
         assert_eq!(config.binlog_full_backup_interval_seconds, 86_400);
         assert_eq!(config.binlog_rotate_interval_seconds, 60);
+        // Retention is opt-in: absent means the archive is never expired,
+        // which is the behavior every service had before it existed.
+        assert_eq!(config.binlog_retention_days, None);
+        assert!(!config.binlog_retention_dry_run);
+    }
+
+    #[test]
+    fn retention_horizon_parses_and_refuses_meaningless_values() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (raw, expected) in [
+            ("7", Some(7u64)),
+            // 0 must mean "no retention", never "expire everything".
+            ("0", None),
+            // Malformed input must not silently become an aggressive horizon.
+            ("", None),
+            ("   ", None),
+            ("seven", None),
+            ("-3", None),
+            ("3.5", None),
+        ] {
+            base_env();
+            env::set_var("BINLOG_RETENTION_DAYS", raw);
+            let config = Config::from_env().unwrap();
+            assert_eq!(
+                config.binlog_retention_days, expected,
+                "BINLOG_RETENTION_DAYS={raw:?} should parse to {expected:?}"
+            );
+            env::remove_var("BINLOG_RETENTION_DAYS");
+        }
+    }
+
+    #[test]
+    fn retention_dry_run_is_opt_in() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        env::set_var("BINLOG_RETENTION_DAYS", "14");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.binlog_retention_days, Some(14));
+        assert!(!config.binlog_retention_dry_run);
+
+        env::set_var("BINLOG_RETENTION_DRY_RUN", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.binlog_retention_dry_run);
+        env::remove_var("BINLOG_RETENTION_DRY_RUN");
+        env::remove_var("BINLOG_RETENTION_DAYS");
     }
 
     #[test]

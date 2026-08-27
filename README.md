@@ -132,6 +132,35 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     every `BINLOG_ROTATE_INTERVAL_SECONDS` (default 60s) to bound the
     recovery point objective. A binlog is only purged locally once its
     upload is confirmed — the volume is the spool during a bucket outage.
+  - **Archive retention**, opt-in via `BINLOG_RETENTION_DAYS`: how far back
+    the archive stays restorable. **Unset — the default — never expires
+    anything**, so an archive grows without bound; that is deliberate, because
+    a default horizon would make an image bump destructive for every existing
+    service. `BINLOG_RETENTION_DRY_RUN=true` logs what a horizon would delete
+    without deleting it.
+
+    The horizon is the promise, not the whole rule. Two safety rails are not
+    configurable, because a policy knob that can disable a safety net is not
+    one: `MIN_ACTIVE_FULLS_KEPT` (2) fulls of the live lineage survive
+    regardless of age — so an archiver that has been broken for longer than
+    the horizon can never be expired into being unrestorable — and no object
+    is deleted while younger than an hour.
+
+    What expires, and why it is safe: replay always starts at a full backup's
+    own recorded binlog coordinate, so binlogs *below* the oldest retained
+    full's coordinate cannot be reached by any promised target, while that
+    coordinate file itself is load-bearing and never expires. Deleting a
+    strict prefix is what keeps the retained chain gap-free. A *dead* lineage
+    (a `server-<uuid>/` left behind by a volume reset) is retired whole only
+    once even its newest full predates the horizon — until then it is exactly
+    what a "restore to before the reset" target needs. All of these rules live
+    in `pitr::plan_retention` as pure logic, unit-tested without a bucket;
+    `archiver.rs` only executes a plan.
+
+    Note there is no diff/incremental tier here as pgBackRest has: storage is
+    (retained fulls x dump size) + (binlogs since the oldest retained full),
+    and `BINLOG_FULL_BACKUP_INTERVAL_SECONDS` is the knob that trades storage
+    against replay time on restore.
   - **Restore-on-boot**, gated by `BINLOG_RECOVER_FROM_BUCKET` (same
     `_KEY`/`_SECRET`/`_REGION`/`_ENDPOINT`/`_PATH` shape) together with
     `MYSQL_RECOVERY_TARGET_TIME` (ISO-8601 UTC): on a fresh volume only,
