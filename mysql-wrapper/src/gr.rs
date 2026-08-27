@@ -2748,6 +2748,7 @@ mod tests {
             binlog_rotate_interval_seconds: 60,
             binlog_retention_days: None,
             binlog_retention_dry_run: false,
+            test_retention_min_object_age_seconds: crate::pitr::RETENTION_MIN_OBJECT_AGE_SECONDS,
             binlog_recover_from_bucket: None,
             binlog_recover_from_key: None,
             binlog_recover_from_secret: None,

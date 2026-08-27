@@ -157,6 +157,19 @@ pub struct Config {
     /// (BINLOG_RETENTION_DRY_RUN). For validating a horizon against a real
     /// bucket before letting it act.
     pub binlog_retention_dry_run: bool,
+    /// TEST-ONLY override for `pitr::RETENTION_MIN_OBJECT_AGE_SECONDS`,
+    /// defaulting to it (RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS).
+    ///
+    /// Unlike RAILWAY_TEST_ADOPTION_DETECTION_DELAY_MS, this one CAN weaken a
+    /// safety rail, so it is spelled out: the hour-long floor exists so a
+    /// just-uploaded object is never expired, and an e2e test cannot forge an
+    /// old `LastModified` (S3 stamps it on write) — without this knob the
+    /// only way to prove retention actually deletes is to wait out that hour,
+    /// which no test harness run can do.
+    ///
+    /// Never set it outside a test workspace. Production keeps the default
+    /// purely by not setting it, the same way the horizon itself is opt-in.
+    pub test_retention_min_object_age_seconds: i64,
 
     // --- PITR: restore gate (BINLOG_RECOVER_FROM_* + MYSQL_RECOVERY_TARGET_TIME) ---
     pub binlog_recover_from_bucket: Option<String>,
@@ -232,6 +245,10 @@ impl Config {
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|d| *d > 0),
             binlog_retention_dry_run: bool::env_bool("BINLOG_RETENTION_DRY_RUN", false),
+            test_retention_min_object_age_seconds: i64::env_parse(
+                "RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS",
+                crate::pitr::RETENTION_MIN_OBJECT_AGE_SECONDS,
+            ),
 
             binlog_recover_from_bucket: non_empty(std::env::var("BINLOG_RECOVER_FROM_BUCKET").ok()),
             binlog_recover_from_key: non_empty(std::env::var("BINLOG_RECOVER_FROM_KEY").ok()),

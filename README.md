@@ -140,11 +140,15 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     without deleting it.
 
     The horizon is the promise, not the whole rule. Two safety rails are not
-    configurable, because a policy knob that can disable a safety net is not
-    one: `MIN_ACTIVE_FULLS_KEPT` (2) fulls of the live lineage survive
-    regardless of age — so an archiver that has been broken for longer than
-    the horizon can never be expired into being unrestorable — and no object
-    is deleted while younger than an hour.
+    policy knobs, because a knob that can disable a safety net is not one:
+    `MIN_ACTIVE_FULLS_KEPT` (2) fulls of the live lineage survive regardless
+    of age — so an archiver that has been broken for longer than the horizon
+    can never be expired into being unrestorable — and no object is deleted
+    while younger than an hour. (The age floor has a TEST-ONLY override,
+    `RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS`, purely because S3 stamps
+    `LastModified` on write, so an e2e test otherwise has no way to prove
+    retention deletes anything without waiting out the hour. Never set it
+    outside a test workspace.)
 
     What expires, and why it is safe: replay always starts at a full backup's
     own recorded binlog coordinate, so binlogs *below* the oldest retained
