@@ -2046,23 +2046,42 @@ t_pitr_retention_expires_the_archive_without_breaking_restore() {
   # RECENT full rather than waiting for the archiver's own schedule, which
   # would make phase 1 a race. Its coordinate is binlog.000001 deliberately,
   # so the floor stays at the bottom and no real binlog becomes expirable —
-  # this phase is about full expiry only.
+  # this phase is about full expiry only. Also forge one full older than the
+  # ancient one: the ancient one is the boundary now (see below), so the
+  # oldest one is what the horizon must expire — the delete path still gets
+  # its proof on the live lineage with the floor satisfied.
   local recent
   recent="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
   mc_put_key "e2e-pitr/server-$live_uuid/full/$recent.sql.gz" "forged-recent-dump"
   mc_put_key "e2e-pitr/server-$live_uuid/full/$recent.meta.json" \
     "{\"taken_at\":\"$recent\",\"binlog_file\":\"binlog.000001\",\"binlog_pos\":4,\"server_uuid\":\"$live_uuid\",\"mysql_version\":\"8.4.0\"}"
-  ok "forged a second recent full; the count floor is now satisfied by recent fulls alone"
+  local oldest="2019-01-01T00:00:00.000Z"
+  mc_put_key "e2e-pitr/server-$live_uuid/full/$oldest.sql.gz" "forged-oldest-dump"
+  mc_put_key "e2e-pitr/server-$live_uuid/full/$oldest.meta.json" \
+    "{\"taken_at\":\"$oldest\",\"binlog_file\":\"binlog.000001\",\"binlog_pos\":4,\"server_uuid\":\"$live_uuid\",\"mysql_version\":\"8.4.0\"}"
+  ok "forged a second recent full plus an oldest one; the count floor is now satisfied by recent fulls alone"
 
   docker restart mysql-pitr-retain >/dev/null 2>&1
   wait_until 180 "node back up for the second sweep" \
     bash -c 'docker exec mysql-pitr-retain wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
     || { bad "node never came back for the second sweep"; return; }
 
-  ancient_full_gone() { local n; n="$(mc_count_matching "e2e-pitr/server-$live_uuid/full/" "$ancient")" || return 1; [ "$n" = "0" ]; }
-  wait_until 600 "retention expired the ancient full" ancient_full_gone \
-    || { bad "the ancient full survived even once two recent fulls satisfied the floor"; docker logs mysql-pitr-retain 2>&1 | grep -i "retention" | tail -30; return; }
-  ok "ancient full expired once the floor was satisfied by recent fulls"
+  oldest_full_gone() { local n; n="$(mc_count_matching "e2e-pitr/server-$live_uuid/full/" "$oldest")" || return 1; [ "$n" = "0" ]; }
+  wait_until 600 "retention expired the oldest full" oldest_full_gone \
+    || { bad "the oldest full survived even once two recent fulls satisfied the floor"; docker logs mysql-pitr-retain 2>&1 | grep -i "retention" | tail -30; return; }
+  ok "oldest full expired once the floor was satisfied by recent fulls"
+
+  # The ancient full must now SURVIVE: it is the boundary — the newest full
+  # at-or-before every target between the cutoff (the horizon is 1 day, the
+  # real fulls are minutes old) and the initial real full. Expiring it would
+  # strand that entire sliver of the promised window with no base to restore
+  # from, which is exactly the regression this pins.
+  local boundary_left
+  boundary_left="$(mc_count_matching "e2e-pitr/server-$live_uuid/full/" "$ancient")" \
+    || { bad "could not list the live lineage's fulls after the sweep"; return; }
+  [ "$boundary_left" != "0" ] \
+    && ok "the boundary full survived — the window's earliest sliver keeps its restore base" \
+    || bad "the boundary full expired — every target older than the newest in-horizon full lost its only base"
 
   # The retained full must still be there. Note this is deliberately not
   # "every object that existed pre-forge still exists": expiring real binlogs
