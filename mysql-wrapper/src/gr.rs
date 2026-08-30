@@ -1718,19 +1718,40 @@ pub async fn orchestrate(
                     // (no in-container monitor process to restart mysqld);
                     // the supervisor exits the container and the next boot
                     // joins with the cloned datadir. Everything else retries
-                    // — after tearing the plugin down. A failed START can
-                    // leave the plugin half-joined ("[GCS] The member is
-                    // already leaving or joining a group", live 2026-08-27),
-                    // where every later START fails instantly, the member
-                    // sits in RECOVERING refusing GCS connections, and — the
-                    // deadlock half fixed in group_active_from — used to
-                    // advertise that wedge to peers as a live group. STOP is
-                    // best-effort: if the join actually got far enough to
-                    // shut the server down (clone path), it just errors on a
-                    // dead connection.
-                    warn!(error = %e, "join attempt failed; stopping the plugin before retrying");
-                    if let Err(stop_err) = sql.stop_group_replication().await {
-                        debug!(error = %stop_err, "post-failure STOP GROUP_REPLICATION did not complete (dead connection after a clone shutdown is expected)");
+                    // — after tearing the plugin down, but only from the
+                    // half-joined wedge. A failed START can leave the plugin
+                    // half-joined ("[GCS] The member is already leaving or
+                    // joining a group", live 2026-08-27), where every later
+                    // START fails instantly, the member sits in RECOVERING
+                    // refusing GCS connections, and — the deadlock half
+                    // fixed in group_active_from — used to advertise that
+                    // wedge to peers as a live group.
+                    //
+                    // ERROR is off-limits for the STOP. That state is
+                    // terminal-plugin territory owned by the stuck-member
+                    // watchdog (self_heal::stuck_watch), whose dwell only
+                    // accrues while the member READS ERROR: STOPPING an
+                    // errored member flips it to OFFLINE, the watchdog's
+                    // dwell resets on the state change, and the next join
+                    // attempt re-errors the applier back into ERROR — a
+                    // stable ERROR↔OFFLINE flap in which the dwell never
+                    // fills and the wedged member is never recloned. That
+                    // is exactly what stranded the applier-wedged member in
+                    // t_stuck_error_member_self_heals (PR run 2026-08-27
+                    // 23:16Z): 420s of flap, no heal, no reclone.
+                    warn!(error = %e, "join attempt failed; retrying");
+                    let wedged_mid_join = local_gr_state(&sql, &config.data_dir)
+                        .await
+                        .map(|s| s.member_state.as_deref() == Some("RECOVERING"))
+                        .unwrap_or(false);
+                    if wedged_mid_join {
+                        info!("plugin still reports RECOVERING after the failed START — tearing it down before the retry");
+                        // Best-effort: if the join actually got far enough
+                        // to shut the server down (clone path), it just
+                        // errors on a dead connection.
+                        if let Err(stop_err) = sql.stop_group_replication().await {
+                            debug!(error = %stop_err, "post-failure STOP GROUP_REPLICATION did not complete (dead connection after a clone shutdown is expected)");
+                        }
                     }
                 }
             }
