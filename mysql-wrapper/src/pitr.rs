@@ -569,6 +569,13 @@ impl RetentionPlan {
 /// `min_kept` when the horizon alone would leave fewer. Newest-first. Always
 /// keeps at least one — dropping a lineage's last full is the retire-whole
 /// decision, made by the caller, never a side effect here.
+///
+/// The window also extends by exactly one full past the cutoff when the oldest
+/// in-horizon full is strictly newer than it: restore selects the newest full
+/// with `taken_at <= target`, so a target between the cutoff and that full has
+/// nothing to stand on unless the boundary full — the newest one at-or-before
+/// the target — survives. Keeping it is what makes "any point in the last N
+/// days" a promise instead of "any full-backup interval inside those days".
 fn fulls_to_keep(
     fulls: &[FullBackupRef],
     cutoff: DateTime<Utc>,
@@ -582,7 +589,13 @@ fn fulls_to_keep(
             .then_with(|| a.dump_key.cmp(&b.dump_key))
     });
     let inside = sorted.iter().filter(|f| f.meta.taken_at >= cutoff).count();
-    let keep = inside.max(min_kept).max(1).min(sorted.len());
+    let mut keep = inside.max(min_kept).max(1).min(sorted.len());
+    // The oldest kept full is newer than the cutoff while an older full
+    // exists: targets between the cutoff and that full's taken_at lose their
+    // only qualifying base. Keep exactly one more — the boundary full.
+    if keep < sorted.len() && sorted[keep - 1].meta.taken_at > cutoff {
+        keep += 1;
+    }
     sorted.into_iter().take(keep).collect()
 }
 
@@ -703,6 +716,18 @@ pub fn plan_retention(input: &RetentionInput) -> RetentionPlan {
         let floor = kept
             .last()
             .expect("fulls_to_keep always keeps at least one");
+
+        // The floor predating the horizon while in-horizon fulls exist is the
+        // boundary extension at work — worth a line in the log so a full that
+        // outlived the horizon doesn't read as a sweep that failed to sweep.
+        if floor.meta.taken_at < cutoff && kept.iter().any(|f| f.meta.taken_at >= cutoff) {
+            plan.notes.push(format!(
+                "lineage {}: floor full ({}) predates the horizon; kept because \
+                 in-window targets before the oldest in-horizon full restore from it",
+                lineage.server_uuid,
+                format_rfc3339_millis(floor.meta.taken_at)
+            ));
+        }
 
         let kept_dumps: BTreeSet<&str> = kept.iter().map(|f| f.dump_key.as_str()).collect();
         let mut expired_fulls = 0usize;
@@ -1347,8 +1372,9 @@ mod tests {
     fn retention_expires_fulls_past_the_horizon_and_binlogs_below_the_floor() {
         // 3d horizon at 2026-08-27T12:00Z -> cutoff 2026-08-24T12:00Z.
         // The 08-20 and 08-22 fulls are outside; 08-25 and 08-26 inside.
-        // Floor becomes the 08-25 full, whose coordinate is binlog.000030,
-        // so binlogs 10 and 20 go and 30/40 stay.
+        // The 08-22 full is the boundary — the base restore needs for targets
+        // before 08-25 — so it stays and the floor moves down to it. Its
+        // coordinate is binlog.000020, so binlog 10 goes and 20/30/40 stay.
         let l = lineage(
             "a",
             vec![
@@ -1370,8 +1396,6 @@ mod tests {
             vec![
                 "server-a/full/2026-08-20T00:00:00.000Z.sql.gz".to_string(),
                 "server-a/full/2026-08-20T00:00:00.000Z.meta.json".to_string(),
-                "server-a/full/2026-08-22T00:00:00.000Z.sql.gz".to_string(),
-                "server-a/full/2026-08-22T00:00:00.000Z.meta.json".to_string(),
             ]
         );
         let expired: Vec<&str> = plan
@@ -1379,16 +1403,107 @@ mod tests {
             .iter()
             .map(|(_, n)| n.as_str())
             .collect();
-        assert_eq!(expired, vec!["binlog.000010", "binlog.000020"]);
+        assert_eq!(expired, vec!["binlog.000010"]);
+    }
+
+    #[test]
+    fn retention_keeps_the_boundary_full_every_in_window_target_restores_from() {
+        // The window's promise is any point in the last N days. A target
+        // between the cutoff and the oldest in-horizon full restores from the
+        // boundary full — the newest one at-or-before it — so deleting that
+        // base strands the earliest sliver of the window. Walk the whole
+        // window hourly, through restore's own selection rule, against only
+        // what retention left behind.
+        let all_binlogs: Vec<String> = (10..=28).map(|n| format!("binlog.{n:06}")).collect();
+        let names: Vec<&str> = all_binlogs.iter().map(|s| s.as_str()).collect();
+        let l = lineage(
+            "a",
+            vec![
+                full_at("a", "2026-08-20T00:00:00.000Z", "binlog.000010"),
+                full_at("a", "2026-08-22T00:00:00.000Z", "binlog.000015"),
+                full_at("a", "2026-08-25T00:00:00.000Z", "binlog.000021"),
+                full_at("a", "2026-08-26T00:00:00.000Z", "binlog.000027"),
+            ],
+            &names,
+        );
+        let all_fulls = l.fulls.clone();
+        let now = at("2026-08-27T12:00:00.000Z");
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 3));
+        let cutoff = now - chrono::Duration::days(3);
+
+        // Only the pre-boundary full expires, with the binlogs its dump covers.
+        assert_eq!(
+            plan.expired_full_keys,
+            vec![
+                "server-a/full/2026-08-20T00:00:00.000Z.sql.gz".to_string(),
+                "server-a/full/2026-08-20T00:00:00.000Z.meta.json".to_string(),
+            ]
+        );
+        let expired_binlogs: Vec<&str> = plan
+            .expired_binlogs
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect();
+        assert_eq!(
+            expired_binlogs,
+            vec![
+                "binlog.000010",
+                "binlog.000011",
+                "binlog.000012",
+                "binlog.000013",
+                "binlog.000014"
+            ]
+        );
+
+        let surviving_fulls: Vec<FullBackupRef> = all_fulls
+            .iter()
+            .filter(|f| !plan.expired_full_keys.contains(&f.dump_key))
+            .cloned()
+            .collect();
+        let surviving_binlogs: Vec<String> = all_binlogs
+            .iter()
+            .filter(|n| !expired_binlogs.contains(&n.as_str()))
+            .cloned()
+            .collect();
+
+        let mut t = cutoff;
+        while t <= now {
+            let base = newest_qualifying_full(&surviving_fulls, t).unwrap_or_else(|| {
+                panic!("in-window target {t} lost its only qualifying full to retention")
+            });
+            let replay = binlogs_to_replay(surviving_binlogs.clone(), &base.meta.binlog_file);
+            assert!(
+                replay.gap.is_none(),
+                "retention left a gap above the base for target {t}: {replay:?}"
+            );
+            assert_eq!(
+                replay.run.first(),
+                Some(&base.meta.binlog_file),
+                "the base's own coordinate must survive with it: {replay:?}"
+            );
+            t += chrono::Duration::hours(1);
+        }
+
+        // The specific regression: the earliest sliver of the window restores
+        // from the boundary full, not from nothing.
+        let earliest = newest_qualifying_full(&surviving_fulls, cutoff).unwrap();
+        assert_eq!(
+            earliest.meta.taken_at,
+            at("2026-08-22T00:00:00.000Z"),
+            "the boundary full must survive as the base for pre-08-25 targets"
+        );
     }
 
     #[test]
     fn retention_never_expires_the_floor_fulls_own_coordinate_file() {
         // The coordinate file is where replay STARTS (binlogs_to_replay treats
         // it as missing -> empty run + a gap), so it must survive even though
-        // nothing older than it is retained. Sequence numbers here are
-        // consecutive, as real binlogs are: retention deletes a strict PREFIX,
-        // which is exactly why what remains is still gap-free from the floor.
+        // nothing older than it is retained. The floor here is a boundary
+        // full — outside the horizon, kept as the base for in-window targets —
+        // which is the usual shape in a steady cadence. Sequence numbers are
+        // consecutive, as real binlogs are: retention deletes a strict PREFIX
+        // below the floor coordinate, which is exactly why what remains is
+        // still gap-free from the floor.
         let all = [
             "binlog.000001",
             "binlog.000002",
@@ -1398,7 +1513,7 @@ mod tests {
         let l = lineage(
             "a",
             vec![
-                full_at("a", "2026-08-01T00:00:00.000Z", "binlog.000001"),
+                full_at("a", "2026-08-20T00:00:00.000Z", "binlog.000002"),
                 full_at("a", "2026-08-26T00:00:00.000Z", "binlog.000003"),
                 full_at("a", "2026-08-27T00:00:00.000Z", "binlog.000004"),
             ],
@@ -1412,11 +1527,11 @@ mod tests {
             .collect();
         assert_eq!(
             expired,
-            vec!["binlog.000001", "binlog.000002"],
+            vec!["binlog.000001"],
             "only files strictly below the floor coordinate expire"
         );
         assert!(
-            !expired.contains(&"binlog.000003"),
+            !expired.contains(&"binlog.000002"),
             "the floor full's own coordinate file must never expire: {expired:?}"
         );
 
@@ -1426,7 +1541,7 @@ mod tests {
             .filter(|n| !expired.contains(n))
             .map(|n| n.to_string())
             .collect();
-        let replay = binlogs_to_replay(survivors.clone(), "binlog.000003");
+        let replay = binlogs_to_replay(survivors.clone(), "binlog.000002");
         assert!(
             replay.gap.is_none(),
             "retention left a gap in the retained chain: {replay:?}"
