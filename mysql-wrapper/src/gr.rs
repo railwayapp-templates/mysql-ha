@@ -77,7 +77,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub const RECOVERY_USER: &str = "gr_recovery";
@@ -274,6 +274,27 @@ pub fn persist_group_name(config: &Config, group_name: &str) -> Result<()> {
     persist_atomically(&path, &format!("{group_name}\n"))
 }
 
+/// Whether this node's own view proves a live group worth joining.
+///
+/// ONLINE always does. RECOVERING only counts when the member's view also
+/// contains an ONLINE member — a genuine distributed recovery always sees
+/// its donor's group, so this keeps real recoveries advertising. A
+/// RECOVERING member whose view holds no ONLINE member is just a join
+/// attempt in flight, and advertising IT as "a live group exists" is what
+/// deadlocked fresh clusters live on 2026-08-27 (twice, e2e double-failure
+/// fixtures): one wedged joiner ("[GCS] The member is already leaving or
+/// joining a group") advertised group_active, every peer switched to the
+/// join path, their own join attempts made THEM advertise RECOVERING too,
+/// and from then on all three nodes saw "a live group" made of nothing but
+/// each other's stuck joins — nobody ever fell through to bootstrap.
+fn group_active_from(member_state: Option<&str>, members: &[MemberRow]) -> bool {
+    match member_state {
+        Some("ONLINE") => true,
+        Some("RECOVERING") => members.iter().any(|m| m.state == "ONLINE"),
+        _ => false,
+    }
+}
+
 /// This node's own Group Replication state, in the same shape peers report.
 pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
     let self_uuid = sql.server_uuid().await?;
@@ -284,7 +305,7 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
         .iter()
         .find(|m| m.member_id.eq_ignore_ascii_case(&self_uuid));
     let member_state = me.map(|m| m.state.clone());
-    let group_active = matches!(member_state.as_deref(), Some("ONLINE") | Some("RECOVERING"));
+    let group_active = group_active_from(member_state.as_deref(), &members);
 
     Ok(GrState {
         group_active,
@@ -1696,8 +1717,42 @@ pub async fn orchestrate(
                     // Clone-based recovery shuts the server down mid-join
                     // (no in-container monitor process to restart mysqld);
                     // the supervisor exits the container and the next boot
-                    // joins with the cloned datadir. Everything else retries.
+                    // joins with the cloned datadir. Everything else retries
+                    // — after tearing the plugin down, but only from the
+                    // half-joined wedge. A failed START can leave the plugin
+                    // half-joined ("[GCS] The member is already leaving or
+                    // joining a group", live 2026-08-27), where every later
+                    // START fails instantly, the member sits in RECOVERING
+                    // refusing GCS connections, and — the deadlock half
+                    // fixed in group_active_from — used to advertise that
+                    // wedge to peers as a live group.
+                    //
+                    // ERROR is off-limits for the STOP. That state is
+                    // terminal-plugin territory owned by the stuck-member
+                    // watchdog (self_heal::stuck_watch), whose dwell only
+                    // accrues while the member READS ERROR: STOPPING an
+                    // errored member flips it to OFFLINE, the watchdog's
+                    // dwell resets on the state change, and the next join
+                    // attempt re-errors the applier back into ERROR — a
+                    // stable ERROR↔OFFLINE flap in which the dwell never
+                    // fills and the wedged member is never recloned. That
+                    // is exactly what stranded the applier-wedged member in
+                    // t_stuck_error_member_self_heals (PR run 2026-08-27
+                    // 23:16Z): 420s of flap, no heal, no reclone.
                     warn!(error = %e, "join attempt failed; retrying");
+                    let wedged_mid_join = local_gr_state(&sql, &config.data_dir)
+                        .await
+                        .map(|s| s.member_state.as_deref() == Some("RECOVERING"))
+                        .unwrap_or(false);
+                    if wedged_mid_join {
+                        info!("plugin still reports RECOVERING after the failed START — tearing it down before the retry");
+                        // Best-effort: if the join actually got far enough
+                        // to shut the server down (clone path), it just
+                        // errors on a dead connection.
+                        if let Err(stop_err) = sql.stop_group_replication().await {
+                            debug!(error = %stop_err, "post-failure STOP GROUP_REPLICATION did not complete (dead connection after a clone shutdown is expected)");
+                        }
+                    }
                 }
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -2811,6 +2866,49 @@ mod tests {
             1,
             3,
             usize::MAX.saturating_mul(2) > 3
+        ));
+    }
+
+    #[test]
+    fn group_active_requires_an_online_member_behind_recovering() {
+        // ONLINE self: always a live group.
+        assert!(group_active_from(
+            Some("ONLINE"),
+            &[member("a", "mysql-1", "ONLINE", "PRIMARY")]
+        ));
+        // RECOVERING with an ONLINE donor in view: genuine distributed
+        // recovery — keeps advertising.
+        assert!(group_active_from(
+            Some("RECOVERING"),
+            &[
+                member("a", "mysql-1", "ONLINE", "PRIMARY"),
+                member("b", "mysql-2", "RECOVERING", "SECONDARY"),
+            ]
+        ));
+        // RECOVERING alone (a join attempt in flight, or a wedged
+        // half-joined plugin): NOT a live group — advertising it deadlocked
+        // fresh clusters 2026-08-27.
+        assert!(!group_active_from(
+            Some("RECOVERING"),
+            &[member("b", "mysql-2", "RECOVERING", "")]
+        ));
+        // RECOVERING seeing only other non-ONLINE members: same.
+        assert!(!group_active_from(
+            Some("RECOVERING"),
+            &[
+                member("b", "mysql-2", "RECOVERING", ""),
+                member("c", "mysql-3", "UNREACHABLE", ""),
+            ]
+        ));
+        // Not in the members view at all / OFFLINE / ERROR: never.
+        assert!(!group_active_from(None, &[]));
+        assert!(!group_active_from(
+            Some("OFFLINE"),
+            &[member("a", "mysql-1", "OFFLINE", "")]
+        ));
+        assert!(!group_active_from(
+            Some("ERROR"),
+            &[member("a", "mysql-1", "ERROR", "")]
         ));
     }
 }
