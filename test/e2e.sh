@@ -334,6 +334,14 @@ t_cold_restart_preserves_group() {
   codes="$(role_code mysql-2 mysql-1)/$(role_code mysql-2 mysql-2)/$(role_code mysql-2 mysql-3)"
   n200="$(printf '%s\n' "$codes" | tr '/' '\n' | grep -c 200)"
   while [ "$n200" != "1" ] && [ "$waited" -lt 30 ]; do
+    # Zero 200s is the fence still lifting, which is what this poll waits
+    # out. Two 200s is two nodes serving as writable primary at once — a
+    # safety violation, never something to wait out. Fail on it immediately
+    # so the poll cannot turn a dual-primary flicker into a pass.
+    if [ "$n200" -gt 1 ]; then
+      bad "expected exactly one 200 after cold restart, got $codes"
+      return
+    fi
     sleep 3; waited=$((waited+3))
     codes="$(role_code mysql-2 mysql-1)/$(role_code mysql-2 mysql-2)/$(role_code mysql-2 mysql-3)"
     n200="$(printf '%s\n' "$codes" | tr '/' '\n' | grep -c 200)"
@@ -720,7 +728,16 @@ t_patch_skew_on_redeploy() {
   v2_ver="$(sql mysql-2 "SELECT @@version")"
   ok "mixed-patch group healthy: mysql-2 on $v2_ver, siblings on $before_ver"
 
+  # Answering local SQL is not the same as having replayed the recovery
+  # backlog: the member accepts connections while its applier is still
+  # catching up, so the pre-skew row can legitimately read empty for a few
+  # seconds. The 2026-08-26 run read '' here and then saw the k=2 write —
+  # issued AFTER this read — replicate 24s later, and GR applies in order, so
+  # k=1 had landed too. Poll the row like the k=2 check below does; a row
+  # that is genuinely gone still fails, with the same message.
   local v
+  wait_until 60 "pre-skew row applied on the patch-upgraded member" \
+    bash -c '[ "$(docker exec mysql-2 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null)" = "pre-skew" ]'
   v="$(sql mysql-2 "SELECT v FROM t.kv WHERE k=1")"
   [ "$v" = "pre-skew" ] \
     && ok "data intact on the patch-upgraded member" \
@@ -915,6 +932,7 @@ t_password_variable_edit_does_not_rotate() {
   # Same classify-round lag as the cold restart: /role can answer 503 for a
   # few seconds after the group reports ONLINE while the write fence lifts.
   # The wait itself is the assertion — poll instead of probing once.
+  local primary
   if wait_until 30 "a writable primary is being served" \
       any_role_200 mysql-2 mysql-1 mysql-2 mysql-3; then
     primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)"
