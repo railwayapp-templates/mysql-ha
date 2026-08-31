@@ -167,15 +167,44 @@ fn membership_high_water_path(data_dir: &str) -> PathBuf {
 
 /// The highest simultaneous ONLINE member count this volume's group has ever
 /// reached — the membership fence's arming condition (see majority_watch).
-/// Absent (0) on fresh volumes and pre-fence builds: a group that never
-/// reached a declared majority is still forming, and fencing it would turn a
-/// fresh conversion (root serving alone while replicas clone-provision) into
-/// a write outage.
-pub(crate) fn read_membership_high_water(data_dir: &str) -> usize {
-    std::fs::read_to_string(membership_high_water_path(data_dir))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+/// `Some(0)` on fresh volumes and pre-fence builds: a group that never reached
+/// a declared majority is still forming, and fencing it would turn a fresh
+/// conversion (root serving alone while replicas clone-provision) into a write
+/// outage.
+///
+/// `None` means the marker is THERE and we cannot read it — bytes that are not
+/// valid UTF-8 (a torn write, disk decay), a body that will not parse, EACCES,
+/// EIO. That is a different claim from "never written", and collapsing the two
+/// into 0 (as `.ok().and_then(parse).unwrap_or(0)` did) silently disarms the
+/// fence on a group that may well have been armed: `armed = high_water * 2 >
+/// configured` is false for 0 against any real membership. The caller arms on
+/// `None` instead — see majority_watch. Only a definite NotFound is `Some(0)`,
+/// the same split postgres-ha's `major_upgrade::read_marker` makes.
+pub(crate) fn read_membership_high_water(data_dir: &str) -> Option<usize> {
+    let path = membership_high_water_path(data_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => match raw.trim().parse() {
+            Ok(count) => Some(count),
+            Err(_) => {
+                warn!(
+                    path = %path.display(),
+                    "membership high-water marker is present but unparseable; arming the fence \
+                     rather than reading it as a group that never reached a majority"
+                );
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "membership high-water marker is present but unreadable; arming the fence \
+                 rather than reading it as a group that never reached a majority"
+            );
+            None
+        }
+    }
 }
 
 fn persist_membership_high_water(data_dir: &str, count: usize) -> Result<()> {
@@ -447,7 +476,15 @@ pub async fn majority_watch(
     let dns_deadline = Duration::from_millis(config.peer_query_timeout_ms);
     let gone_dwell = Duration::from_secs(config.peer_gone_dwell_seconds);
     let configured = config.seed_hosts().len().max(1);
-    let mut high_water = read_membership_high_water(&config.data_dir);
+    // `None` = the marker exists but is unreadable. We cannot prove this group
+    // never reached a majority, and "cannot prove it" must not disarm a write
+    // fence, so arm unconditionally until a readable marker replaces it (the
+    // first `online > high_water` write below does exactly that).
+    let (mut high_water, arming_marker_unreadable) =
+        match read_membership_high_water(&config.data_dir) {
+            Some(count) => (count, false),
+            None => (0, true),
+        };
     let mut seed_gone = GoneTracker::new();
     let mut consecutive_force = 0u32;
     let mut attempts = 0u32;
@@ -502,7 +539,10 @@ pub async fn majority_watch(
                 warn!(error = %e, "could not persist membership high-water marker");
             }
         }
-        let armed = high_water * 2 > configured;
+        // saturating: the marker is a plain integer on the volume, and a
+        // hand-edited or corrupted-but-parseable huge value must not overflow
+        // the comparison that decides whether writes are allowed.
+        let armed = arming_marker_unreadable || high_water.saturating_mul(2) > configured;
         let mut effective = configured;
         if armed && online * 2 <= configured {
             let now = Instant::now();
@@ -2714,5 +2754,63 @@ mod tests {
             binlog_recover_from_path: "/binlog".to_string(),
             mysql_recovery_target_time: None,
         }
+    }
+
+    #[test]
+    fn an_unreadable_high_water_marker_arms_the_fence_instead_of_disarming_it() {
+        // The fence's whole purpose is that a lone survivor of clean leaves
+        // must not take writes (#33). Its arming condition is a marker on the
+        // volume, and `.ok().and_then(parse).unwrap_or(0)` read a corrupt
+        // marker as "this group never reached a majority" -- disarming the
+        // fence on exactly the volume whose state we can no longer trust.
+        let dir =
+            std::env::temp_dir().join(format!("mysql-ha-high-water-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_dir = dir.to_string_lossy().into_owned();
+        let path = membership_high_water_path(&data_dir);
+
+        // Fresh volume: genuinely zero, and the fence must stay OFF so a
+        // conversion root serving alone while replicas clone is not fenced.
+        assert_eq!(read_membership_high_water(&data_dir), Some(0));
+
+        persist_membership_high_water(&data_dir, 3).unwrap();
+        assert_eq!(read_membership_high_water(&data_dir), Some(3));
+        assert!(
+            membership_fence_wanted(1, 3, 3usize.saturating_mul(2) > 3),
+            "an armed 3-node group fences its lone survivor"
+        );
+
+        for corrupt in [
+            b"\xff\xfe\x00 torn".as_slice(),
+            b"3 3\n".as_slice(),
+            b"".as_slice(),
+        ] {
+            std::fs::write(&path, corrupt).unwrap();
+            assert_eq!(
+                read_membership_high_water(&data_dir),
+                None,
+                "a present-but-unreadable marker is not a fresh volume"
+            );
+        }
+
+        // Negative control: absent really is Some(0), so the still-forming
+        // carve-out this marker exists for is untouched.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_membership_high_water(&data_dir), Some(0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn arming_saturates_instead_of_overflowing_on_a_huge_marker() {
+        // The marker is a plain integer on a volume an operator can edit.
+        // `high_water * 2` on a value near usize::MAX panics in debug builds,
+        // in the expression that decides whether writes are allowed.
+        assert!(usize::MAX.saturating_mul(2) > 3);
+        assert!(membership_fence_wanted(
+            1,
+            3,
+            usize::MAX.saturating_mul(2) > 3
+        ));
     }
 }
