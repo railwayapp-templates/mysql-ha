@@ -491,6 +491,15 @@ pub fn binlogs_to_replay(mut files: Vec<String>, start_file: &str) -> BinlogRepl
 /// retained full still has a margin when the next sweep moves the floor.
 pub const MIN_ACTIVE_FULLS_KEPT: usize = 2;
 
+/// The horizon the image assumes when `BINLOG_RETENTION_DAYS` is unset, so a
+/// PITR service bounds its own archive without the platform having to stamp a
+/// value onto the template. Matches the window the Backups panel presents.
+/// Defaulting is safe because `MIN_ACTIVE_FULLS_KEPT` fulls survive regardless
+/// of age — retention can never expire a service into being unrestorable — and
+/// an explicit `BINLOG_RETENTION_DAYS=0` remains the opt-out for a service that
+/// deliberately wants an unbounded archive.
+pub const DEFAULT_BINLOG_RETENTION_DAYS: u64 = 7;
+
 /// No object is ever deleted while younger than this, whatever the policy says.
 /// Insurance against expiring something a just-started restore still needs.
 pub const RETENTION_MIN_OBJECT_AGE_SECONDS: i64 = 3600;

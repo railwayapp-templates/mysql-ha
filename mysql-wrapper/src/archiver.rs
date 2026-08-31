@@ -12,8 +12,10 @@
 //!   - rotation: `FLUSH BINARY LOGS` every `BINLOG_ROTATE_INTERVAL_SECONDS`,
 //!     bounding the recovery point objective — the same role
 //!     `archive_timeout` plays for a WAL archive.
-//!   - retention (hourly, only when `BINLOG_RETENTION_DAYS` is set): expire
-//!     archive objects outside the promised window. Note the asymmetry with
+//!   - retention (hourly, on by default; off only when `BINLOG_RETENTION_DAYS`
+//!     is explicitly `0`): expire archive objects outside the promised window.
+//!     The horizon defaults to `pitr::DEFAULT_BINLOG_RETENTION_DAYS`. Note the
+//!     asymmetry with
 //!     the reclaim above: that one frees LOCAL disk and never touches the
 //!     bucket, this one is the only thing that ever deletes from the bucket.
 //!     All of its rules live in `pitr::plan_retention` so they are testable
@@ -411,8 +413,8 @@ async fn retention_loop(
 ) {
     let Some(days) = config.binlog_retention_days else {
         info!(
-            "BINLOG_RETENTION_DAYS is unset; the archive is never expired (unbounded growth). \
-             Set it to promise a restorable window and bound storage."
+            "BINLOG_RETENTION_DAYS=0; retention is opted out and the archive is never expired \
+             (unbounded growth). Unset it, or set a positive horizon, to bound storage."
         );
         return;
     };

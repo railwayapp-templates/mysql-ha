@@ -132,12 +132,17 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     every `BINLOG_ROTATE_INTERVAL_SECONDS` (default 60s) to bound the
     recovery point objective. A binlog is only purged locally once its
     upload is confirmed — the volume is the spool during a bucket outage.
-  - **Archive retention**, opt-in via `BINLOG_RETENTION_DAYS`: how far back
-    the archive stays restorable. **Unset — the default — never expires
-    anything**, so an archive grows without bound; that is deliberate, because
-    a default horizon would make an image bump destructive for every existing
-    service. `BINLOG_RETENTION_DRY_RUN=true` logs what a horizon would delete
-    without deleting it.
+  - **Archive retention**, `BINLOG_RETENTION_DAYS`: how far back the archive
+    stays restorable. **Unset — the common case — assumes
+    `DEFAULT_BINLOG_RETENTION_DAYS` (7)**, so the image bounds every service's
+    archive itself rather than relying on the platform to stamp a value; a
+    positive integer sets an explicit horizon, and **`0` is the opt-out** that
+    keeps the archive forever. Defaulting in the image is what bounds the whole
+    FLEET — a template stamp reaches only freshly-seeded template instances,
+    leaving existing and adopted services growing forever — and it is safe
+    because the safety rails below mean the only thing an image bump can expire
+    is archive beyond the presented window. `BINLOG_RETENTION_DRY_RUN=true`
+    logs what the horizon would delete without deleting it.
 
     The horizon is the promise, not the whole rule. Two safety rails are not
     policy knobs, because a knob that can disable a safety net is not one:

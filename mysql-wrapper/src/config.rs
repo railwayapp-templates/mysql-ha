@@ -139,19 +139,26 @@ pub struct Config {
     /// (BINLOG_ROTATE_INTERVAL_SECONDS).
     pub binlog_rotate_interval_seconds: u64,
     /// How far back the archive stays restorable, in days
-    /// (BINLOG_RETENTION_DAYS). `None` — the default — means the archive is
-    /// never expired and grows without bound, which is what every service had
-    /// before retention existed.
+    /// (BINLOG_RETENTION_DAYS). Unset — the common case — assumes
+    /// `pitr::DEFAULT_BINLOG_RETENTION_DAYS`, so every PITR service bounds its
+    /// own archive on the next redeploy without the platform stamping anything
+    /// onto the template. `None` here means the retention loop does not run
+    /// (unbounded growth); it is reached only by the explicit `0` opt-out
+    /// below, never by an unset variable.
     ///
-    /// Deliberately opt-in: a default horizon would turn an image bump into a
-    /// destructive change on every existing PITR service. Setting it is the
-    /// platform's explicit, visible decision (the mysql-pitr template stamps
-    /// it), the same way `WAL_BACKUP_RETENTION_FULL` is for postgres-pitr.
+    /// Defaulting in the image rather than opting in from the template is what
+    /// actually bounds the FLEET: a template stamp only reaches services
+    /// freshly materialized from the seeded template, leaving every existing
+    /// and every adopted service growing forever. It is safe to default
+    /// because `pitr::MIN_ACTIVE_FULLS_KEPT` fulls survive regardless of age,
+    /// so retention can never expire a service into being unrestorable — the
+    /// only "loss" on an image bump is archive beyond the presented window,
+    /// which is billed storage the product never surfaced.
     ///
     /// The horizon is the promise ("restorable to any point in the last N
-    /// days"), not the whole rule: `pitr::MIN_ACTIVE_FULLS_KEPT` fulls survive
-    /// regardless of age, so a long archiver outage can never expire the
-    /// service into being unrestorable.
+    /// days"), not the whole rule. `BINLOG_RETENTION_DAYS=0` is the deliberate
+    /// opt-out for a service that wants an unbounded archive; a malformed value
+    /// falls back to the default rather than silently disabling retention.
     pub binlog_retention_days: Option<u64>,
     /// Log what retention WOULD delete, and delete nothing
     /// (BINLOG_RETENTION_DRY_RUN). For validating a horizon against a real
@@ -238,12 +245,18 @@ impl Config {
                 86_400,
             ),
             binlog_rotate_interval_seconds: u64::env_parse("BINLOG_ROTATE_INTERVAL_SECONDS", 60),
-            // Absent, empty, unparseable, or 0 all mean "no retention". A
-            // malformed value must not silently become an aggressive horizon,
-            // and 0 must not mean "expire everything".
-            binlog_retention_days: non_empty(std::env::var("BINLOG_RETENTION_DAYS").ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|d| *d > 0),
+            // Unset assumes the default horizon so the image bounds every
+            // service itself; explicit 0 is the opt-out (keep forever); a
+            // positive integer is the chosen horizon; a malformed value falls
+            // back to the default rather than silently disabling retention.
+            binlog_retention_days: match non_empty(std::env::var("BINLOG_RETENTION_DAYS").ok()) {
+                None => Some(crate::pitr::DEFAULT_BINLOG_RETENTION_DAYS),
+                Some(raw) => match raw.parse::<u64>() {
+                    Ok(0) => None,
+                    Ok(days) => Some(days),
+                    Err(_) => Some(crate::pitr::DEFAULT_BINLOG_RETENTION_DAYS),
+                },
+            },
             binlog_retention_dry_run: bool::env_bool("BINLOG_RETENTION_DRY_RUN", false),
             test_retention_min_object_age_seconds: i64::env_parse(
                 "RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS",
@@ -605,25 +618,32 @@ mod tests {
         assert_eq!(config.binlog_archive_path, "/binlog");
         assert_eq!(config.binlog_full_backup_interval_seconds, 86_400);
         assert_eq!(config.binlog_rotate_interval_seconds, 60);
-        // Retention is opt-in: absent means the archive is never expired,
-        // which is the behavior every service had before it existed.
-        assert_eq!(config.binlog_retention_days, None);
+        // Retention defaults in the image: an unset variable assumes the
+        // product default horizon so the archive is bounded without a template
+        // stamp. None (unbounded) is reached only by the explicit `0` opt-out.
+        assert_eq!(
+            config.binlog_retention_days,
+            Some(crate::pitr::DEFAULT_BINLOG_RETENTION_DAYS)
+        );
         assert!(!config.binlog_retention_dry_run);
     }
 
     #[test]
     fn retention_horizon_parses_and_refuses_meaningless_values() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let default = Some(crate::pitr::DEFAULT_BINLOG_RETENTION_DAYS);
         for (raw, expected) in [
-            ("7", Some(7u64)),
-            // 0 must mean "no retention", never "expire everything".
+            ("14", Some(14u64)),
+            // 0 is the explicit opt-out: keep the archive forever.
             ("0", None),
-            // Malformed input must not silently become an aggressive horizon.
-            ("", None),
-            ("   ", None),
-            ("seven", None),
-            ("-3", None),
-            ("3.5", None),
+            // Empty and malformed fall back to the default horizon rather than
+            // silently disabling retention (the unbounded-growth bug this
+            // closes). 0 remains the only way to turn retention off.
+            ("", default),
+            ("   ", default),
+            ("seven", default),
+            ("-3", default),
+            ("3.5", default),
         ] {
             base_env();
             env::set_var("BINLOG_RETENTION_DAYS", raw);
