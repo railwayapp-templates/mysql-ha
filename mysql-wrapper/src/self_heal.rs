@@ -107,7 +107,25 @@ impl HealLedger {
 pub fn read_ledger(data_dir: &str) -> HealLedger {
     let raw = match std::fs::read_to_string(ledger_path(data_dir)) {
         Ok(raw) => raw,
-        Err(_) => return HealLedger::default(),
+        // Only a definite NotFound means "no ledger yet". Every other error is
+        // a ledger we HAVE but cannot read — non-UTF-8 bytes from a torn write
+        // or disk decay, EACCES, EIO — which is the same claim as the
+        // unparseable body below, not the same claim as a first boot. Sending
+        // it down the default path re-opens the wipe budget, the exact failure
+        // the fail-closed arm exists to stop. Mirrors postgres-ha's
+        // major_upgrade::read_marker, which splits on NotFound for this reason.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HealLedger::default(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "self-heal ledger is present but unreadable; treating the attempt budget as \
+                 spent until the file is removed or fixed"
+            );
+            return HealLedger {
+                attempts: u32::MAX,
+                last_unix: now_unix(),
+            };
+        }
     };
     let mut parts = raw.split_whitespace();
     let attempts = parts.next().and_then(|s| s.parse().ok());
@@ -219,7 +237,11 @@ pub async fn quorum_confirmed_peer(
 /// running) and only behind the donor gate. The datadir must end up EMPTY —
 /// `mysqld --initialize` refuses anything else — which is also why the
 /// bumped ledger can't be written back here: it rides in memory until
-/// boot_watch persists it once mysqld is up (see PrebootState).
+/// boot_watch persists it, at the first moment the datadir can hold a marker
+/// again — initialization complete, NOT mysqld accepting connections (see
+/// PrebootState and boot_watch). This file is the only bound on how often the
+/// line below may run, so leaving it in memory across the clone means a
+/// reprovision that keeps failing keeps resetting the budget.
 fn wipe_datadir(data_dir: &str) -> Result<()> {
     for entry in std::fs::read_dir(data_dir).with_context(|| format!("reading {data_dir}"))? {
         let entry = entry?;
@@ -258,9 +280,13 @@ fn init_could_succeed(data_dir: &str) -> bool {
 /// What preboot hands the rest of the boot.
 pub struct PrebootState {
     /// Set when this boot discarded a wedged datadir: the bumped attempt
-    /// ledger, to be persisted the moment markers become writable (mysqld
-    /// up). Until then the count lives only here — an interruption in that
-    /// window under-counts by one, which the boot-loop threshold absorbs.
+    /// ledger, to be persisted the moment markers become writable — which is
+    /// `mysqld --initialize` having created the `mysql` system schema, NOT
+    /// mysqld accepting connections (see boot_watch). Until then the count
+    /// lives only here, and a boot killed in that window loses the attempt.
+    /// That window used to span the entire reprovision, clone included, so a
+    /// reprovision that kept failing reset the budget every cycle and the cap
+    /// was never reachable.
     pub pending_ledger: Option<HealLedger>,
     /// Flipped by boot_watch when mysqld reaches accepting-connections;
     /// the planned-shutdown note reads it to tell an interrupted boot from
@@ -415,8 +441,47 @@ pub async fn boot_watch(
     let peer_hosts = config.peer_hosts();
     let timeout = Duration::from_millis(config.peer_query_timeout_ms);
     let mut over_budget_logged = false;
+    let mut pending_ledger = state.pending_ledger;
 
     loop {
+        // Land the bumped ledger as soon as the datadir can hold a marker
+        // again, NOT at accepting-connections.
+        //
+        // The wipe that produced this pending ledger deleted the old one along
+        // with the rest of the datadir (wipe_datadir has to leave it empty or
+        // `mysqld --initialize` refuses it), so until this write lands the
+        // attempt exists only in this process's memory. Waiting for
+        // accepting-connections held it there across the whole reprovision —
+        // including the clone, the long and failure-prone part — and any boot
+        // that died in that window lost the attempt outright. Lost every
+        // cycle, the count never accumulated and the cap was unreachable: a
+        // node whose reprovision keeps failing (a sick volume, which is also a
+        // common reason to be boot-wedged in the first place) discarded its
+        // datadir again and again, unbounded. The backoff went with it, since
+        // backoff_gap_seconds keys on the same attempt count.
+        //
+        // `mysqld --initialize` creating the `mysql` system schema is the
+        // earliest safe point: its "data directory has files in it" check runs
+        // before that, so a marker written afterwards cannot abort
+        // initialization. From here the count survives a failed clone.
+        if let Some(ledger) = pending_ledger {
+            if config.datadir_is_initialized() {
+                match persist_ledger(&config.data_dir, ledger) {
+                    Ok(()) => {
+                        pending_ledger = None;
+                        info!(
+                            attempts = ledger.attempts,
+                            "recorded the datadir-discard attempt; the cap now survives a \
+                             failed reprovision"
+                        );
+                    }
+                    // Stay pending and retry next poll — the readiness arm
+                    // below is still a second chance.
+                    Err(e) => warn!(error = %e, "could not persist the self-heal ledger yet"),
+                }
+            }
+        }
+
         // The same readiness test the orchestrator uses: the FINAL mysqld
         // (not docker-entrypoint's init temp server) answering queries.
         if let Ok(false) = sql.is_init_temp_server().await {
@@ -424,7 +489,7 @@ pub async fn boot_watch(
             if let Err(e) = persist_boot_attempts(&config.data_dir, 0) {
                 warn!(error = %e, "could not reset the boot attempt counter");
             }
-            if let Some(ledger) = state.pending_ledger {
+            if let Some(ledger) = pending_ledger {
                 if let Err(e) = persist_ledger(&config.data_dir, ledger) {
                     warn!(error = %e, "could not persist the self-heal ledger");
                 }
@@ -897,5 +962,91 @@ mod tests {
         assert_eq!(read_boot_attempts(&dir), 0);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_ledger_reads_as_budget_spent_not_as_a_first_boot() {
+        // A present-but-unreadable ledger is a torn write or disk decay — the
+        // same claim as an unparseable one, NOT the same claim as "no ledger
+        // yet". Defaulting it to 0 re-opens the wipe budget this file caps.
+        let dir = temp_dir("unreadable-ledger");
+        std::fs::write(ledger_path(&dir), b"\xff\xfe\x00 torn").unwrap();
+        let read = read_ledger(&dir);
+        assert_eq!(
+            read.attempts,
+            u32::MAX,
+            "non-UTF-8 bytes must fail closed, like the unparseable-UTF-8 case"
+        );
+        assert_eq!(
+            heal_gate(read, u32::MAX, 60, u64::MAX),
+            HealGate::CapReached
+        );
+        // Negative control: NotFound is the one error that really does mean
+        // "no ledger yet".
+        std::fs::remove_file(ledger_path(&dir)).unwrap();
+        assert_eq!(read_ledger(&dir), HealLedger::default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_wipe_removes_the_ledger_so_the_bump_has_to_be_re_persisted() {
+        // Pins the coupling the boot_watch change exists for: the ledger lives
+        // inside the directory the heal deletes.
+        let dir = temp_dir("wipe-eats-ledger");
+        persist_ledger(
+            &dir,
+            HealLedger {
+                attempts: 2,
+                last_unix: 1,
+            },
+        )
+        .unwrap();
+        std::fs::write(std::path::Path::new(&dir).join("ibdata1"), "data").unwrap();
+        assert_eq!(read_ledger(&dir).attempts, 2);
+
+        wipe_datadir(&dir).unwrap();
+        assert_eq!(
+            read_ledger(&dir).attempts,
+            0,
+            "the wipe takes the ledger with it — hence the re-persist in boot_watch"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_cap_is_reachable_only_when_each_wipe_re_persists_its_bump() {
+        // The end-to-end count. Same loop twice: once losing the bump every
+        // cycle (what the old boot_watch did when the reprovision never
+        // reached accepting-connections), once landing it at initialization.
+        let cap = 5u32;
+        let run = |tag: &str, persist: bool| -> usize {
+            let dir = temp_dir(tag);
+            let mut wipes = 0;
+            for _ in 0..8 {
+                let ledger = read_ledger(&dir);
+                if ledger.attempts >= cap {
+                    continue;
+                }
+                std::fs::write(std::path::Path::new(&dir).join("ibdata1"), "data").unwrap();
+                wipe_datadir(&dir).unwrap();
+                wipes += 1;
+                let bumped = ledger.bump(now_unix());
+                if persist {
+                    persist_ledger(&dir, bumped).unwrap();
+                }
+            }
+            std::fs::remove_dir_all(&dir).ok();
+            wipes
+        };
+        assert_eq!(
+            run("cap-lossy", false),
+            8,
+            "losing the bump every cycle makes the cap unreachable — the node wipes without bound"
+        );
+        assert_eq!(
+            run("cap-durable", true),
+            cap as usize,
+            "re-persisting it caps datadir discards at SELF_HEAL_ATTEMPT_CAP"
+        );
     }
 }
