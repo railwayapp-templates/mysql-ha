@@ -155,6 +155,79 @@ mc_rm_key() {
     >/dev/null 2>&1
 }
 
+
+# mc_put_key <key> <content> — write an object straight into the archive
+# bucket. Used by the retention scenario to forge archive objects with old
+# timestamps, which is the only way to exercise a horizon measured in days
+# inside a test run.
+mc_put_key() {
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && printf '%s' '$2' | mc pipe e2e/$PITR_BUCKET/$1" \
+    >/dev/null 2>&1
+}
+
+# mc_count <prefix> — print how many objects live under a prefix.
+#
+# Returns non-zero, printing nothing, when the listing itself could not be
+# performed. That distinction is the whole point: an earlier version of this
+# harness compared raw command output against "" and so read "I could not
+# look" as "nothing is there" — which silently turned a retention sweep that
+# never ran into a passing test, in both directions. `mc find` answers rc=0
+# with the keys when the prefix has objects, and rc=1 with "does not exist"
+# when it genuinely holds none; anything else is a broken listing, not zero.
+mc_count() {
+  local out rc
+  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc find e2e/$PITR_BUCKET/$1" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$out" | grep -c "^e2e/" || true
+    return 0
+  fi
+  case "$out" in
+    *"does not exist"*) echo 0; return 0 ;;
+  esac
+  log "mc listing FAILED for prefix '$1' (rc=$rc): $out"
+  return 1
+}
+
+# mc_count_matching <prefix> <substring> — objects under a prefix whose key
+# contains a substring. Same fail-loud contract as mc_count.
+mc_count_matching() {
+  local out rc
+  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc find e2e/$PITR_BUCKET/$1" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$out" | grep -c "$2" || true
+    return 0
+  fi
+  case "$out" in
+    *"does not exist"*) echo 0; return 0 ;;
+  esac
+  log "mc listing FAILED for prefix '$1' (rc=$rc): $out"
+  return 1
+}
+
+# prefix_is_empty <prefix> — wait_until predicate. Fails (so the wait keeps
+# going and ultimately times out loudly) when the listing itself broke, rather
+# than reporting a phantom success.
+prefix_is_empty() {
+  local n
+  n="$(mc_count "$1")" || return 1
+  [ "$n" = "0" ]
+}
+
+# mc_put_key <key> <content> — write an object straight into the archive
+# bucket. Used by the retention scenario to forge archive objects with old
+# timestamps, which is the only way to exercise a horizon measured in days
+# inside a test run.
+mc_put_key() {
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && printf '%s' '$2' | mc pipe e2e/$PITR_BUCKET/$1" \
+    >/dev/null 2>&1
+}
+
 # sql <node> <statement> — root SQL over the node's local socket.
 sql() {
   local node="$1"; shift
@@ -1856,6 +1929,202 @@ t_pitr_archive_and_restore_to_point_in_time() {
   docker volume rm mysql-ha-e2e-vol-mysql-pitr-src mysql-ha-e2e-vol-mysql-pitr-restore mysql-ha-e2e-vol-mysql-pitr-crash mysql-ha-e2e-minio-data >/dev/null 2>&1
 }
 
+# Retention: the archive must be expired on its horizon WITHOUT ever becoming
+# unrestorable. Both halves matter, because deleting too much is irreversible.
+#
+# A horizon is measured in days, so nothing this run creates could age past
+# it — the forged objects below stand in for an archive that has been running
+# for weeks. RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS=0 is needed for the
+# same reason on the other axis: S3 stamps LastModified on write, so every
+# forged object looks brand new and production's hour-long age floor would
+# spare all of them.
+t_pitr_retention_expires_the_archive_without_breaking_restore() {
+  log "t_pitr_retention_expires_the_archive_without_breaking_restore"
+  docker rm -f mysql-pitr-retain mysql-pitr-retain-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-retain mysql-ha-e2e-vol-mysql-pitr-retain-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr"
+    -e "BINLOG_RETENTION_DAYS=1"
+    -e "RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS=0"
+  )
+  start_standalone mysql-pitr-retain "${archive_env[@]}"
+
+  wait_until 120 "retention source node healthy" \
+    bash -c 'docker exec mysql-pitr-retain wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "retention source node never became healthy"; return; }
+
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-retain 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-retain 2>&1 | tail -40; return; }
+  ok "archiving live with a 1-day horizon"
+
+  sql mysql-pitr-retain "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'keeper');"
+  sleep 2
+  local t1
+  t1="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  sleep 2
+  sql mysql-pitr-retain "INSERT INTO t.kv VALUES (2,'after-t1');"
+  sql mysql-pitr-retain "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog shipped" \
+    bash -c 'docker logs mysql-pitr-retain 2>&1 | grep -q "binlog uploaded"' \
+    || { bad "binlog was never shipped"; docker logs mysql-pitr-retain 2>&1 | tail -40; return; }
+
+  local live_uuid
+  live_uuid="$(sql mysql-pitr-retain 'SELECT @@server_uuid')"
+  [ -n "$live_uuid" ] || { bad "could not read the live server_uuid"; return; }
+  log "live lineage = server-$live_uuid"
+
+  # Before judging anything by what is or is not in the bucket, prove the
+  # retention loop is actually armed. Without this the whole scenario can pass
+  # or fail for reasons that have nothing to do with the code under test.
+  docker logs mysql-pitr-retain 2>&1 | grep -q "PITR archive retention enabled" \
+    && ok "retention loop is armed" \
+    || { bad "retention never armed — BINLOG_RETENTION_DAYS did not reach the archiver"; docker logs mysql-pitr-retain 2>&1 | grep -i retention | tail -20; return; }
+
+  local real_before
+  real_before="$(mc_count "e2e-pitr/server-$live_uuid/")" \
+    || { bad "could not list the live lineage; refusing to judge retention on an unreadable bucket"; return; }
+  [ "$real_before" -gt 0 ] \
+    || { bad "the live lineage archived nothing; refusing to test retention on an empty archive"; return; }
+  log "live lineage holds $real_before real object(s) pre-forge"
+
+  local ancient="2020-01-01T00:00:00.000Z"
+  local dead_uuid="e2e-dead-lineage-0000-0000-00000001"
+
+  # (a) a whole DEAD lineage, entirely ancient -> must retire completely
+  mc_put_key "e2e-pitr/server-$dead_uuid/full/$ancient.sql.gz" "forged-dump"
+  mc_put_key "e2e-pitr/server-$dead_uuid/full/$ancient.meta.json" \
+    "{\"taken_at\":\"$ancient\",\"binlog_file\":\"binlog.000001\",\"binlog_pos\":4,\"server_uuid\":\"$dead_uuid\",\"mysql_version\":\"8.4.0\"}"
+  mc_put_key "e2e-pitr/server-$dead_uuid/binlog/binlog.000001" "forged-binlog"
+
+  # (b) an ancient full INSIDE the live lineage
+  mc_put_key "e2e-pitr/server-$live_uuid/full/$ancient.sql.gz" "forged-stale-dump"
+  mc_put_key "e2e-pitr/server-$live_uuid/full/$ancient.meta.json" \
+    "{\"taken_at\":\"$ancient\",\"binlog_file\":\"binlog.000001\",\"binlog_pos\":4,\"server_uuid\":\"$live_uuid\",\"mysql_version\":\"8.4.0\"}"
+
+  # Prove the forge actually landed — otherwise a later "it is gone" reads as
+  # success when nothing was ever there.
+  local forged_dead
+  forged_dead="$(mc_count "e2e-pitr/server-$dead_uuid/")" \
+    || { bad "could not list the forged dead lineage"; return; }
+  [ "$forged_dead" = "3" ] \
+    && ok "forged a dead lineage (3 objects) and an ancient full inside the live lineage" \
+    || { bad "the forge did not land as expected (dead lineage has $forged_dead objects, want 3)"; return; }
+
+  # The archiver delays its first sweep on purpose (a boot storm must not have
+  # every container listing and deleting at once), so restart to re-arm it.
+  docker restart mysql-pitr-retain >/dev/null 2>&1
+  wait_until 180 "node back up after restart" \
+    bash -c 'docker exec mysql-pitr-retain wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "node never came back after restart"; docker logs mysql-pitr-retain 2>&1 | tail -40; return; }
+
+  wait_until 600 "retention swept the dead lineage" \
+    prefix_is_empty "e2e-pitr/server-$dead_uuid/" \
+    || { bad "the forged dead lineage was never retired"; docker logs mysql-pitr-retain 2>&1 | grep -i "retention" | tail -30; return; }
+  ok "dead lineage retired whole"
+
+  # Phase 1 — the floor BINDS. The live lineage holds one real full plus the
+  # forged ancient one, so MIN_ACTIVE_FULLS_KEPT (2) legitimately protects the
+  # ancient one even though it is far outside the horizon: expiring it would
+  # leave a single full, which is exactly what the floor exists to prevent.
+  local stale_left
+  stale_left="$(mc_count_matching "e2e-pitr/server-$live_uuid/full/" "$ancient")" \
+    || { bad "could not list the live lineage's fulls"; return; }
+  [ "$stale_left" != "0" ] \
+    && ok "the count floor protected the ancient full while it was one of only two" \
+    || bad "the ancient full expired while the live lineage had only two fulls — MIN_ACTIVE_FULLS_KEPT did not hold"
+
+  # Phase 2 — the floor is SATISFIED, so the horizon governs. Forge a second
+  # RECENT full rather than waiting for the archiver's own schedule, which
+  # would make phase 1 a race. Its coordinate is binlog.000001 deliberately,
+  # so the floor stays at the bottom and no real binlog becomes expirable —
+  # this phase is about full expiry only. Also forge one full older than the
+  # ancient one: the ancient one is the boundary now (see below), so the
+  # oldest one is what the horizon must expire — the delete path still gets
+  # its proof on the live lineage with the floor satisfied.
+  local recent
+  recent="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  mc_put_key "e2e-pitr/server-$live_uuid/full/$recent.sql.gz" "forged-recent-dump"
+  mc_put_key "e2e-pitr/server-$live_uuid/full/$recent.meta.json" \
+    "{\"taken_at\":\"$recent\",\"binlog_file\":\"binlog.000001\",\"binlog_pos\":4,\"server_uuid\":\"$live_uuid\",\"mysql_version\":\"8.4.0\"}"
+  local oldest="2019-01-01T00:00:00.000Z"
+  mc_put_key "e2e-pitr/server-$live_uuid/full/$oldest.sql.gz" "forged-oldest-dump"
+  mc_put_key "e2e-pitr/server-$live_uuid/full/$oldest.meta.json" \
+    "{\"taken_at\":\"$oldest\",\"binlog_file\":\"binlog.000001\",\"binlog_pos\":4,\"server_uuid\":\"$live_uuid\",\"mysql_version\":\"8.4.0\"}"
+  ok "forged a second recent full plus an oldest one; the count floor is now satisfied by recent fulls alone"
+
+  docker restart mysql-pitr-retain >/dev/null 2>&1
+  wait_until 180 "node back up for the second sweep" \
+    bash -c 'docker exec mysql-pitr-retain wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "node never came back for the second sweep"; return; }
+
+  oldest_full_gone() { local n; n="$(mc_count_matching "e2e-pitr/server-$live_uuid/full/" "$oldest")" || return 1; [ "$n" = "0" ]; }
+  wait_until 600 "retention expired the oldest full" oldest_full_gone \
+    || { bad "the oldest full survived even once two recent fulls satisfied the floor"; docker logs mysql-pitr-retain 2>&1 | grep -i "retention" | tail -30; return; }
+  ok "oldest full expired once the floor was satisfied by recent fulls"
+
+  # The ancient full must now SURVIVE: it is the boundary — the newest full
+  # at-or-before every target between the cutoff (the horizon is 1 day, the
+  # real fulls are minutes old) and the initial real full. Expiring it would
+  # strand that entire sliver of the promised window with no base to restore
+  # from, which is exactly the regression this pins.
+  local boundary_left
+  boundary_left="$(mc_count_matching "e2e-pitr/server-$live_uuid/full/" "$ancient")" \
+    || { bad "could not list the live lineage's fulls after the sweep"; return; }
+  [ "$boundary_left" != "0" ] \
+    && ok "the boundary full survived — the window's earliest sliver keeps its restore base" \
+    || bad "the boundary full expired — every target older than the newest in-horizon full lost its only base"
+
+  # The retained full must still be there. Note this is deliberately not
+  # "every object that existed pre-forge still exists": expiring real binlogs
+  # BELOW the retained floor's coordinate is the feature, not a defect (the
+  # dump covers them). What must never vanish is a complete full plus the
+  # chain from its coordinate forward — which the restore below really proves.
+  local full_metas
+  full_metas="$(mc_count_matching "e2e-pitr/server-$live_uuid/full/" "meta.json")" \
+    || { bad "could not list the live lineage's fulls after the sweep"; return; }
+  [ "$full_metas" != "0" ] \
+    && ok "the live lineage still holds a complete full after two sweeps ($full_metas)" \
+    || bad "retention left the live lineage with no full backup at all"
+
+  # The assertion that actually matters: still restorable afterwards. A sweep
+  # that quietly broke the binlog chain passes everything above and fails here.
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$t1"
+  )
+  start_standalone mysql-pitr-retain-restore "${recover_env[@]}"
+  wait_until 180 "post-retention restore completed and serving" \
+    bash -c 'docker exec mysql-pitr-retain-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "post-retention restore never became healthy — retention broke the archive"; docker logs mysql-pitr-retain-restore 2>&1 | tail -60; return; }
+
+  local v1 v2
+  v1="$(sql mysql-pitr-retain-restore "SELECT v FROM t.kv WHERE k=1")"
+  v2="$(sql mysql-pitr-retain-restore "SELECT v FROM t.kv WHERE k=2")"
+  [ "$v1" = "keeper" ] \
+    && ok "archive still restorable after retention ran (pre-T1 row present)" \
+    || bad "post-retention restore lost the pre-T1 row (got: '$v1') — retention broke the chain"
+  [ -z "$v2" ] \
+    && ok "post-retention restore still stops exactly at the target" \
+    || bad "post-T1 row present after restore (got: '$v2')"
+
+  docker rm -f mysql-pitr-retain mysql-pitr-retain-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-retain mysql-ha-e2e-vol-mysql-pitr-retain-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
 # ADVERSARIAL (expected RED): the two scenarios below prove known,
 # confirmed-but-not-yet-fixed gaps in the PITR path. They are intentionally
 # NOT expected to pass — they document the defect precisely enough that
@@ -2123,7 +2392,7 @@ t_binlog_expiry_silently_loses_unshipped_data() {
 # t_binlog_expiry_silently_loses_unshipped_data — same self-contained shape;
 # born RED to prove the silent-loss bugs, green since the gap-refusal and
 # lost-binlog-signal fixes), with only the cross-version finale last.
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade)
 
 main() {
   ensure_image

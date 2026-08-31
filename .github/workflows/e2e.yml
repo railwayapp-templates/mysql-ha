@@ -20,9 +20,10 @@ jobs:
     # the previous-LTS seed image (cross-version conversion). The suite
     # paced ~52 min on 2026-08-27 but ~60 on 2026-08-31 runners, and the
     # 60-min cap cut a run mid-suite with no log blob left to autopsy
-    # (cancelled 2026-08-31 01:04Z). 90 fits the suite plus variance
-    # without masking a hang: every scenario still fails on its own
-    # internal waits, far below the cap.
+    # (cancelled 2026-08-31 01:04Z). This branch's retention scenario adds
+    # ~10 min of bucket sweeps on its own clock on top of that. 90 fits the
+    # suite plus variance without masking a hang: every scenario still fails
+    # on its own internal waits, far below the cap.
     timeout-minutes: 90
 
     steps:

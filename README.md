@@ -132,6 +132,53 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     every `BINLOG_ROTATE_INTERVAL_SECONDS` (default 60s) to bound the
     recovery point objective. A binlog is only purged locally once its
     upload is confirmed — the volume is the spool during a bucket outage.
+  - **Archive retention**, `BINLOG_RETENTION_DAYS`: how far back the archive
+    stays restorable. **Unset — the common case — assumes
+    `DEFAULT_BINLOG_RETENTION_DAYS` (7)**, so the image bounds every service's
+    archive itself rather than relying on the platform to stamp a value; a
+    positive integer sets an explicit horizon, and **`0` is the opt-out** that
+    keeps the archive forever. Defaulting in the image is what bounds the whole
+    FLEET — a template stamp reaches only freshly-seeded template instances,
+    leaving existing and adopted services growing forever — and it is safe
+    because the safety rails below mean the only thing an image bump can expire
+    is archive beyond the presented window. `BINLOG_RETENTION_DRY_RUN=true`
+    logs what the horizon would delete without deleting it.
+
+    The horizon is the promise, not the whole rule. Two safety rails are not
+    policy knobs, because a knob that can disable a safety net is not one:
+    `MIN_ACTIVE_FULLS_KEPT` (2) fulls of the live lineage survive regardless
+    of age — so an archiver that has been broken for longer than the horizon
+    can never be expired into being unrestorable — and no object is deleted
+    while younger than an hour. (The age floor has a TEST-ONLY override,
+    `RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS`, purely because S3 stamps
+    `LastModified` on write, so an e2e test otherwise has no way to prove
+    retention deletes anything without waiting out the hour. Never set it
+    outside a test workspace.)
+
+    What expires, and why it is safe: replay always starts at a full backup's
+    own recorded binlog coordinate, so binlogs *below* the oldest retained
+    full's coordinate cannot be reached by any promised target, while that
+    coordinate file itself is load-bearing and never expires. Deleting a
+    strict prefix is what keeps the retained chain gap-free. A *dead* lineage
+    (a `server-<uuid>/` left behind by a volume reset) is retired whole only
+    once even its newest full predates the horizon — until then it is exactly
+    what a "restore to before the reset" target needs. All of these rules live
+    in `pitr::plan_retention` as pure logic, unit-tested without a bucket;
+    `archiver.rs` only executes a plan.
+
+    Two rules exist because their absence was a data-loss bug, not because
+    they were designed up front — both are regression-tested: a lineage whose
+    fulls **exist but could not be read** this pass (an S3 blip, a corrupt
+    meta) is never treated as a lineage with no fulls, since expiring its
+    binlogs would leave those fulls unrestorable past their own coordinates;
+    and nothing expires anywhere until the ACTIVE lineage holds a complete
+    full, so a fresh volume never retires the bucket's last restorable full
+    before its replacement exists.
+
+    Note there is no diff/incremental tier here as pgBackRest has: storage is
+    (retained fulls x dump size) + (binlogs since the oldest retained full),
+    and `BINLOG_FULL_BACKUP_INTERVAL_SECONDS` is the knob that trades storage
+    against replay time on restore.
   - **Restore-on-boot**, gated by `BINLOG_RECOVER_FROM_BUCKET` (same
     `_KEY`/`_SECRET`/`_REGION`/`_ENDPOINT`/`_PATH` shape) together with
     `MYSQL_RECOVERY_TARGET_TIME` (ISO-8601 UTC): on a fresh volume only,

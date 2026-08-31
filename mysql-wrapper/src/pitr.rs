@@ -463,6 +463,349 @@ pub fn binlogs_to_replay(mut files: Vec<String>, start_file: &str) -> BinlogRepl
     BinlogReplayPlan { run, gap: None }
 }
 
+// --- archive retention -------------------------------------------------------
+//
+// Without this the archive grows forever: fulls accumulate every
+// BINLOG_FULL_BACKUP_INTERVAL_SECONDS and no binlog is ever removed from the
+// bucket (`purge_cut` above reclaims LOCAL disk only). pgBackRest gives
+// postgres-pitr `expire`; this is the MySQL equivalent, and it is deliberately
+// pure so every deletion rule is unit-testable without touching a bucket.
+//
+// The restorability invariant it must never break: for any target T inside the
+// promised window there must be a complete full F with `taken_at <= T`, AND a
+// gap-free binlog run from `F.meta.binlog_file` through T. `binlogs_to_replay`
+// starts AT the full's own coordinate file and treats a missing coordinate file
+// as a gap yielding an EMPTY run — so that one file is load-bearing and can
+// never be expired while its full is retained.
+//
+// Policy shape: a TIME horizon (what a customer is actually promised — "you can
+// restore to any point in the last N days") plus a hard count floor that is NOT
+// configurable. Time alone is unsafe: if archiving has been broken for longer
+// than the horizon, a naive sweep deletes the only restorable full. Count alone
+// is unpredictable: the window becomes N x interval and drifts whenever the
+// interval changes or a backup fails.
+
+/// Complete fulls kept for the ACTIVE lineage regardless of age. A safety
+/// invariant, not a knob: it is what makes a time horizon safe to apply at all.
+/// Two rather than one so a restore already replaying against the oldest
+/// retained full still has a margin when the next sweep moves the floor.
+pub const MIN_ACTIVE_FULLS_KEPT: usize = 2;
+
+/// The horizon the image assumes when `BINLOG_RETENTION_DAYS` is unset, so a
+/// PITR service bounds its own archive without the platform having to stamp a
+/// value onto the template. Matches the window the Backups panel presents.
+/// Defaulting is safe because `MIN_ACTIVE_FULLS_KEPT` fulls survive regardless
+/// of age — retention can never expire a service into being unrestorable — and
+/// an explicit `BINLOG_RETENTION_DAYS=0` remains the opt-out for a service that
+/// deliberately wants an unbounded archive.
+pub const DEFAULT_BINLOG_RETENTION_DAYS: u64 = 7;
+
+/// No object is ever deleted while younger than this, whatever the policy says.
+/// Insurance against expiring something a just-started restore still needs.
+pub const RETENTION_MIN_OBJECT_AGE_SECONDS: i64 = 3600;
+
+/// A `.sql.gz` with no sibling `.meta.json` is either an upload still in flight
+/// or the wreckage of a failed one. Unrestorable either way (the meta carries
+/// the replay coordinate), but it must not be deleted until it is far past any
+/// plausible in-flight dump.
+pub const ORPHAN_DUMP_GRACE_SECONDS: i64 = 6 * 3600;
+
+/// What one lineage's objects look like to the planner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineageObjects {
+    pub server_uuid: String,
+    /// Complete fulls (dump AND meta present), any order.
+    pub fulls: Vec<FullBackupRef>,
+    /// How many full-backup `meta.json` objects the bucket actually holds for
+    /// this lineage, whether or not they could be read or parsed this pass.
+    ///
+    /// Load-bearing: without it an empty `fulls` is ambiguous between "this
+    /// lineage never had a full" and "its fulls exist but we could not read
+    /// them", and only the first of those makes its binlogs expirable. A
+    /// transient S3 error must never be able to turn a good lineage into an
+    /// unrestorable one.
+    pub full_objects_seen: usize,
+    /// `.sql.gz` keys with no sibling `.meta.json`, with their upload time.
+    pub orphan_dumps: Vec<(String, DateTime<Utc>)>,
+    /// Bare binlog file names (e.g. `binlog.000007`), any order.
+    pub binlogs: Vec<String>,
+}
+
+/// Everything the planner needs. Deliberately a snapshot: the caller lists the
+/// bucket once, then this decides, so the decision is reproducible in a test.
+#[derive(Debug, Clone)]
+pub struct RetentionInput {
+    pub lineages: Vec<LineageObjects>,
+    /// The lineage this server archives under. `None` when the archiver has not
+    /// yet established its own lineage — the planner then refuses to delete
+    /// anything, because it cannot tell a dead lineage from its own.
+    pub active_server_uuid: Option<String>,
+    pub now: DateTime<Utc>,
+    pub horizon: chrono::Duration,
+}
+
+/// Objects to delete, plus why — the caller logs the reasons whether or not it
+/// is in dry-run mode.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RetentionPlan {
+    /// Full-backup objects (both the `.sql.gz` and `.meta.json` of each expired
+    /// full) to delete.
+    pub expired_full_keys: Vec<String>,
+    /// Binlog file NAMES to delete, as `(server_uuid, name)`.
+    pub expired_binlogs: Vec<(String, String)>,
+    /// Orphan `.sql.gz` keys past the grace window.
+    pub orphan_dump_keys: Vec<String>,
+    /// Lineages retired whole — informational; their objects are already in the
+    /// lists above.
+    pub retired_lineages: Vec<String>,
+    /// One note per decision worth seeing in the log.
+    pub notes: Vec<String>,
+}
+
+impl RetentionPlan {
+    pub fn is_empty(&self) -> bool {
+        self.expired_full_keys.is_empty()
+            && self.expired_binlogs.is_empty()
+            && self.orphan_dump_keys.is_empty()
+    }
+
+    pub fn object_count(&self) -> usize {
+        self.expired_full_keys.len() + self.expired_binlogs.len() + self.orphan_dump_keys.len()
+    }
+}
+
+/// Which fulls a lineage keeps: everything inside the horizon, extended down to
+/// `min_kept` when the horizon alone would leave fewer. Newest-first. Always
+/// keeps at least one — dropping a lineage's last full is the retire-whole
+/// decision, made by the caller, never a side effect here.
+///
+/// The window also extends by exactly one full past the cutoff when the oldest
+/// in-horizon full is strictly newer than it: restore selects the newest full
+/// with `taken_at <= target`, so a target between the cutoff and that full has
+/// nothing to stand on unless the boundary full — the newest one at-or-before
+/// the target — survives. Keeping it is what makes "any point in the last N
+/// days" a promise instead of "any full-backup interval inside those days".
+fn fulls_to_keep(
+    fulls: &[FullBackupRef],
+    cutoff: DateTime<Utc>,
+    min_kept: usize,
+) -> Vec<FullBackupRef> {
+    let mut sorted: Vec<FullBackupRef> = fulls.to_vec();
+    sorted.sort_by(|a, b| {
+        b.meta
+            .taken_at
+            .cmp(&a.meta.taken_at)
+            .then_with(|| a.dump_key.cmp(&b.dump_key))
+    });
+    let inside = sorted.iter().filter(|f| f.meta.taken_at >= cutoff).count();
+    let mut keep = inside.max(min_kept).max(1).min(sorted.len());
+    // The oldest kept full is newer than the cutoff while an older full
+    // exists: targets between the cutoff and that full's taken_at lose their
+    // only qualifying base. Keep exactly one more — the boundary full.
+    if keep < sorted.len() && sorted[keep - 1].meta.taken_at > cutoff {
+        keep += 1;
+    }
+    sorted.into_iter().take(keep).collect()
+}
+
+/// Plan one sweep. Never deletes anything it cannot prove unnecessary; on any
+/// ambiguity it keeps the object and says why in `notes`.
+pub fn plan_retention(input: &RetentionInput) -> RetentionPlan {
+    let mut plan = RetentionPlan::default();
+
+    let Some(active_uuid) = input.active_server_uuid.as_deref() else {
+        plan.notes.push(
+            "no active lineage established yet; skipping retention entirely (cannot distinguish \
+             a dead lineage from this server's own)"
+                .to_string(),
+        );
+        return plan;
+    };
+
+    if input.horizon <= chrono::Duration::zero() {
+        plan.notes
+            .push("retention horizon is not positive; nothing expires".to_string());
+        return plan;
+    }
+
+    let cutoff = input.now - input.horizon;
+    let orphan_grace = chrono::Duration::seconds(ORPHAN_DUMP_GRACE_SECONDS);
+
+    // Nothing expires until the active lineage can itself serve a restore. On
+    // a fresh volume the only fulls in the bucket belong to the lineage it
+    // replaced, and retiring those — even past the horizon — would leave
+    // nothing restorable at all until the first new full lands. Wait for the
+    // replacement to exist first.
+    let active_has_full = input
+        .lineages
+        .iter()
+        .any(|l| l.server_uuid == active_uuid && !l.fulls.is_empty());
+    if !active_has_full {
+        plan.notes.push(format!(
+            "the active lineage has no complete full backup yet ({active_uuid}); expiring nothing \
+             anywhere until it does, so the bucket is never left without a restorable full"
+        ));
+        return plan;
+    }
+
+    // The active lineage must always remain restorable, so it never retires
+    // whole and always honors the count floor. A dead lineage exists only to
+    // serve targets inside the window (restoring to before a volume reset);
+    // once every one of its fulls is past the horizon it can no longer serve
+    // anything the window promises, and it retires completely.
+    for lineage in &input.lineages {
+        let is_active = lineage.server_uuid == active_uuid;
+
+        for (key, uploaded_at) in &lineage.orphan_dumps {
+            if input.now - *uploaded_at > orphan_grace {
+                plan.orphan_dump_keys.push(key.clone());
+            }
+        }
+
+        if lineage.fulls.is_empty() {
+            if lineage.full_objects_seen > 0 {
+                // Its fulls exist; we just could not read them this pass.
+                // Expiring the binlogs now would leave those fulls
+                // unrestorable past their own coordinates — permanently.
+                plan.notes.push(format!(
+                    "lineage {}: {} full backup(s) exist but could not be read this pass; \
+                     expiring nothing in this lineage",
+                    lineage.server_uuid, lineage.full_objects_seen
+                ));
+                continue;
+            }
+            // Genuinely no full: nothing here is restorable at all, since a
+            // lineage's binlogs are only ever replayed from its own full. Still
+            // spare the active lineage, whose first full may simply not have
+            // landed yet.
+            if !is_active && !lineage.binlogs.is_empty() {
+                plan.notes.push(format!(
+                    "lineage {} has binlogs but no complete full backup; expiring {} \
+                     unrestorable binlog(s)",
+                    lineage.server_uuid,
+                    lineage.binlogs.len()
+                ));
+                for name in &lineage.binlogs {
+                    plan.expired_binlogs
+                        .push((lineage.server_uuid.clone(), name.clone()));
+                }
+                plan.retired_lineages.push(lineage.server_uuid.clone());
+            }
+            continue;
+        }
+
+        let newest_full_at = lineage
+            .fulls
+            .iter()
+            .map(|f| f.meta.taken_at)
+            .max()
+            .expect("non-empty checked above");
+
+        if !is_active && newest_full_at < cutoff {
+            plan.notes.push(format!(
+                "retiring dead lineage {} whole: its newest full ({}) is older than the horizon",
+                lineage.server_uuid,
+                format_rfc3339_millis(newest_full_at)
+            ));
+            for full in &lineage.fulls {
+                plan.expired_full_keys.push(full.dump_key.clone());
+                plan.expired_full_keys
+                    .push(meta_key_for_dump(&full.dump_key));
+            }
+            for name in &lineage.binlogs {
+                plan.expired_binlogs
+                    .push((lineage.server_uuid.clone(), name.clone()));
+            }
+            plan.retired_lineages.push(lineage.server_uuid.clone());
+            continue;
+        }
+
+        let min_kept = if is_active { MIN_ACTIVE_FULLS_KEPT } else { 1 };
+        let kept = fulls_to_keep(&lineage.fulls, cutoff, min_kept);
+        let floor = kept
+            .last()
+            .expect("fulls_to_keep always keeps at least one");
+
+        // The floor predating the horizon while in-horizon fulls exist is the
+        // boundary extension at work — worth a line in the log so a full that
+        // outlived the horizon doesn't read as a sweep that failed to sweep.
+        if floor.meta.taken_at < cutoff && kept.iter().any(|f| f.meta.taken_at >= cutoff) {
+            plan.notes.push(format!(
+                "lineage {}: floor full ({}) predates the horizon; kept because \
+                 in-window targets before the oldest in-horizon full restore from it",
+                lineage.server_uuid,
+                format_rfc3339_millis(floor.meta.taken_at)
+            ));
+        }
+
+        let kept_dumps: BTreeSet<&str> = kept.iter().map(|f| f.dump_key.as_str()).collect();
+        let mut expired_fulls = 0usize;
+        for full in &lineage.fulls {
+            if kept_dumps.contains(full.dump_key.as_str()) {
+                continue;
+            }
+            plan.expired_full_keys.push(full.dump_key.clone());
+            plan.expired_full_keys
+                .push(meta_key_for_dump(&full.dump_key));
+            expired_fulls += 1;
+        }
+
+        // Expire binlogs strictly BELOW the floor full's coordinate file. The
+        // coordinate file itself is where replay starts, so it stays; files
+        // before it are covered by the dump.
+        let Some(floor_seq) = binlog_seq(&floor.meta.binlog_file) else {
+            plan.notes.push(format!(
+                "lineage {}: the floor full's coordinate file {:?} has no parseable sequence; \
+                 keeping every binlog in this lineage",
+                lineage.server_uuid, floor.meta.binlog_file
+            ));
+            continue;
+        };
+        let mut expired_below = 0usize;
+        let mut unparseable = 0usize;
+        for name in &lineage.binlogs {
+            match binlog_seq(name) {
+                Some(seq) if seq < floor_seq => {
+                    plan.expired_binlogs
+                        .push((lineage.server_uuid.clone(), name.clone()));
+                    expired_below += 1;
+                }
+                Some(_) => {}
+                None => unparseable += 1,
+            }
+        }
+        if unparseable > 0 {
+            plan.notes.push(format!(
+                "lineage {}: kept {} binlog(s) whose name has no parseable sequence",
+                lineage.server_uuid, unparseable
+            ));
+        }
+        if expired_fulls > 0 || expired_below > 0 {
+            plan.notes.push(format!(
+                "lineage {}{}: keeping {} full(s) back to {} (coordinate {}); expiring {} full(s) \
+                 and {} binlog(s) below it",
+                lineage.server_uuid,
+                if is_active { " (active)" } else { "" },
+                kept.len(),
+                format_rfc3339_millis(floor.meta.taken_at),
+                floor.meta.binlog_file,
+                expired_fulls,
+                expired_below
+            ));
+        }
+    }
+
+    plan
+}
+
+/// `<...>/full/<rfc>.sql.gz` -> `<...>/full/<rfc>.meta.json`.
+pub fn meta_key_for_dump(dump_key: &str) -> String {
+    match dump_key.strip_suffix(".sql.gz") {
+        Some(stem) => format!("{stem}.meta.json"),
+        None => format!("{dump_key}.meta.json"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,6 +1320,524 @@ mod tests {
         assert_eq!(
             purge_cut(&disk, "binlog.000004", &uploaded, &set(&[])),
             Some("binlog.000002".to_string())
+        );
+    }
+
+    // --- retention ----------------------------------------------------------
+
+    /// A full with an explicit binlog coordinate, so retention's
+    /// keep-binlogs-at-or-after-the-floor rule can be exercised precisely.
+    fn full_at(server_uuid: &str, taken_at: &str, coord: &str) -> FullBackupRef {
+        let mut f = full(server_uuid, taken_at);
+        f.meta.binlog_file = coord.to_string();
+        f
+    }
+
+    fn lineage(server_uuid: &str, fulls: Vec<FullBackupRef>, binlogs: &[&str]) -> LineageObjects {
+        let full_objects_seen = fulls.len();
+        LineageObjects {
+            server_uuid: server_uuid.to_string(),
+            fulls,
+            full_objects_seen,
+            orphan_dumps: Vec::new(),
+            binlogs: binlogs.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn at(ts: &str) -> DateTime<Utc> {
+        parse_target_time(ts).unwrap()
+    }
+
+    fn input(
+        lineages: Vec<LineageObjects>,
+        active: Option<&str>,
+        now: &str,
+        days: i64,
+    ) -> RetentionInput {
+        RetentionInput {
+            lineages,
+            active_server_uuid: active.map(|s| s.to_string()),
+            now: at(now),
+            horizon: chrono::Duration::days(days),
+        }
+    }
+
+    #[test]
+    fn retention_keeps_everything_inside_the_horizon() {
+        let l = lineage(
+            "a",
+            vec![
+                full_at("a", "2026-08-25T00:00:00.000Z", "binlog.000010"),
+                full_at("a", "2026-08-26T00:00:00.000Z", "binlog.000020"),
+                full_at("a", "2026-08-27T00:00:00.000Z", "binlog.000030"),
+            ],
+            &["binlog.000010", "binlog.000020", "binlog.000030"],
+        );
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 7));
+        assert!(plan.is_empty(), "nothing is past a 7d horizon: {plan:?}");
+    }
+
+    #[test]
+    fn retention_expires_fulls_past_the_horizon_and_binlogs_below_the_floor() {
+        // 3d horizon at 2026-08-27T12:00Z -> cutoff 2026-08-24T12:00Z.
+        // The 08-20 and 08-22 fulls are outside; 08-25 and 08-26 inside.
+        // The 08-22 full is the boundary — the base restore needs for targets
+        // before 08-25 — so it stays and the floor moves down to it. Its
+        // coordinate is binlog.000020, so binlog 10 goes and 20/30/40 stay.
+        let l = lineage(
+            "a",
+            vec![
+                full_at("a", "2026-08-20T00:00:00.000Z", "binlog.000010"),
+                full_at("a", "2026-08-22T00:00:00.000Z", "binlog.000020"),
+                full_at("a", "2026-08-25T00:00:00.000Z", "binlog.000030"),
+                full_at("a", "2026-08-26T00:00:00.000Z", "binlog.000040"),
+            ],
+            &[
+                "binlog.000010",
+                "binlog.000020",
+                "binlog.000030",
+                "binlog.000040",
+            ],
+        );
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 3));
+        assert_eq!(
+            plan.expired_full_keys,
+            vec![
+                "server-a/full/2026-08-20T00:00:00.000Z.sql.gz".to_string(),
+                "server-a/full/2026-08-20T00:00:00.000Z.meta.json".to_string(),
+            ]
+        );
+        let expired: Vec<&str> = plan
+            .expired_binlogs
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect();
+        assert_eq!(expired, vec!["binlog.000010"]);
+    }
+
+    #[test]
+    fn retention_keeps_the_boundary_full_every_in_window_target_restores_from() {
+        // The window's promise is any point in the last N days. A target
+        // between the cutoff and the oldest in-horizon full restores from the
+        // boundary full — the newest one at-or-before it — so deleting that
+        // base strands the earliest sliver of the window. Walk the whole
+        // window hourly, through restore's own selection rule, against only
+        // what retention left behind.
+        let all_binlogs: Vec<String> = (10..=28).map(|n| format!("binlog.{n:06}")).collect();
+        let names: Vec<&str> = all_binlogs.iter().map(|s| s.as_str()).collect();
+        let l = lineage(
+            "a",
+            vec![
+                full_at("a", "2026-08-20T00:00:00.000Z", "binlog.000010"),
+                full_at("a", "2026-08-22T00:00:00.000Z", "binlog.000015"),
+                full_at("a", "2026-08-25T00:00:00.000Z", "binlog.000021"),
+                full_at("a", "2026-08-26T00:00:00.000Z", "binlog.000027"),
+            ],
+            &names,
+        );
+        let all_fulls = l.fulls.clone();
+        let now = at("2026-08-27T12:00:00.000Z");
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 3));
+        let cutoff = now - chrono::Duration::days(3);
+
+        // Only the pre-boundary full expires, with the binlogs its dump covers.
+        assert_eq!(
+            plan.expired_full_keys,
+            vec![
+                "server-a/full/2026-08-20T00:00:00.000Z.sql.gz".to_string(),
+                "server-a/full/2026-08-20T00:00:00.000Z.meta.json".to_string(),
+            ]
+        );
+        let expired_binlogs: Vec<&str> = plan
+            .expired_binlogs
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect();
+        assert_eq!(
+            expired_binlogs,
+            vec![
+                "binlog.000010",
+                "binlog.000011",
+                "binlog.000012",
+                "binlog.000013",
+                "binlog.000014"
+            ]
+        );
+
+        let surviving_fulls: Vec<FullBackupRef> = all_fulls
+            .iter()
+            .filter(|f| !plan.expired_full_keys.contains(&f.dump_key))
+            .cloned()
+            .collect();
+        let surviving_binlogs: Vec<String> = all_binlogs
+            .iter()
+            .filter(|n| !expired_binlogs.contains(&n.as_str()))
+            .cloned()
+            .collect();
+
+        let mut t = cutoff;
+        while t <= now {
+            let base = newest_qualifying_full(&surviving_fulls, t).unwrap_or_else(|| {
+                panic!("in-window target {t} lost its only qualifying full to retention")
+            });
+            let replay = binlogs_to_replay(surviving_binlogs.clone(), &base.meta.binlog_file);
+            assert!(
+                replay.gap.is_none(),
+                "retention left a gap above the base for target {t}: {replay:?}"
+            );
+            assert_eq!(
+                replay.run.first(),
+                Some(&base.meta.binlog_file),
+                "the base's own coordinate must survive with it: {replay:?}"
+            );
+            t += chrono::Duration::hours(1);
+        }
+
+        // The specific regression: the earliest sliver of the window restores
+        // from the boundary full, not from nothing.
+        let earliest = newest_qualifying_full(&surviving_fulls, cutoff).unwrap();
+        assert_eq!(
+            earliest.meta.taken_at,
+            at("2026-08-22T00:00:00.000Z"),
+            "the boundary full must survive as the base for pre-08-25 targets"
+        );
+    }
+
+    #[test]
+    fn retention_never_expires_the_floor_fulls_own_coordinate_file() {
+        // The coordinate file is where replay STARTS (binlogs_to_replay treats
+        // it as missing -> empty run + a gap), so it must survive even though
+        // nothing older than it is retained. The floor here is a boundary
+        // full — outside the horizon, kept as the base for in-window targets —
+        // which is the usual shape in a steady cadence. Sequence numbers are
+        // consecutive, as real binlogs are: retention deletes a strict PREFIX
+        // below the floor coordinate, which is exactly why what remains is
+        // still gap-free from the floor.
+        let all = [
+            "binlog.000001",
+            "binlog.000002",
+            "binlog.000003",
+            "binlog.000004",
+        ];
+        let l = lineage(
+            "a",
+            vec![
+                full_at("a", "2026-08-20T00:00:00.000Z", "binlog.000002"),
+                full_at("a", "2026-08-26T00:00:00.000Z", "binlog.000003"),
+                full_at("a", "2026-08-27T00:00:00.000Z", "binlog.000004"),
+            ],
+            &all,
+        );
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 3));
+        let expired: Vec<&str> = plan
+            .expired_binlogs
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect();
+        assert_eq!(
+            expired,
+            vec!["binlog.000001"],
+            "only files strictly below the floor coordinate expire"
+        );
+        assert!(
+            !expired.contains(&"binlog.000002"),
+            "the floor full's own coordinate file must never expire: {expired:?}"
+        );
+
+        // The surviving archive must still replay, gap-free, from the floor.
+        let survivors: Vec<String> = all
+            .iter()
+            .filter(|n| !expired.contains(n))
+            .map(|n| n.to_string())
+            .collect();
+        let replay = binlogs_to_replay(survivors.clone(), "binlog.000002");
+        assert!(
+            replay.gap.is_none(),
+            "retention left a gap in the retained chain: {replay:?}"
+        );
+        assert_eq!(replay.run, survivors);
+    }
+
+    #[test]
+    fn retention_count_floor_saves_the_only_fulls_when_archiving_has_been_broken() {
+        // Every full is far outside the horizon — a naive time sweep would
+        // delete all of them and leave the service unrestorable. The active
+        // lineage's count floor is what prevents that.
+        let l = lineage(
+            "a",
+            vec![
+                full_at("a", "2026-07-01T00:00:00.000Z", "binlog.000010"),
+                full_at("a", "2026-07-02T00:00:00.000Z", "binlog.000020"),
+                full_at("a", "2026-07-03T00:00:00.000Z", "binlog.000030"),
+            ],
+            &["binlog.000010", "binlog.000020", "binlog.000030"],
+        );
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 7));
+        // Newest MIN_ACTIVE_FULLS_KEPT survive; only the oldest expires.
+        assert_eq!(MIN_ACTIVE_FULLS_KEPT, 2);
+        assert_eq!(
+            plan.expired_full_keys,
+            vec![
+                "server-a/full/2026-07-01T00:00:00.000Z.sql.gz".to_string(),
+                "server-a/full/2026-07-01T00:00:00.000Z.meta.json".to_string(),
+            ]
+        );
+        let expired: Vec<&str> = plan
+            .expired_binlogs
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect();
+        assert_eq!(expired, vec!["binlog.000010"]);
+    }
+
+    #[test]
+    fn retention_never_touches_a_lineage_with_a_single_full() {
+        let l = lineage(
+            "a",
+            vec![full_at("a", "2026-01-01T00:00:00.000Z", "binlog.000005")],
+            &["binlog.000005", "binlog.000006"],
+        );
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 1));
+        assert!(
+            plan.is_empty(),
+            "a lone full and its chain must survive any horizon: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn retention_retires_a_dead_lineage_wholly_past_the_horizon() {
+        let dead = lineage(
+            "old",
+            vec![
+                full_at("old", "2026-08-01T00:00:00.000Z", "binlog.000010"),
+                full_at("old", "2026-08-02T00:00:00.000Z", "binlog.000020"),
+            ],
+            &["binlog.000010", "binlog.000020"],
+        );
+        let live = lineage(
+            "new",
+            vec![
+                full_at("new", "2026-08-26T00:00:00.000Z", "binlog.000001"),
+                full_at("new", "2026-08-27T00:00:00.000Z", "binlog.000002"),
+            ],
+            &["binlog.000001", "binlog.000002"],
+        );
+        let plan = plan_retention(&input(
+            vec![dead, live],
+            Some("new"),
+            "2026-08-27T12:00:00.000Z",
+            7,
+        ));
+        assert_eq!(plan.retired_lineages, vec!["old".to_string()]);
+        assert_eq!(
+            plan.expired_full_keys.len(),
+            4,
+            "both of old's fulls, dump+meta"
+        );
+        assert!(
+            plan.expired_binlogs.iter().all(|(uuid, _)| uuid == "old"),
+            "the live lineage must be untouched: {:?}",
+            plan.expired_binlogs
+        );
+    }
+
+    #[test]
+    fn retention_keeps_a_dead_lineage_still_inside_the_horizon() {
+        // The volume was reset an hour ago. Restoring to before the reset is
+        // exactly what the window promises, so the dead lineage stays.
+        let dead = lineage(
+            "old",
+            vec![full_at("old", "2026-08-27T09:00:00.000Z", "binlog.000010")],
+            &["binlog.000010", "binlog.000011"],
+        );
+        let live = lineage(
+            "new",
+            vec![full_at("new", "2026-08-27T11:00:00.000Z", "binlog.000001")],
+            &["binlog.000001"],
+        );
+        let plan = plan_retention(&input(
+            vec![dead, live],
+            Some("new"),
+            "2026-08-27T12:00:00.000Z",
+            7,
+        ));
+        assert!(
+            plan.is_empty(),
+            "a fresh dead lineage must survive: {plan:?}"
+        );
+        assert!(plan.retired_lineages.is_empty());
+    }
+
+    #[test]
+    fn retention_refuses_to_act_without_an_active_lineage() {
+        // Cannot tell a dead lineage from this server's own yet: do nothing.
+        let l = lineage(
+            "a",
+            vec![full_at("a", "2026-01-01T00:00:00.000Z", "binlog.000010")],
+            &["binlog.000010"],
+        );
+        let plan = plan_retention(&input(vec![l], None, "2026-08-27T12:00:00.000Z", 1));
+        assert!(plan.is_empty());
+        assert!(plan.notes.iter().any(|n| n.contains("no active lineage")));
+    }
+
+    #[test]
+    fn retention_is_inert_on_a_non_positive_horizon() {
+        let l = lineage(
+            "a",
+            vec![
+                full_at("a", "2026-01-01T00:00:00.000Z", "binlog.000010"),
+                full_at("a", "2026-01-02T00:00:00.000Z", "binlog.000020"),
+                full_at("a", "2026-01-03T00:00:00.000Z", "binlog.000030"),
+            ],
+            &["binlog.000010"],
+        );
+        let mut inp = input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 0);
+        inp.horizon = chrono::Duration::zero();
+        assert!(plan_retention(&inp).is_empty());
+    }
+
+    #[test]
+    fn retention_expires_orphan_dumps_only_past_the_grace() {
+        let mut l = lineage(
+            "a",
+            vec![full_at("a", "2026-08-27T00:00:00.000Z", "binlog.000010")],
+            &["binlog.000010"],
+        );
+        l.orphan_dumps = vec![
+            // In flight 10 minutes ago — must be spared.
+            (
+                "server-a/full/2026-08-27T11:50:00.000Z.sql.gz".to_string(),
+                at("2026-08-27T11:50:00.000Z"),
+            ),
+            // Wreckage from yesterday — unrestorable, expire it.
+            (
+                "server-a/full/2026-08-26T00:00:00.000Z.sql.gz".to_string(),
+                at("2026-08-26T00:00:00.000Z"),
+            ),
+        ];
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 7));
+        assert_eq!(
+            plan.orphan_dump_keys,
+            vec!["server-a/full/2026-08-26T00:00:00.000Z.sql.gz".to_string()]
+        );
+    }
+
+    #[test]
+    fn retention_expires_binlogs_of_a_dead_lineage_that_never_got_a_full() {
+        let orphaned = lineage("stale", vec![], &["binlog.000001", "binlog.000002"]);
+        let live = lineage(
+            "new",
+            vec![full_at("new", "2026-08-27T00:00:00.000Z", "binlog.000001")],
+            &["binlog.000001"],
+        );
+        let plan = plan_retention(&input(
+            vec![orphaned, live],
+            Some("new"),
+            "2026-08-27T12:00:00.000Z",
+            7,
+        ));
+        assert_eq!(plan.expired_binlogs.len(), 2);
+        assert!(plan.expired_binlogs.iter().all(|(u, _)| u == "stale"));
+    }
+
+    #[test]
+    fn retention_spares_the_active_lineage_before_its_first_full_lands() {
+        // Binlogs are shipping but the initial full has not finished; expiring
+        // them here would punch a hole the first full can never cover.
+        let l = lineage("a", vec![], &["binlog.000001", "binlog.000002"]);
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 7));
+        assert!(plan.is_empty(), "must spare the active lineage: {plan:?}");
+    }
+
+    #[test]
+    fn retention_keeps_every_binlog_when_the_floor_coordinate_is_unparseable() {
+        let l = lineage(
+            "a",
+            vec![
+                full_at("a", "2026-08-01T00:00:00.000Z", "weird-name"),
+                full_at("a", "2026-08-26T00:00:00.000Z", "also-weird"),
+                full_at("a", "2026-08-27T00:00:00.000Z", "binlog.000030"),
+            ],
+            &["binlog.000010", "binlog.000030"],
+        );
+        let plan = plan_retention(&input(vec![l], Some("a"), "2026-08-27T12:00:00.000Z", 3));
+        assert!(
+            plan.expired_binlogs.is_empty(),
+            "an unparseable floor coordinate must not expire any binlog: {:?}",
+            plan.expired_binlogs
+        );
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("no parseable sequence")));
+    }
+
+    #[test]
+    fn retention_does_not_wipe_a_lineage_whose_fulls_merely_could_not_be_read() {
+        // The dangerous shape: a dead lineage that HAS good fulls in the
+        // bucket, but whose meta.json objects could not be read this pass (an
+        // S3 blip, or a corrupt/unparseable meta). The caller cannot express
+        // "keeping this full" by simply omitting it — an empty `fulls` list is
+        // indistinguishable from a lineage that never had one, and expiring
+        // its binlogs would make the surviving fulls unrestorable past their
+        // own coordinates. Irreversibly.
+        let mut dead = lineage("old", vec![], &["binlog.000001", "binlog.000002"]);
+        dead.full_objects_seen = 2; // two meta.json objects exist, unread
+        let live = lineage(
+            "new",
+            vec![full_at("new", "2026-08-27T00:00:00.000Z", "binlog.000001")],
+            &["binlog.000001"],
+        );
+        let plan = plan_retention(&input(
+            vec![dead, live],
+            Some("new"),
+            "2026-08-27T12:00:00.000Z",
+            7,
+        ));
+        assert!(
+            plan.expired_binlogs.is_empty(),
+            "unreadable fulls must never be treated as absent fulls: {:?}",
+            plan.expired_binlogs
+        );
+        assert!(plan.retired_lineages.is_empty());
+        assert!(plan.notes.iter().any(|n| n.contains("could not be read")));
+    }
+
+    #[test]
+    fn retention_waits_for_the_active_lineage_to_have_a_full_before_expiring_anything() {
+        // A fresh volume: the new server has archived nothing yet, and the
+        // only fulls in the bucket belong to the dead lineage it replaced.
+        // Retiring that lineage now — even though it is past the horizon —
+        // would leave the bucket with nothing restorable at all until the
+        // first new full lands. Wait for the replacement to exist.
+        let dead = lineage(
+            "old",
+            vec![full_at("old", "2026-08-01T00:00:00.000Z", "binlog.000010")],
+            &["binlog.000010"],
+        );
+        let fresh = lineage("new", vec![], &[]);
+        let plan = plan_retention(&input(
+            vec![dead, fresh],
+            Some("new"),
+            "2026-08-27T12:00:00.000Z",
+            7,
+        ));
+        assert!(
+            plan.is_empty(),
+            "must not expire the bucket's last fulls before the active lineage has one: {plan:?}"
+        );
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("active lineage has no complete full")));
+    }
+
+    #[test]
+    fn meta_key_for_dump_pairs_the_sidecar() {
+        assert_eq!(
+            meta_key_for_dump("binlog/server-a/full/2026-08-27T00:00:00.000Z.sql.gz"),
+            "binlog/server-a/full/2026-08-27T00:00:00.000Z.meta.json"
         );
     }
 }

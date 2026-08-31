@@ -138,6 +138,45 @@ pub struct Config {
     /// same role `archive_timeout` plays for a WAL archive
     /// (BINLOG_ROTATE_INTERVAL_SECONDS).
     pub binlog_rotate_interval_seconds: u64,
+    /// How far back the archive stays restorable, in days
+    /// (BINLOG_RETENTION_DAYS). Unset — the common case — assumes
+    /// `pitr::DEFAULT_BINLOG_RETENTION_DAYS`, so every PITR service bounds its
+    /// own archive on the next redeploy without the platform stamping anything
+    /// onto the template. `None` here means the retention loop does not run
+    /// (unbounded growth); it is reached only by the explicit `0` opt-out
+    /// below, never by an unset variable.
+    ///
+    /// Defaulting in the image rather than opting in from the template is what
+    /// actually bounds the FLEET: a template stamp only reaches services
+    /// freshly materialized from the seeded template, leaving every existing
+    /// and every adopted service growing forever. It is safe to default
+    /// because `pitr::MIN_ACTIVE_FULLS_KEPT` fulls survive regardless of age,
+    /// so retention can never expire a service into being unrestorable — the
+    /// only "loss" on an image bump is archive beyond the presented window,
+    /// which is billed storage the product never surfaced.
+    ///
+    /// The horizon is the promise ("restorable to any point in the last N
+    /// days"), not the whole rule. `BINLOG_RETENTION_DAYS=0` is the deliberate
+    /// opt-out for a service that wants an unbounded archive; a malformed value
+    /// falls back to the default rather than silently disabling retention.
+    pub binlog_retention_days: Option<u64>,
+    /// Log what retention WOULD delete, and delete nothing
+    /// (BINLOG_RETENTION_DRY_RUN). For validating a horizon against a real
+    /// bucket before letting it act.
+    pub binlog_retention_dry_run: bool,
+    /// TEST-ONLY override for `pitr::RETENTION_MIN_OBJECT_AGE_SECONDS`,
+    /// defaulting to it (RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS).
+    ///
+    /// Unlike RAILWAY_TEST_ADOPTION_DETECTION_DELAY_MS, this one CAN weaken a
+    /// safety rail, so it is spelled out: the hour-long floor exists so a
+    /// just-uploaded object is never expired, and an e2e test cannot forge an
+    /// old `LastModified` (S3 stamps it on write) — without this knob the
+    /// only way to prove retention actually deletes is to wait out that hour,
+    /// which no test harness run can do.
+    ///
+    /// Never set it outside a test workspace. Production keeps the default
+    /// purely by not setting it, the same way the horizon itself is opt-in.
+    pub test_retention_min_object_age_seconds: i64,
 
     // --- PITR: restore gate (BINLOG_RECOVER_FROM_* + MYSQL_RECOVERY_TARGET_TIME) ---
     pub binlog_recover_from_bucket: Option<String>,
@@ -156,9 +195,10 @@ impl Config {
         let mysql_root_password = String::env_required("MYSQL_ROOT_PASSWORD")
             .context("MYSQL_ROOT_PASSWORD must be set")?;
 
-        let mysql_recovery_target_time = non_empty(std::env::var("MYSQL_RECOVERY_TARGET_TIME").ok())
-            .map(|raw| crate::pitr::parse_target_time(&raw))
-            .transpose()?;
+        let mysql_recovery_target_time =
+            non_empty(std::env::var("MYSQL_RECOVERY_TARGET_TIME").ok())
+                .map(|raw| crate::pitr::parse_target_time(&raw))
+                .transpose()?;
 
         let config = Self {
             mysql_root_password,
@@ -205,10 +245,25 @@ impl Config {
                 86_400,
             ),
             binlog_rotate_interval_seconds: u64::env_parse("BINLOG_ROTATE_INTERVAL_SECONDS", 60),
-
-            binlog_recover_from_bucket: non_empty(
-                std::env::var("BINLOG_RECOVER_FROM_BUCKET").ok(),
+            // Unset assumes the default horizon so the image bounds every
+            // service itself; explicit 0 is the opt-out (keep forever); a
+            // positive integer is the chosen horizon; a malformed value falls
+            // back to the default rather than silently disabling retention.
+            binlog_retention_days: match non_empty(std::env::var("BINLOG_RETENTION_DAYS").ok()) {
+                None => Some(crate::pitr::DEFAULT_BINLOG_RETENTION_DAYS),
+                Some(raw) => match raw.parse::<u64>() {
+                    Ok(0) => None,
+                    Ok(days) => Some(days),
+                    Err(_) => Some(crate::pitr::DEFAULT_BINLOG_RETENTION_DAYS),
+                },
+            },
+            binlog_retention_dry_run: bool::env_bool("BINLOG_RETENTION_DRY_RUN", false),
+            test_retention_min_object_age_seconds: i64::env_parse(
+                "RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS",
+                crate::pitr::RETENTION_MIN_OBJECT_AGE_SECONDS,
             ),
+
+            binlog_recover_from_bucket: non_empty(std::env::var("BINLOG_RECOVER_FROM_BUCKET").ok()),
             binlog_recover_from_key: non_empty(std::env::var("BINLOG_RECOVER_FROM_KEY").ok()),
             binlog_recover_from_secret: non_empty(std::env::var("BINLOG_RECOVER_FROM_SECRET").ok()),
             binlog_recover_from_region: non_empty(std::env::var("BINLOG_RECOVER_FROM_REGION").ok()),
@@ -235,11 +290,10 @@ impl Config {
             );
         }
 
-        if config.binlog_recover_from_bucket.is_some() != config.mysql_recovery_target_time.is_some()
+        if config.binlog_recover_from_bucket.is_some()
+            != config.mysql_recovery_target_time.is_some()
         {
-            bail!(
-                "BINLOG_RECOVER_FROM_BUCKET and MYSQL_RECOVERY_TARGET_TIME must be set together"
-            );
+            bail!("BINLOG_RECOVER_FROM_BUCKET and MYSQL_RECOVERY_TARGET_TIME must be set together");
         }
         if config.binlog_recover_from_bucket.is_some()
             && (config.binlog_recover_from_key.is_none()
@@ -564,6 +618,58 @@ mod tests {
         assert_eq!(config.binlog_archive_path, "/binlog");
         assert_eq!(config.binlog_full_backup_interval_seconds, 86_400);
         assert_eq!(config.binlog_rotate_interval_seconds, 60);
+        // Retention defaults in the image: an unset variable assumes the
+        // product default horizon so the archive is bounded without a template
+        // stamp. None (unbounded) is reached only by the explicit `0` opt-out.
+        assert_eq!(
+            config.binlog_retention_days,
+            Some(crate::pitr::DEFAULT_BINLOG_RETENTION_DAYS)
+        );
+        assert!(!config.binlog_retention_dry_run);
+    }
+
+    #[test]
+    fn retention_horizon_parses_and_refuses_meaningless_values() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let default = Some(crate::pitr::DEFAULT_BINLOG_RETENTION_DAYS);
+        for (raw, expected) in [
+            ("14", Some(14u64)),
+            // 0 is the explicit opt-out: keep the archive forever.
+            ("0", None),
+            // Empty and malformed fall back to the default horizon rather than
+            // silently disabling retention (the unbounded-growth bug this
+            // closes). 0 remains the only way to turn retention off.
+            ("", default),
+            ("   ", default),
+            ("seven", default),
+            ("-3", default),
+            ("3.5", default),
+        ] {
+            base_env();
+            env::set_var("BINLOG_RETENTION_DAYS", raw);
+            let config = Config::from_env().unwrap();
+            assert_eq!(
+                config.binlog_retention_days, expected,
+                "BINLOG_RETENTION_DAYS={raw:?} should parse to {expected:?}"
+            );
+            env::remove_var("BINLOG_RETENTION_DAYS");
+        }
+    }
+
+    #[test]
+    fn retention_dry_run_is_opt_in() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        env::set_var("BINLOG_RETENTION_DAYS", "14");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.binlog_retention_days, Some(14));
+        assert!(!config.binlog_retention_dry_run);
+
+        env::set_var("BINLOG_RETENTION_DRY_RUN", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.binlog_retention_dry_run);
+        env::remove_var("BINLOG_RETENTION_DRY_RUN");
+        env::remove_var("BINLOG_RETENTION_DAYS");
     }
 
     #[test]

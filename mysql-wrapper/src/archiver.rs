@@ -1,7 +1,7 @@
 //! Continuous binlog archiving to an S3-compatible bucket — standalone mode
 //! only (see main.rs's gate: this is never spawned while GR_SEEDS is set).
 //!
-//! Three independent loops, spawned together by `run` once mysqld is ready:
+//! Four independent loops, spawned together by `run` once mysqld is ready:
 //!   - full backups: one immediately if the bucket holds none for this
 //!     server_uuid, then every `BINLOG_FULL_BACKUP_INTERVAL_SECONDS`.
 //!   - binlog shipping (~every 10s): upload every CLOSED binlog not yet
@@ -12,6 +12,14 @@
 //!   - rotation: `FLUSH BINARY LOGS` every `BINLOG_ROTATE_INTERVAL_SECONDS`,
 //!     bounding the recovery point objective — the same role
 //!     `archive_timeout` plays for a WAL archive.
+//!   - retention (hourly, on by default; off only when `BINLOG_RETENTION_DAYS`
+//!     is explicitly `0`): expire archive objects outside the promised window.
+//!     The horizon defaults to `pitr::DEFAULT_BINLOG_RETENTION_DAYS`. Note the
+//!     asymmetry with
+//!     the reclaim above: that one frees LOCAL disk and never touches the
+//!     bucket, this one is the only thing that ever deletes from the bucket.
+//!     All of its rules live in `pitr::plan_retention` so they are testable
+//!     without a bucket; this module only executes a plan.
 //!
 //! Every failure is logged loudly (and reported via telemetry) and retried
 //! on the next cycle; nothing here may ever crash mysqld or block its
@@ -103,6 +111,13 @@ pub async fn run(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
         sql.clone(),
         telemetry.clone(),
     ));
+    let retention_task = tokio::spawn(retention_loop(
+        config.clone(),
+        telemetry.clone(),
+        s3.clone(),
+        location.clone(),
+        server_uuid.clone(),
+    ));
 
     // None of these loops return in normal operation; if one panics, say so
     // loudly instead of the archiver silently going dark (mirrors
@@ -111,6 +126,7 @@ pub async fn run(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
         ("full_backup", full_task),
         ("binlog_shipping", ship_task),
         ("rotation", rotate_task),
+        ("retention", retention_task),
     ] {
         if let Err(e) = task.await {
             error!(loop_name = name, error = ?e, "PITR archiver loop exited unexpectedly");
@@ -224,10 +240,8 @@ async fn take_full_backup(
     // way the boot pool does, at every attempt so a rotated pin is picked
     // up without restarting the archiver.
     let dump_pin = crate::password_pin::read_pin(&config.data_dir);
-    let dump_password = crate::password_pin::initial_password(
-        &config.mysql_root_password,
-        dump_pin.as_deref(),
-    );
+    let dump_password =
+        crate::password_pin::initial_password(&config.mysql_root_password, dump_pin.as_deref());
 
     let mut mysqldump = Command::new("mysqldump")
         .arg(format!("--socket={}", config.socket_path))
@@ -377,6 +391,274 @@ async fn binlog_shipping_loop(
         }
         tokio::time::sleep(SHIP_POLL).await;
     }
+}
+
+// --- archive retention ------------------------------------------------------
+
+/// Sweep cadence. Slow on purpose: retention is a housekeeping job whose
+/// horizon is measured in days, and every pass lists the whole archive.
+const RETENTION_POLL: Duration = Duration::from_secs(3600);
+
+/// Delay before the FIRST sweep, so a boot storm never has several containers
+/// listing and deleting at once, and so this server's own lineage has had time
+/// to establish itself (the planner refuses to act before that anyway).
+const RETENTION_INITIAL_DELAY: Duration = Duration::from_secs(300);
+
+async fn retention_loop(
+    config: Arc<Config>,
+    telemetry: Arc<Telemetry>,
+    s3: S3Client,
+    location: S3Location,
+    server_uuid: String,
+) {
+    let Some(days) = config.binlog_retention_days else {
+        info!(
+            "BINLOG_RETENTION_DAYS=0; retention is opted out and the archive is never expired \
+             (unbounded growth). Unset it, or set a positive horizon, to bound storage."
+        );
+        return;
+    };
+    let horizon = chrono::Duration::days(days as i64);
+    info!(
+        retention_days = days,
+        dry_run = config.binlog_retention_dry_run,
+        min_active_fulls_kept = pitr::MIN_ACTIVE_FULLS_KEPT,
+        "PITR archive retention enabled"
+    );
+
+    tokio::time::sleep(RETENTION_INITIAL_DELAY).await;
+    loop {
+        if let Err(e) = retention_pass(&config, &s3, &location, &server_uuid, horizon).await {
+            warn!(error = %e, "retention pass failed; retrying next cycle");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "mysql-wrapper".to_string(),
+                error: e.to_string(),
+                context: "pitr_retention".to_string(),
+            });
+        }
+        tokio::time::sleep(RETENTION_POLL).await;
+    }
+}
+
+/// One sweep: read the whole archive, plan, then delete exactly what the plan
+/// names — nothing is decided here, so every rule stays unit-testable in
+/// `pitr::plan_retention`.
+async fn retention_pass(
+    config: &Config,
+    s3: &S3Client,
+    location: &S3Location,
+    server_uuid: &str,
+    horizon: chrono::Duration,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    let lineages = read_archive_lineages(s3, location, now).await?;
+    let input = pitr::RetentionInput {
+        lineages,
+        // Passing our OWN uuid is what makes "dead lineage" meaningful. The
+        // planner refuses to expire anything when this is None.
+        active_server_uuid: Some(server_uuid.to_string()),
+        now,
+        horizon,
+    };
+    let plan = pitr::plan_retention(&input);
+
+    for note in &plan.notes {
+        info!(note = %note, "retention");
+    }
+    if plan.is_empty() {
+        return Ok(());
+    }
+    if config.binlog_retention_dry_run {
+        info!(
+            objects = plan.object_count(),
+            fulls = plan.expired_full_keys.len(),
+            binlogs = plan.expired_binlogs.len(),
+            orphans = plan.orphan_dump_keys.len(),
+            retired_lineages = ?plan.retired_lineages,
+            "BINLOG_RETENTION_DRY_RUN is set; would delete these objects but will not"
+        );
+        for key in plan.expired_full_keys.iter().chain(&plan.orphan_dump_keys) {
+            info!(key = %key, "retention (dry run) would delete");
+        }
+        for (uuid, name) in &plan.expired_binlogs {
+            info!(key = %pitr::binlog_key(location, uuid, name), "retention (dry run) would delete");
+        }
+        return Ok(());
+    }
+
+    // The absolute age rail, enforced here because this is where an object's
+    // real last-modified time is available. A policy bug upstream cannot get
+    // past it: whatever the plan says, nothing younger than
+    // RETENTION_MIN_OBJECT_AGE_SECONDS is deleted (the config field defaults
+    // to exactly that constant; only a test workspace ever overrides it).
+    let min_age = chrono::Duration::seconds(config.test_retention_min_object_age_seconds);
+    let mut deleted = 0usize;
+    let mut spared_young = 0usize;
+
+    let binlog_keys: Vec<String> = plan
+        .expired_binlogs
+        .iter()
+        .map(|(uuid, name)| pitr::binlog_key(location, uuid, name))
+        .collect();
+
+    for key in plan
+        .expired_full_keys
+        .iter()
+        .chain(&plan.orphan_dump_keys)
+        .chain(&binlog_keys)
+    {
+        match s3.last_modified(key).await {
+            Ok(Some(modified)) if now - modified < min_age => {
+                spared_young += 1;
+                continue;
+            }
+            Ok(None) => continue, // already gone
+            Ok(Some(_)) => {}
+            Err(e) => {
+                // Could not establish the age: keep it. An unreadable HEAD is
+                // never a licence to delete a backup.
+                warn!(error = %e, %key, "could not read object age; keeping it this pass");
+                continue;
+            }
+        }
+        match s3.delete_object(key).await {
+            Ok(()) => {
+                deleted += 1;
+                info!(%key, "retention deleted");
+            }
+            Err(e) => warn!(error = %e, %key, "retention could not delete an object; will retry"),
+        }
+    }
+
+    info!(
+        deleted,
+        spared_young,
+        retired_lineages = ?plan.retired_lineages,
+        "retention pass complete"
+    );
+    Ok(())
+}
+
+/// Group the whole archive into per-lineage objects for the planner. Reads
+/// every `full/*.meta.json` (the completeness marker: the dump is uploaded
+/// first, the meta after, so a dump without one is incomplete), and HEADs only
+/// the orphan dumps, whose age is not recoverable any other way.
+async fn read_archive_lineages(
+    s3: &S3Client,
+    location: &S3Location,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<pitr::LineageObjects>> {
+    use std::collections::BTreeMap;
+
+    let base = pitr::base_prefix(location);
+    let keys = s3
+        .list_keys_with_prefix(&base)
+        .await
+        .context("listing the PITR archive bucket for retention")?;
+
+    struct Raw {
+        metas: Vec<String>,
+        dumps: BTreeSet<String>,
+        binlogs: Vec<String>,
+    }
+    let mut per_lineage: BTreeMap<String, Raw> = BTreeMap::new();
+
+    for key in &keys {
+        let Some(uuid) = pitr::server_uuid_from_key(location, key) else {
+            continue;
+        };
+        let entry = per_lineage.entry(uuid).or_insert_with(|| Raw {
+            metas: Vec::new(),
+            dumps: BTreeSet::new(),
+            binlogs: Vec::new(),
+        });
+        if key.contains("/full/") {
+            if key.ends_with(".meta.json") {
+                entry.metas.push(key.clone());
+            } else if key.ends_with(".sql.gz") {
+                entry.dumps.insert(key.clone());
+            }
+        } else if key.contains("/binlog/") {
+            if let Some(name) = key.rsplit('/').next() {
+                entry.binlogs.push(name.to_string());
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (uuid, raw) in per_lineage {
+        let mut fulls = Vec::new();
+        let mut paired_dumps: BTreeSet<String> = BTreeSet::new();
+        for meta_key in &raw.metas {
+            let Some(stem) = meta_key.strip_suffix(".meta.json") else {
+                continue;
+            };
+            let dump_key = format!("{stem}.sql.gz");
+            // A meta whose dump is gone is not a restorable full. Record the
+            // pairing anyway so the dump is not then also treated as an
+            // orphan, and let the meta itself age out with its lineage.
+            paired_dumps.insert(dump_key.clone());
+            if !raw.dumps.contains(&dump_key) {
+                warn!(%meta_key, "full-backup meta has no dump object; not counting it as restorable");
+                continue;
+            }
+            let bytes = match s3.get_object_bytes(meta_key).await {
+                Ok(b) => b,
+                Err(e) => {
+                    // Unreadable meta: leave it out of `fulls` so it is
+                    // neither counted as retainable nor listed for deletion.
+                    // `full_objects_seen` below is what stops the planner
+                    // reading this omission as "the lineage has no fulls".
+                    warn!(error = %e, %meta_key, "could not read a full-backup meta.json during retention; keeping this full");
+                    paired_dumps.insert(dump_key);
+                    continue;
+                }
+            };
+            let meta: FullBackupMeta = match serde_json::from_slice(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, %meta_key, "could not parse a full-backup meta.json during retention; keeping this full");
+                    continue;
+                }
+            };
+            fulls.push(pitr::FullBackupRef {
+                server_uuid: uuid.clone(),
+                dump_key,
+                meta,
+            });
+        }
+
+        let mut orphan_dumps = Vec::new();
+        for dump_key in &raw.dumps {
+            if paired_dumps.contains(dump_key) {
+                continue;
+            }
+            match s3.last_modified(dump_key).await {
+                Ok(Some(modified)) => orphan_dumps.push((dump_key.clone(), modified)),
+                // No age readable: pass `now` so it always looks too young to
+                // expire, i.e. keep it.
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(error = %e, %dump_key, "could not read an orphan dump's age; keeping it");
+                    orphan_dumps.push((dump_key.clone(), now));
+                }
+            }
+        }
+
+        out.push(pitr::LineageObjects {
+            server_uuid: uuid,
+            fulls,
+            // Every full-backup meta OBJECT the bucket holds, not just the
+            // ones parsed above. This is what lets the planner tell "no fulls
+            // here" apart from "its fulls exist but this pass could not read
+            // them" — the second must never make a lineage's binlogs
+            // expirable.
+            full_objects_seen: raw.metas.len(),
+            orphan_dumps,
+            binlogs: raw.binlogs,
+        });
+    }
+    Ok(out)
 }
 
 async fn ship_once(
