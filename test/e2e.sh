@@ -205,6 +205,21 @@ wait_until() {
 
 group_is_fully_online() { has_n_online "$1" 3; }
 
+# any_role_200 <probe> <nodes...> — exit 0 when any listed node's /role
+# answers 200. The view can report the group fully ONLINE one classify
+# round (3s poll) before the wrapper lifts the membership write fence, so
+# /role legitimately answers 503 for those seconds right after a
+# re-formation; callers poll this instead of probing the instant ONLINE
+# is observed.
+any_role_200() {
+  local probe="$1"; shift
+  local n
+  for n in "$@"; do
+    docker exec "$probe" wget -q -O /dev/null "http://$n:8080/role" 2>/dev/null && return 0
+  done
+  return 1
+}
+
 # current_primary — prints the node name (mysql-N) whose /role answers 200,
 # probing from mysql-2 (any live node works as probe origin).
 current_primary() {
@@ -311,11 +326,27 @@ t_cold_restart_preserves_group() {
     bad "data lost after cold restart (got: '$v')"
   fi
 
-  local codes
+  # The view can report the group fully ONLINE one classify round (3s poll)
+  # before the wrapper lifts the membership write fence, so /role legitimately
+  # answers 503 for a few seconds right after a re-formation. Poll briefly
+  # for exactly one 200 instead of probing the instant ONLINE is observed.
+  local codes n200 waited=0
   codes="$(role_code mysql-2 mysql-1)/$(role_code mysql-2 mysql-2)/$(role_code mysql-2 mysql-3)"
-  local twohundreds
-  twohundreds="$(echo "$codes" | tr '/' '\n' | grep -c 200)"
-  if [ "$twohundreds" = "1" ]; then
+  n200="$(printf '%s\n' "$codes" | tr '/' '\n' | grep -c 200)"
+  while [ "$n200" != "1" ] && [ "$waited" -lt 30 ]; do
+    # Zero 200s is the fence still lifting, which is what this poll waits
+    # out. Two 200s is two nodes serving as writable primary at once — a
+    # safety violation, never something to wait out. Fail on it immediately
+    # so the poll cannot turn a dual-primary flicker into a pass.
+    if [ "$n200" -gt 1 ]; then
+      bad "expected exactly one 200 after cold restart, got $codes"
+      return
+    fi
+    sleep 3; waited=$((waited+3))
+    codes="$(role_code mysql-2 mysql-1)/$(role_code mysql-2 mysql-2)/$(role_code mysql-2 mysql-3)"
+    n200="$(printf '%s\n' "$codes" | tr '/' '\n' | grep -c 200)"
+  done
+  if [ "$n200" = "1" ]; then
     ok "exactly one primary after cold restart ($codes)"
   else
     bad "expected exactly one 200 after cold restart, got $codes"
@@ -697,7 +728,16 @@ t_patch_skew_on_redeploy() {
   v2_ver="$(sql mysql-2 "SELECT @@version")"
   ok "mixed-patch group healthy: mysql-2 on $v2_ver, siblings on $before_ver"
 
+  # Answering local SQL is not the same as having replayed the recovery
+  # backlog: the member accepts connections while its applier is still
+  # catching up, so the pre-skew row can legitimately read empty for a few
+  # seconds. The 2026-08-26 run read '' here and then saw the k=2 write —
+  # issued AFTER this read — replicate 24s later, and GR applies in order, so
+  # k=1 had landed too. Poll the row like the k=2 check below does; a row
+  # that is genuinely gone still fails, with the same message.
   local v
+  wait_until 60 "pre-skew row applied on the patch-upgraded member" \
+    bash -c '[ "$(docker exec mysql-2 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null)" = "pre-skew" ]'
   v="$(sql mysql-2 "SELECT v FROM t.kv WHERE k=1")"
   [ "$v" = "pre-skew" ] \
     && ok "data intact on the patch-upgraded member" \
@@ -889,10 +929,18 @@ t_password_variable_edit_does_not_rotate() {
   wait_until 300 "group re-forms on the pinned password" group_is_fully_online mysql-1 \
     || { bad "group never re-formed after the variable edit (wrapper locked out?)"; return; }
 
+  # Same classify-round lag as the cold restart: /role can answer 503 for a
+  # few seconds after the group reports ONLINE while the write fence lifts.
+  # The wait itself is the assertion — poll instead of probing once.
   local primary
-  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" \
-    && ok "a writable primary is being served ($primary)" \
-    || { bad "no node answers /role 200 after the variable edit"; return; }
+  if wait_until 30 "a writable primary is being served" \
+      any_role_200 mysql-2 mysql-1 mysql-2 mysql-3; then
+    primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)"
+    ok "a writable primary is being served ($primary)"
+  else
+    bad "no node answers /role 200 after the variable edit"
+    return
+  fi
 
   [ "$(sql mysql-1 "SELECT v FROM t.kv WHERE k=10")" = "before-drift" ] \
     && ok "original password still authenticates and the data is intact" \
@@ -1500,7 +1548,10 @@ t_restore_identical_datadirs() {
   [ "$v" = "survives-restore" ] \
     && ok "restored dataset intact on a replica" \
     || bad "restored dataset missing on a replica (got '$v')"
-  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary after restore"; return; }
+  wait_until 30 "a primary serves /role after the restore" \
+    any_role_200 mysql-2 mysql-1 mysql-2 mysql-3 \
+    || { bad "no primary after restore"; return; }
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)"
   sql "$primary" "INSERT INTO t.kv VALUES (61,'post-restore') ON DUPLICATE KEY UPDATE v='post-restore';"
   wait_until 60 "post-restore write replicated" \
     bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=61" 2>/dev/null)" = "post-restore" ]' \
@@ -1563,7 +1614,11 @@ t_boot_wedged_member_self_heals() {
   wait_until 120 "healed member answers SQL locally" \
     bash -c '[ -n "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT 1" 2>/dev/null)" ]' \
     || { bad "healed member never accepted local SQL"; return; }
-  [ "$(sql mysql-3 "SELECT v FROM t.kv WHERE k=80")" = "pre-corruption" ] \
+  # A member can show ONLINE in the view a moment before its applier has
+  # replayed the clone backlog, so poll for the pre-corruption row like the
+  # post-heal write below instead of SELECTing once.
+  wait_until 60 "pre-corruption data recovered onto the healed member" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=80" 2>/dev/null)" = "pre-corruption" ]' \
     && ok "pre-corruption data recovered onto the healed member" \
     || bad "healed member is missing the dataset"
 

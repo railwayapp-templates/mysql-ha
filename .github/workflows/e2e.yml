@@ -17,8 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     # MySQL nodes are slow to boot/clone compared to redis; the full suite
     # also builds a second wrapper image in-scenario (patch skew) and pulls
-    # the previous-LTS seed image (cross-version conversion).
-    timeout-minutes: 60
+    # the previous-LTS seed image (cross-version conversion). The suite
+    # paced ~52 min on 2026-08-27 but ~60 on 2026-08-31 runners, and the
+    # 60-min cap cut a run mid-suite with no log blob left to autopsy
+    # (cancelled 2026-08-31 01:04Z). 90 fits the suite plus variance
+    # without masking a hang: every scenario still fails on its own
+    # internal waits, far below the cap.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout sources
