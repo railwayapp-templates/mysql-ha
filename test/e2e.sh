@@ -87,10 +87,20 @@ start_node() {
 
 start_trio() { start_node 1; start_node 2; start_node 3; }
 
+# Reaps the trio AND any node the scale-up chain added beside it. Every
+# caller wants a clean slate, and t_scale_up_to_five starts mysql-4/mysql-5,
+# which no scenario of its own removes — a node left behind holds ~650MiB of
+# resident mysqld and a Group Replication retry loop for the ~37 minutes of
+# suite that follow it, so the scenarios after the chain get five live mysqld
+# to run against instead of three. Both spellings are swept because the
+# scale-up nodes are started with no NODE_SUFFIX, and the suffixed scenarios
+# have to clear them too.
 teardown_trio() {
-  local s="${NODE_SUFFIX:-}"
-  docker rm -f "mysql-1$s" "mysql-2$s" "mysql-3$s" >/dev/null 2>&1
-  docker volume rm mysql-ha-e2e-vol-1 mysql-ha-e2e-vol-2 mysql-ha-e2e-vol-3 >/dev/null 2>&1
+  local s="${NODE_SUFFIX:-}" n
+  for n in 1 2 3 4 5; do
+    docker rm -f "mysql-$n$s" "mysql-$n" >/dev/null 2>&1
+    docker volume rm "mysql-ha-e2e-vol-$n" >/dev/null 2>&1
+  done
 }
 
 # start_standalone <name> [extra docker args...] — boots a standalone
@@ -274,6 +284,24 @@ wait_until() {
       return 1
     fi
   done
+}
+
+# resources — host memory and live-container count. The suite runs
+# unbounded mysqld processes (no --memory, so each sizes its buffer pool from
+# the 512MB no-cgroup fallback and settles around 660MiB resident) next to a
+# full Rust image build, and when the runner runs out of RAM the kernel kills
+# the harness mid-statement: run 33450193087 died to SIGKILL 48 minutes in
+# with nothing in the log to say how much memory was in use, and the
+# `if: always()` log upload never got to run either. Printed per scenario so
+# the next one is diagnosable from the job log alone. Linux-only; a no-op on
+# a developer's machine, where /proc/meminfo does not exist.
+resources() {
+  [ -r /proc/meminfo ] || return 0
+  local avail total live
+  avail="$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)"
+  total="$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)"
+  live="$(docker ps -q --filter "label=$LABEL" | wc -l | tr -d ' ')"
+  log "resources: ${avail}/${total} MiB available, $live container(s) up"
 }
 
 group_is_fully_online() { has_n_online "$1" 3; }
@@ -762,12 +790,19 @@ t_conversion_cross_version_upgrade() {
 t_patch_skew_on_redeploy() {
   local old_image="mysql-ha-e2e:8.4.0"
   log "t_patch_skew_on_redeploy (group on 8.4.0; one member redeploys onto $IMAGE)"
+  # Tear the previous scenario's group down BEFORE the build, not after: this
+  # is a full Rust release build of the workspace, the heaviest thing the
+  # suite does, and it took 8m15s on the CI runner on 2026-08-31. Building it
+  # while the last group is still up parks every one of those nodes' mysqld
+  # next to a parallel cargo build for the whole of it, which is the memory
+  # peak of the entire job. Nothing here needs that group — the scenario
+  # boots its own trio on the old patch below.
+  teardown_trio
   docker image inspect "$old_image" >/dev/null 2>&1 || {
     log "building $old_image"
     docker build -t "$old_image" -f mysql-wrapper/Dockerfile \
       --build-arg MYSQL_VERSION=8.4.0 . || { bad "old-patch image build failed"; return; }
   }
-  teardown_trio
 
   # Production reality this reproduces: data nodes carry the moving :8.4 tag
   # with NO auto-update, but ANY redeploy re-pulls the tag — a user redeploy,
@@ -2402,6 +2437,7 @@ main() {
   [ ${#tests[@]} -eq 0 ] && tests=("${ALL_TESTS[@]}")
 
   for t in "${tests[@]}"; do
+    resources
     "$t"
   done
 
