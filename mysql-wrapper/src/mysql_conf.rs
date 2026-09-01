@@ -229,12 +229,19 @@ pub const ARCHIVE_CONF_FILE_NAME: &str = "zz-railway-pitr-archive.cnf";
 
 /// Standalone + `BINLOG_ARCHIVE_BUCKET` set: the plain standalone rendering
 /// (no file at all — see main.rs) leaves the binlog off, same as the
-/// upstream image. Archiving needs it on; this is the ONLY difference from
-/// that plain rendering. Written to its own file, separate from
-/// `CONF_FILE_NAME`, since the two are mutually exclusive (GR mode never
+/// upstream image. Archiving needs it on. Written to its own file, separate
+/// from `CONF_FILE_NAME`, since the two are mutually exclusive (GR mode never
 /// reaches this path — see main.rs's standalone-only gate).
+///
+/// It also has to carry the server tuning the published `mysql` template
+/// passes on its command line, because enabling PITR CLEARS that command: the
+/// archiver only runs when the image's own entrypoint does, so the platform
+/// replaces the image and drops the start command it came with. Everything
+/// that command configured has to be re-established here or the customer
+/// silently loses it on enable — see the fields below.
 pub struct StandaloneArchiveConfInput {
     pub server_id: u32,
+    pub buffer_pool_bytes: u64,
 }
 
 pub fn render_standalone_archive_conf(input: &StandaloneArchiveConfInput) -> String {
@@ -250,6 +257,27 @@ log_bin = binlog
 binlog_format = ROW
 sync_binlog = 1
 
+# Carried over from the published `mysql` template's start command, which
+# enabling PITR clears (the archiver needs this image's entrypoint, and the
+# entrypoint is what a start command overrides). Without these three the
+# transition would silently hand the customer a differently-tuned server.
+#
+# Native AIO stays off: the standalone template disables it, and on a host
+# whose aio-max-nr is exhausted io_setup() fails with EAGAIN and mysqld
+# aborts on startup rather than degrading — the failure mode that flag
+# exists to prevent. InnoDB falls back to synchronous I/O.
+innodb_use_native_aio = 0
+
+# performance_schema stays off, as the standalone template has it. GR needs
+# it (render_gr_conf turns it ON) but nothing on this path reads it, and it
+# costs hundreds of MB on a container sized without it.
+performance_schema = OFF
+
+# Sized from the container instead of the template's hardcoded 1G — see
+# buffer_pool_bytes, which exists because that constant OOMs small containers
+# and wastes big ones. INNODB_BUFFER_POOL_MB overrides.
+innodb_buffer_pool_size = {buffer_pool}
+
 # The archiver reclaims a closed binlog itself once it has confirmed the
 # upload (see archiver.rs's PURGE BINARY LOGS TO) — and NOTHING else may:
 # auto-expiry is disabled outright, because mysqld's own purge cannot know
@@ -262,6 +290,7 @@ sync_binlog = 1
 binlog_expire_logs_seconds = 0
 "#,
         server_id = input.server_id,
+        buffer_pool = input.buffer_pool_bytes,
     )
 }
 
@@ -269,7 +298,13 @@ binlog_expire_logs_seconds = 0
 /// spawned, same requirement as `write_gr_conf`. Never called when GR_SEEDS
 /// is set — main.rs gates archiving to standalone only.
 pub fn write_standalone_archive_conf(config: &Config, server_id: u32) -> Result<()> {
-    let content = render_standalone_archive_conf(&StandaloneArchiveConfInput { server_id });
+    let content = render_standalone_archive_conf(&StandaloneArchiveConfInput {
+        server_id,
+        buffer_pool_bytes: buffer_pool_bytes(
+            read_cgroup_memory_limit(),
+            config.innodb_buffer_pool_mb,
+        ),
+    });
     let path = Path::new(&config.conf_dir).join(ARCHIVE_CONF_FILE_NAME);
     std::fs::create_dir_all(&config.conf_dir)
         .with_context(|| format!("creating {}", config.conf_dir))?;
@@ -365,12 +400,21 @@ mod tests {
 
     #[test]
     fn standalone_archive_conf_renders_the_load_bearing_directives() {
-        let conf = render_standalone_archive_conf(&StandaloneArchiveConfInput { server_id: 1 });
+        let conf = render_standalone_archive_conf(&StandaloneArchiveConfInput {
+            server_id: 1,
+            buffer_pool_bytes: 536870912,
+        });
         for directive in [
             "server_id = 1",
             "log_bin = binlog",
             "binlog_format = ROW",
             "sync_binlog = 1",
+            // Enabling PITR clears the start command the published `mysql`
+            // template shipped, so everything it configured has to be
+            // re-established here or the customer silently loses it.
+            "innodb_use_native_aio = 0",
+            "performance_schema = OFF",
+            "innodb_buffer_pool_size = 536870912",
             // Auto-expiry DISABLED on an archiving node: mysqld's own purge
             // cannot know what has shipped, so any nonzero expiry can reclaim
             // a not-yet-uploaded binlog and punch a silent, permanent hole
