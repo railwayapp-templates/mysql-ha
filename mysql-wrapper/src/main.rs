@@ -100,6 +100,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Now that the volume lock proves no other container runs against this
+    // data, any mysqld socket lock in this container's /var/run is a leftover
+    // of a previous life (crash, killed restore-phase server, restart-policy
+    // restart) whose recorded PID is routinely alive again as one of our own
+    // threads — mysqld would refuse to start against it forever. See
+    // process_manager::clear_stale_socket_locks.
+    process_manager::clear_stale_socket_locks(&config.socket_path);
+
     // A PITR restore that crashed mid-way leaves the datadir in an unknown,
     // partially-loaded state. Everything in that datadir is derived from the
     // recovery bucket by construction (a restore only ever runs on an
