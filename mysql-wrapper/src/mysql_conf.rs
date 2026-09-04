@@ -23,6 +23,11 @@
 //!     standalone volumes, because Railway's standalone template runs with
 //!     `--disable-log-bin` — there is no anonymous-transaction binlog history
 //!     to migrate through the staged gtid_mode dance.
+//!   - `group_replication_gtid_assignment_block_size = 1`: the default
+//!     (1,000,000) opens a same-sized, un-lost gap in the group's GTID
+//!     sequence on every switchover/failover to a member generating its
+//!     first transaction, which PITR's hole check cannot distinguish from
+//!     real data loss. Harmless to pin at 1 in single-primary mode.
 
 use crate::config::Config;
 use anyhow::{Context, Result};
@@ -170,6 +175,15 @@ loose-group_replication_communication_stack = MYSQL
 loose-group_replication_local_address = {private_domain}:{mysql_port}
 loose-group_replication_group_seeds = {gr_seeds}
 loose-group_replication_paxos_single_leader = ON
+# The default (1,000,000) lets every member pre-reserve a disjoint block of
+# GTID numbers under the group's own UUID, so a switchover or failover to a
+# member that had never generated one before jumps straight to that member's
+# block start — a gap of up to ~1,000,000 unused (never allocated, so never
+# lost) sequence numbers that PITR's completeness check cannot tell apart
+# from a real archived-binlog hole. Pinning this to 1 keeps the group's GTID
+# sequence gapless in single-primary mode, where only one member ever writes
+# at a time and the block's collision-avoidance purpose does not apply.
+loose-group_replication_gtid_assignment_block_size = 1
 # caching_sha2_password without client-side TLS certs needs RSA key exchange
 # on the recovery channel.
 loose-group_replication_recovery_get_public_key = ON
@@ -343,6 +357,7 @@ mod tests {
             "loose-group_replication_group_name = aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             "loose-group_replication_local_address = mysql-1.railway.internal:3306",
             "loose-group_replication_group_seeds = mysql-1.railway.internal:3306,mysql-2.railway.internal:3306",
+            "loose-group_replication_gtid_assignment_block_size = 1",
             "plugin-load-add = group_replication.so",
             "plugin-load-add = mysql_clone.so",
             "innodb_buffer_pool_size = 536870912",
