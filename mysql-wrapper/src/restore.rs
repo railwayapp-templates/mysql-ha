@@ -1,5 +1,11 @@
 //! Restore-on-boot to an arbitrary timestamp — standalone mode only (see
-//! main.rs's gate: this is never invoked while GR_SEEDS is set).
+//! main.rs's gate: this is never invoked while GR_SEEDS is set; a restore
+//! produces a new standalone server, whatever archived into the bucket).
+//!
+//! The archive it reads may be either kind pitr.rs describes: one
+//! standalone server's independent lineages, or one Group Replication
+//! group's shared history archived by whichever member was primary. The
+//! full's meta says which (`gtid_purged`), and step 5 below branches on it.
 //!
 //! Only runs against an UNINITIALIZED datadir (a fresh volume) — main.rs
 //! checks `Config::datadir_is_initialized()` before calling `run` at all, so
@@ -27,12 +33,24 @@
 //!      and nothing routes to a boot this fresh regardless.
 //!   4. Load the selected full backup (`gunzip -c | mysql`, streamed
 //!      straight from the bucket — nothing stages the whole dump on disk).
-//!   5. Replay the lineage's binlogs from the full's own coordinate up to
-//!      the target time. A sequence gap with binlogs still present past it
-//!      FAILS the restore loudly (see replay_binlogs) — replaying short of
-//!      the target and reporting success would silently lose everything
-//!      after the hole. The ACHIEVED recovery point is then verified against
-//!      the target (see verify_achieved_point): mysqlbinlog exits 0 when the
+//!   5. Replay binlogs up to the target time.
+//!      - Independent history (anonymous transactions): the full's own
+//!        lineage from its recorded coordinate. A sequence gap with binlogs
+//!        still present past it FAILS the restore loudly (see
+//!        replay_binlogs) — replaying short of the target and reporting
+//!        success would silently lose everything after the hole.
+//!      - Shared history (GTIDs): the full's lineage from its coordinate,
+//!        then EVERY other lineage from its first archived file (see
+//!        replay_shared_history). The restore-phase mysqld runs with
+//!        gtid_mode=ON_PERMISSIVE so the dump's GTID set loads and the
+//!        server skips each GTID it already holds, whichever lineage
+//!        delivers it — that is what makes a failed-over primary's
+//!        never-uploaded tail recoverable from the next primary's lineage.
+//!        Completeness is then proven on the result, not assumed from the
+//!        file names: a hole in any UUID's `gtid_executed` interval set, or
+//!        a dump transaction missing from it, FAILS the restore loudly.
+//!      Either way the ACHIEVED recovery point is verified against the
+//!      target (see verify_achieved_point): mysqlbinlog exits 0 when the
 //!      logs simply end before --stop-datetime, so an archive that stopped
 //!      shipping hours before the target would otherwise "succeed" silently;
 //!      more than a rotation-bounded lag behind the target fails as loudly
@@ -50,6 +68,7 @@ use crate::sql::Sql;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -58,6 +77,36 @@ use tracing::{error, info, warn};
 
 const RESTORE_STATE_FILE: &str = ".pitr_restore_state.json";
 const SCRATCH_DIR: &str = ".pitr_restore_binlogs";
+
+/// Extra mysqld flags for the restore-phase server when the archive is one
+/// shared GTID history (see the module doc). Replaying another lineage
+/// relies on the server skipping GTIDs it already holds, so the phase runs
+/// with GTIDs on; enforce_gtid_consistency=ON is what any gtid_mode above
+/// OFF_PERMISSIVE requires. Which gtid_mode depends on the selected full:
+///
+///   - A GTID full (its meta carries `gtid_purged`) loads a dump that sets
+///     `@@GLOBAL.GTID_PURGED`, and everything replayed after it is GTID
+///     binlogs (its own lineage from the dump coordinate onward, other
+///     members' lineages) — `gtid_mode=ON`, the mode GTID_PURGED is
+///     documented to load under, and the strictest.
+///   - An anonymous full (a standalone server later converted to HA; the
+///     archive is shared only by the marker) has no GTID set to load, and
+///     its own lineage continues with anonymous binlogs BEFORE the GTID ones
+///     begin — only `ON_PERMISSIVE` accepts both in one replay.
+///
+/// Restore-phase only: the serving mysqld main.rs starts afterwards is
+/// spawned with the service's own args.
+fn shared_history_restore_args(full: &FullBackupRef) -> [String; 2] {
+    let gtid_mode = if full.meta.gtid_purged.is_some() {
+        "ON"
+    } else {
+        "ON_PERMISSIVE"
+    };
+    [
+        format!("--gtid-mode={gtid_mode}"),
+        "--enforce-gtid-consistency=ON".to_string(),
+    ]
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -236,12 +285,37 @@ pub async fn run(config: &Config) -> Result<()> {
         server_uuid = %full.server_uuid,
         dump_key = %full.dump_key,
         taken_at = %pitr::format_rfc3339_millis(full.meta.taken_at),
+        gtid_purged = ?full.meta.gtid_purged,
         "selected full backup for restore"
     );
 
+    // One GTID full anywhere, or the marker a group primary writes when it
+    // starts archiving, marks the archive as one shared history (the same
+    // test retention applies — pitr::archive_shares_history plus the
+    // marker): a lineage that never dumped has nothing else to declare
+    // itself with, and erring this way only ever replays MORE — which the
+    // server dedups. The marker read fails the restore rather than guessing:
+    // misreading a shared history as independent would replay one lineage
+    // under gtid_mode=OFF and refuse its GTID binlogs half-way.
+    let shared_history = fulls.iter().any(|f| f.meta.gtid_purged.is_some())
+        || s3
+            .exists(&pitr::shared_history_marker_key(&location))
+            .await
+            .context("checking the archive for the shared-history marker")?;
+
     // Same invocation as any other boot — docker-entrypoint.sh sees the
-    // empty datadir and runs its normal first-boot init.
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // empty datadir and runs its normal first-boot init — plus, for a
+    // shared history, the GTID flags the replay depends on.
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if shared_history {
+        let gtid_args = shared_history_restore_args(&full);
+        info!(
+            gtid_args = ?gtid_args,
+            "the archive is one shared GTID history (Group Replication); the restore-phase \
+             mysqld runs with GTIDs on and every lineage is replayed"
+        );
+        args.extend(gtid_args);
+    }
     let mut child = process_manager::spawn_mysqld(&args)
         .await
         .context("spawning the restore-phase mysqld")?;
@@ -261,9 +335,12 @@ pub async fn run(config: &Config) -> Result<()> {
         .context("loading the full backup")?;
     info!("full backup loaded");
 
-    let achieved = replay_binlogs(&s3, &location, &fulls, &full, target, config)
-        .await
-        .context("replaying binlogs")?;
+    let achieved = if shared_history {
+        replay_shared_history(&s3, &location, &fulls, &full, target, config, &sql).await
+    } else {
+        replay_binlogs(&s3, &location, &fulls, &full, target, config).await
+    }
+    .context("replaying binlogs")?;
     info!(
         achieved = %pitr::format_rfc3339_millis(achieved),
         target = %pitr::format_rfc3339_millis(target),
@@ -543,9 +620,196 @@ async fn replay_binlogs(
     // The achieved-point pass below reads the last staged file, so it must
     // run before the scratch dir is removed — and the dir must be removed on
     // the failure paths too, hence the inner-result shape.
-    let result = replay_downloaded(&local_paths, full, target, config).await;
+    let result = replay_downloaded(&local_paths, Some(full.meta.binlog_pos), target, config).await;
     let _ = std::fs::remove_dir_all(&scratch);
     let achieved = result?;
+    verify_achieved_point(achieved, target, config, fulls, full)?;
+    Ok(achieved)
+}
+
+/// One lineage's contribution to a shared-history replay.
+struct LineageRun {
+    server_uuid: String,
+    /// Gap-free, in order.
+    files: Vec<String>,
+    /// `--start-position` for the first file — only the selected full's own
+    /// lineage has one (its recorded dump coordinate); every other lineage
+    /// replays from the start of its first archived file and lets the server
+    /// skip what the dump already holds.
+    start_position: Option<u64>,
+}
+
+fn note_lineage_gap(server_uuid: &str, plan: &pitr::BinlogReplayPlan) {
+    if let Some(gap) = &plan.gap {
+        warn!(
+            lineage = %server_uuid,
+            after = %gap.after,
+            next_present = %gap.next_present,
+            "lineage has a sequence gap; replaying up to it — another lineage may carry the \
+             missing transactions, and the GTID completeness check after replay decides"
+        );
+    }
+}
+
+/// The shared-history replay (module doc, step 5): the selected full's own
+/// lineage from its recorded coordinate, then every other lineage's gap-free
+/// run from its first archived file, each cut at `--stop-datetime`. Order is
+/// immaterial to the result — every lineage is an in-order stream of the same
+/// group history and the server applies each GTID once, whichever stream
+/// delivers it first — so the full's lineage only goes first because it
+/// continues the dump exactly. A sequence gap inside one lineage is not
+/// fatal here: another member's stream may carry those transactions (the
+/// reason for archiving from whichever member is primary), so it is logged
+/// and the verdict left to the completeness check at the end — the restored
+/// server's `gtid_executed` must have no hole in any UUID, and must contain
+/// everything the dump declared. Either failing is the loud, fail-closed
+/// refusal: the archive lost a transaction on every lineage that held it.
+async fn replay_shared_history(
+    s3: &S3Client,
+    location: &S3Location,
+    fulls: &[FullBackupRef],
+    full: &FullBackupRef,
+    target: DateTime<Utc>,
+    config: &Config,
+    sql: &Sql,
+) -> Result<DateTime<Utc>> {
+    let keys = s3
+        .list_keys_with_prefix(&pitr::base_prefix(location))
+        .await
+        .context("listing the archive's binlogs across lineages")?;
+    let mut by_lineage: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for key in &keys {
+        if !key.contains("/binlog/") {
+            continue;
+        }
+        let Some(uuid) = pitr::server_uuid_from_key(location, key) else {
+            continue;
+        };
+        if let Some(name) = key.rsplit('/').next() {
+            by_lineage.entry(uuid).or_default().push(name.to_string());
+        }
+    }
+
+    let mut runs: Vec<LineageRun> = Vec::new();
+    let own = by_lineage.remove(&full.server_uuid).unwrap_or_default();
+    let own_plan = pitr::binlogs_to_replay(own, &full.meta.binlog_file);
+    note_lineage_gap(&full.server_uuid, &own_plan);
+    runs.push(LineageRun {
+        server_uuid: full.server_uuid.clone(),
+        files: own_plan.run,
+        start_position: Some(full.meta.binlog_pos),
+    });
+    for (uuid, mut names) in by_lineage {
+        names.sort_by(|a, b| pitr::binlog_name_cmp(a, b));
+        let Some(first) = names.first().cloned() else {
+            continue;
+        };
+        let plan = pitr::binlogs_to_replay(names, &first);
+        note_lineage_gap(&uuid, &plan);
+        if plan.run.is_empty() {
+            continue;
+        }
+        runs.push(LineageRun {
+            server_uuid: uuid,
+            files: plan.run,
+            start_position: None,
+        });
+    }
+    info!(
+        lineages = runs.len(),
+        files = runs.iter().map(|r| r.files.len()).sum::<usize>(),
+        "replaying the shared history across lineages"
+    );
+
+    let scratch = Path::new(&config.data_dir).join(SCRATCH_DIR);
+    let mut achieved = full.meta.taken_at;
+    let replay: Result<()> = async {
+        for run in &runs {
+            if run.files.is_empty() {
+                continue;
+            }
+            // One directory per lineage, removed as soon as that lineage has
+            // replayed, so the staged copy on the volume never exceeds one
+            // lineage's worth of binlogs.
+            let dir = scratch.join(format!("server-{}", run.server_uuid));
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let mut local_paths = Vec::new();
+            for name in &run.files {
+                let key = pitr::binlog_key(location, &run.server_uuid, name);
+                let local = dir.join(name);
+                s3.download_to_file(&key, &local)
+                    .await
+                    .with_context(|| format!("downloading {key}"))?;
+                local_paths.push(local);
+            }
+            info!(
+                lineage = %run.server_uuid,
+                files = ?run.files,
+                start_position = ?run.start_position,
+                "replaying lineage"
+            );
+            let reached = replay_downloaded(&local_paths, run.start_position, target, config)
+                .await
+                .with_context(|| format!("replaying lineage {}", run.server_uuid))?;
+            achieved = achieved.max(reached);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        Ok(())
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    replay?;
+
+    // Completeness, proven on the result. Under Group Replication every
+    // group transaction takes the group's UUID and the next number, so a
+    // hole in the restored gtid_executed is exactly a transaction no lineage
+    // delivered — the shared-history form of the single-lineage gap check,
+    // and the reason a per-lineage gap above was not fatal on its own.
+    let executed = sql
+        .executed_gtid_set()
+        .await
+        .context("reading gtid_executed from the restored server")?;
+    let holes = pitr::gtid_set_holes(&executed);
+    if !holes.is_empty() {
+        let listed = holes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        error!(
+            holes = %listed,
+            gtid_executed = %executed,
+            "restored GTID history has holes: the archive is missing the binlogs that carried \
+             these transactions on every lineage that held them — the requested point-in-time \
+             target cannot be reached, and serving the result would silently lose them"
+        );
+        anyhow::bail!(
+            "gtid history has holes: {listed} — the archive is missing at least one binlog \
+             (expired, deleted, or lost before upload) on every lineage that carried these \
+             transactions, so a restore to the requested target is impossible; pick an earlier \
+             target, or restore from another full backup (other discovered full backups: {})",
+            pitr::describe_fallback_fulls(fulls, full),
+        );
+    }
+    if let Some(purged) = full.meta.gtid_purged.as_deref().filter(|p| !p.is_empty()) {
+        // gtid_compare(mine, peer) -> (peer ⊆ mine, mine ⊆ peer).
+        let (dump_within_result, _) = sql
+            .gtid_compare(&executed, purged)
+            .await
+            .context("checking the dump's GTID set against the restored server")?;
+        if !dump_within_result {
+            anyhow::bail!(
+                "the restored server lacks transactions the full backup declared it contains \
+                 (dump GTID set {purged}, restored gtid_executed {executed}) — the dump did not \
+                 load completely"
+            );
+        }
+    }
+    info!(
+        gtid_executed = %executed,
+        "restored GTID history is contiguous and contains the full backup's set"
+    );
+
     verify_achieved_point(achieved, target, config, fulls, full)?;
     Ok(achieved)
 }
@@ -556,7 +820,7 @@ async fn replay_binlogs(
 /// every path.
 async fn replay_downloaded(
     local_paths: &[PathBuf],
-    full: &FullBackupRef,
+    start_position: Option<u64>,
     target: DateTime<Utc>,
     config: &Config,
 ) -> Result<DateTime<Utc>> {
@@ -564,8 +828,10 @@ async fn replay_downloaded(
 
     let stop_dt = target.format("%Y-%m-%d %H:%M:%S").to_string();
     let mut mysqlbinlog_cmd = Command::new("mysqlbinlog");
+    if let Some(pos) = start_position {
+        mysqlbinlog_cmd.arg(format!("--start-position={pos}"));
+    }
     mysqlbinlog_cmd
-        .arg(format!("--start-position={}", full.meta.binlog_pos))
         .arg(format!("--stop-datetime={stop_dt}"))
         // mysqlbinlog interprets --stop-datetime in ITS local time zone, and
         // stop_dt above is the UTC target formatted without one: pin TZ so
