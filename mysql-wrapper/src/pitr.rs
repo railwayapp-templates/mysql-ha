@@ -14,11 +14,30 @@
 //! <PATH>/server-<server_uuid>/full/<RFC3339>.meta.json
 //! <PATH>/server-<server_uuid>/binlog/<name>
 //! ```
+//!
+//! Two kinds of archive live in that one layout, and several rules here
+//! branch on which one they are looking at:
+//!
+//!   - **Independent histories** — a standalone server whose lineage changes
+//!     only when its volume is reset. Lineages are unrelated datasets; a
+//!     restore replays exactly one lineage from one of ITS fulls, and binlogs
+//!     carry anonymous transactions (gtid_mode=OFF), so nothing can be
+//!     cross-checked between lineages.
+//!   - **One shared history, several writers** — a Group Replication cluster
+//!     archiving from whichever member is the writable primary. Every member
+//!     logs the same group transactions under the same GTIDs, so any
+//!     lineage's binlogs are a valid stream of the group's history, and a
+//!     restore from one lineage's full legitimately replays every other
+//!     lineage too: the server skips the GTIDs it already has, and a hole in
+//!     the result's `gtid_executed` is proof the archive lost a transaction.
+//!     A full's meta records the dump's own GTID set (`gtid_purged`); its
+//!     presence anywhere in the archive is what marks it shared
+//!     (`archive_shares_history`).
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Where the archive/restore bucket lives and how to reach it — built from
 /// one gate's worth of env vars (either the `BINLOG_ARCHIVE_*` or the
@@ -59,6 +78,23 @@ pub fn server_prefix(loc: &S3Location, server_uuid: &str) -> String {
         format!("server-{server_uuid}")
     } else {
         format!("{base}/server-{server_uuid}")
+    }
+}
+
+/// Archive-level marker a Group Replication primary writes when it starts
+/// archiving (`<path>/shared-history`). Restore and retention read it
+/// alongside the fulls' `gtid_purged` to decide the archive is one shared
+/// history: a standalone server converted to HA keeps its `server_uuid`, so
+/// until its first post-conversion full lands nothing else in the archive
+/// says its newer binlogs carry GTIDs. Never removed — a history that once
+/// had GTID writers is replayed as one from then on, which only ever errs
+/// toward replaying more (the server dedups by GTID).
+pub fn shared_history_marker_key(loc: &S3Location) -> String {
+    let base = base_prefix(loc);
+    if base.is_empty() {
+        "shared-history".to_string()
+    } else {
+        format!("{base}/shared-history")
     }
 }
 
@@ -124,6 +160,17 @@ pub struct FullBackupMeta {
     pub binlog_pos: u64,
     pub server_uuid: String,
     pub mysql_version: String,
+    /// The GTID set the dump embeds (`SET @@GLOBAL.GTID_PURGED`): every
+    /// transaction the dump already contains, by identity. Present exactly
+    /// when the source ran with GTIDs — a Group Replication member, or any
+    /// gtid_mode=ON server — and possibly empty on a GTID server with no
+    /// history yet. `None` on dumps from an anonymous-transaction
+    /// (gtid_mode=OFF) standalone server, and on metas written before this
+    /// field existed (serde default). Restore keys its whole
+    /// lineage-stitching strategy on it (see restore.rs), and retention keys
+    /// `archive_shares_history` on it.
+    #[serde(default)]
+    pub gtid_purged: Option<String>,
 }
 
 /// One full backup discovered in the bucket, with enough to select it and
@@ -316,6 +363,118 @@ pub fn parse_change_master_coords(dump_head: &str) -> Option<(String, u64)> {
         return Some((file, pos));
     }
     None
+}
+
+/// Pull the GTID set a mysqldump embeds out of the head of its output:
+///
+/// ```text
+/// SET @@GLOBAL.GTID_PURGED=/*!80000 '+'*/ '8f0e...:1-13,
+/// 9a11...:1-2';
+/// ```
+///
+/// The literal can span several lines (one UUID's ranges per line, comma
+/// separated), so this scans from the assignment to the closing quote and
+/// drops the whitespace, matching the server's own normalized form. Both
+/// spellings are handled — the 8.0+ one with the version-gated `'+'`
+/// comment and the bare 5.7 one. `Some("")` for a GTID-enabled source with
+/// no history yet; `None` when the dump carries no GTID set at all, which is
+/// what mysqldump emits for a gtid_mode=OFF source.
+pub fn parse_gtid_purged(dump_head: &str) -> Option<String> {
+    const MARKER: &str = "SET @@GLOBAL.GTID_PURGED=";
+    let start = dump_head.find(MARKER)? + MARKER.len();
+    let rest = &dump_head[start..];
+    let open = rest.find('\'')?;
+    let mut literal = &rest[open + 1..];
+    // The 8.0 form quotes a `+` inside the version comment before the set
+    // itself (`/*!80000 '+'*/ '...'`); step past it to the real literal.
+    if let Some(after_plus) = literal.strip_prefix("+'") {
+        let next_open = after_plus.find('\'')?;
+        literal = &after_plus[next_open + 1..];
+    }
+    let close = literal.find('\'')?;
+    Some(literal[..close].split_whitespace().collect())
+}
+
+/// The `taken_at` instant a full backup's object NAME encodes
+/// (`.../full/<RFC3339>.sql.gz` or `.meta.json`) — the same value its
+/// sidecar meta records, readable from a listing alone without a GET.
+/// `None` for any key that is not a full-backup object.
+pub fn full_taken_at_from_key(key: &str) -> Option<DateTime<Utc>> {
+    if !key.contains("/full/") {
+        return None;
+    }
+    let name = key.rsplit('/').next()?;
+    let stem = name
+        .strip_suffix(".meta.json")
+        .or_else(|| name.strip_suffix(".sql.gz"))?;
+    parse_target_time(stem).ok()
+}
+
+/// One UUID's missing range inside a GTID set — transaction numbers between
+/// two executed intervals that nothing delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GtidHole {
+    pub uuid: String,
+    /// First missing transaction number.
+    pub from: u64,
+    /// Last missing transaction number (inclusive).
+    pub to: u64,
+}
+
+impl std::fmt::Display for GtidHole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.from == self.to {
+            write!(f, "{}:{}", self.uuid, self.from)
+        } else {
+            write!(f, "{}:{}-{}", self.uuid, self.from, self.to)
+        }
+    }
+}
+
+/// Every hole in a GTID set: `uuid:1-5:8-9,other:1-3` → `uuid:6-7`. The
+/// server prints each UUID's executed intervals sorted and coalesced, so a
+/// UUID with more than one interval has, by construction, skipped the
+/// numbers between them. Under Group Replication every group transaction
+/// takes the group's UUID and the next number in sequence, so a hole in a
+/// restored server's `gtid_executed` is exactly "a transaction the archive
+/// never delivered" — the fail-closed signal a shared-history restore keys
+/// on (see restore.rs). Malformed ranges are ignored rather than reported:
+/// this judges completeness, and cannot judge what it cannot parse.
+pub fn gtid_set_holes(set: &str) -> Vec<GtidHole> {
+    let mut holes = Vec::new();
+    for entry in set.split(',') {
+        let entry: String = entry.split_whitespace().collect();
+        if entry.is_empty() {
+            continue;
+        }
+        let mut parts = entry.split(':');
+        let Some(uuid) = parts.next() else {
+            continue;
+        };
+        let mut intervals: Vec<(u64, u64)> = Vec::new();
+        for range in parts {
+            let parsed = match range.split_once('-') {
+                Some((lo, hi)) => lo.parse::<u64>().ok().zip(hi.parse::<u64>().ok()),
+                None => range.parse::<u64>().ok().map(|n| (n, n)),
+            };
+            if let Some(iv) = parsed {
+                intervals.push(iv);
+            }
+        }
+        intervals.sort_unstable();
+        for pair in intervals.windows(2) {
+            let (_, prev_hi) = pair[0];
+            let (next_lo, _) = pair[1];
+            if next_lo > prev_hi + 1 {
+                holes.push(GtidHole {
+                    uuid: uuid.to_string(),
+                    from: prev_hi + 1,
+                    to: next_lo - 1,
+                });
+            }
+        }
+    }
+    holes
 }
 
 fn extract_quoted(line: &str, key: &str) -> Option<String> {
@@ -529,6 +688,11 @@ pub struct LineageObjects {
     pub orphan_dumps: Vec<(String, DateTime<Utc>)>,
     /// Bare binlog file names (e.g. `binlog.000007`), any order.
     pub binlogs: Vec<String>,
+    /// Upload time (S3 LastModified) per binlog name, for the ones the
+    /// listing reported one for. Only the shared-history planner reads it —
+    /// a binlog's age against the archive-wide floor full is what makes it
+    /// redundant there — and a binlog with no known age is kept.
+    pub binlog_ages: BTreeMap<String, DateTime<Utc>>,
 }
 
 /// Everything the planner needs. Deliberately a snapshot: the caller lists the
@@ -542,6 +706,10 @@ pub struct RetentionInput {
     pub active_server_uuid: Option<String>,
     pub now: DateTime<Utc>,
     pub horizon: chrono::Duration,
+    /// The archive carries the `shared_history_marker_key` object — a group
+    /// primary has archived here. Selects the shared-history rules even
+    /// before any GTID full exists (see `archive_shares_history`).
+    pub shared_history_marker: bool,
 }
 
 /// Objects to delete, plus why — the caller logs the reasons whether or not it
@@ -630,6 +798,11 @@ pub fn plan_retention(input: &RetentionInput) -> RetentionPlan {
 
     let cutoff = input.now - input.horizon;
     let orphan_grace = chrono::Duration::seconds(ORPHAN_DUMP_GRACE_SECONDS);
+
+    if input.shared_history_marker || archive_shares_history(&input.lineages) {
+        plan_shared_history_retention(input, &mut plan, cutoff, orphan_grace);
+        return plan;
+    }
 
     // Nothing expires until the active lineage can itself serve a restore. On
     // a fresh volume the only fulls in the bucket belong to the lineage it
@@ -798,6 +971,182 @@ pub fn plan_retention(input: &RetentionInput) -> RetentionPlan {
     plan
 }
 
+/// Whether the archive's lineages share one transaction history — true once
+/// any complete full was taken from a GTID-enabled source (see the module
+/// doc). Decided from the fulls because a lineage with no full of its own
+/// (a primary that took over and never dumped) has nothing else to declare
+/// itself with; one GTID full anywhere marks the whole archive, which only
+/// ever errs toward keeping more.
+pub fn archive_shares_history(lineages: &[LineageObjects]) -> bool {
+    lineages
+        .iter()
+        .any(|l| l.fulls.iter().any(|f| f.meta.gtid_purged.is_some()))
+}
+
+/// Retention over an archive whose lineages share one history (see
+/// `archive_shares_history`). Fulls rank ARCHIVE-WIDE — the newest full at or
+/// before a target is what a restore stands on, whichever lineage took it —
+/// and the floor full's `taken_at` is the one instant that divides the
+/// archive: a binlog uploaded before the floor full was taken holds only
+/// transactions the floor dump already contains (upload time ≥ close time ≥
+/// every event in the file), so those expire; everything from the floor
+/// onward, in EVERY lineage, is what a restore inside the window may need — a
+/// primary that never took a full of its own is still the only carrier of its
+/// tenure's transactions.
+///
+/// What differs from the independent-histories rules above:
+///   - a lineage with no full of its own is never "unrestorable";
+///   - a dead lineage never retires on its own fulls' age — it retires when
+///     none of its objects survive the floor;
+///   - the count floor (`MIN_ACTIVE_FULLS_KEPT`) applies to the archive as a
+///     whole, not per lineage;
+///   - the "active lineage must have a full first" gate becomes "the archive
+///     must have a full", since the active primary may legitimately never
+///     dump (see the archiver's archive-wide full cadence).
+/// A binlog with no known upload time is kept — the pass cannot prove it
+/// redundant. The floor full's own lineage expires by sequence below its
+/// coordinate file, exactly as before: the precise form of the same rule.
+/// Any lineage whose fulls exist but could not be read this pass makes the
+/// whole pass inert: the floor might be wrong without them, and a transient
+/// listing error must never expire a binlog a readable-next-time full needs.
+fn plan_shared_history_retention(
+    input: &RetentionInput,
+    plan: &mut RetentionPlan,
+    cutoff: DateTime<Utc>,
+    orphan_grace: chrono::Duration,
+) {
+    let active_uuid = input.active_server_uuid.as_deref().unwrap_or_default();
+    for lineage in &input.lineages {
+        for (key, uploaded_at) in &lineage.orphan_dumps {
+            if input.now - *uploaded_at > orphan_grace {
+                plan.orphan_dump_keys.push(key.clone());
+            }
+        }
+    }
+
+    let unreadable: Vec<&LineageObjects> = input
+        .lineages
+        .iter()
+        .filter(|l| l.full_objects_seen > l.fulls.len())
+        .collect();
+    if !unreadable.is_empty() {
+        plan.notes.push(format!(
+            "shared history: {} lineage(s) have full backups that could not be read this pass \
+             ({}); the archive-wide floor cannot be trusted without them — expiring nothing",
+            unreadable.len(),
+            unreadable
+                .iter()
+                .map(|l| l.server_uuid.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        return;
+    }
+
+    let all_fulls: Vec<FullBackupRef> = input
+        .lineages
+        .iter()
+        .flat_map(|l| l.fulls.iter().cloned())
+        .collect();
+    // archive_shares_history() found a full, so this cannot be empty; the
+    // guard keeps the rule honest if the two ever drift apart.
+    if all_fulls.is_empty() {
+        plan.notes
+            .push("shared history: no complete full backup anywhere; expiring nothing".to_string());
+        return;
+    }
+
+    let kept = fulls_to_keep(&all_fulls, cutoff, MIN_ACTIVE_FULLS_KEPT);
+    let floor = kept
+        .last()
+        .expect("fulls_to_keep always keeps at least one");
+    let kept_dumps: BTreeSet<&str> = kept.iter().map(|f| f.dump_key.as_str()).collect();
+    if floor.meta.taken_at < cutoff && kept.iter().any(|f| f.meta.taken_at >= cutoff) {
+        plan.notes.push(format!(
+            "shared history: floor full ({}, lineage {}) predates the horizon; kept because \
+             in-window targets before the oldest in-horizon full restore from it",
+            format_rfc3339_millis(floor.meta.taken_at),
+            floor.server_uuid
+        ));
+    }
+    let floor_seq = binlog_seq(&floor.meta.binlog_file);
+    if floor_seq.is_none() {
+        plan.notes.push(format!(
+            "shared history: the floor full's coordinate file {:?} has no parseable sequence; \
+             keeping every binlog in its lineage {}",
+            floor.meta.binlog_file, floor.server_uuid
+        ));
+    }
+
+    for lineage in &input.lineages {
+        let is_active = lineage.server_uuid == active_uuid;
+        let is_floor_lineage = lineage.server_uuid == floor.server_uuid;
+        let mut expired_fulls = 0usize;
+        let mut kept_fulls = 0usize;
+        for full in &lineage.fulls {
+            if kept_dumps.contains(full.dump_key.as_str()) {
+                kept_fulls += 1;
+                continue;
+            }
+            plan.expired_full_keys.push(full.dump_key.clone());
+            plan.expired_full_keys
+                .push(meta_key_for_dump(&full.dump_key));
+            expired_fulls += 1;
+        }
+
+        let mut expired_binlogs = 0usize;
+        let mut kept_binlogs = 0usize;
+        let mut unknown_age = 0usize;
+        for name in &lineage.binlogs {
+            let redundant = if is_floor_lineage {
+                matches!((binlog_seq(name), floor_seq), (Some(seq), Some(fs)) if seq < fs)
+            } else {
+                match lineage.binlog_ages.get(name) {
+                    Some(uploaded_at) => *uploaded_at < floor.meta.taken_at,
+                    None => {
+                        unknown_age += 1;
+                        false
+                    }
+                }
+            };
+            if redundant {
+                plan.expired_binlogs
+                    .push((lineage.server_uuid.clone(), name.clone()));
+                expired_binlogs += 1;
+            } else {
+                kept_binlogs += 1;
+            }
+        }
+
+        let touched = expired_fulls > 0 || expired_binlogs > 0;
+        if !is_active && touched && kept_fulls == 0 && kept_binlogs == 0 {
+            plan.retired_lineages.push(lineage.server_uuid.clone());
+        }
+        if unknown_age > 0 {
+            plan.notes.push(format!(
+                "shared history: lineage {}: kept {} binlog(s) whose upload time is unknown",
+                lineage.server_uuid, unknown_age
+            ));
+        }
+        if touched {
+            plan.notes.push(format!(
+                "shared history: lineage {}{}: keeping {} full(s) and {} binlog(s) at or after \
+                 the archive-wide floor ({}, coordinate {} in lineage {}); expiring {} full(s) \
+                 and {} binlog(s) before it",
+                lineage.server_uuid,
+                if is_active { " (active)" } else { "" },
+                kept_fulls,
+                kept_binlogs,
+                format_rfc3339_millis(floor.meta.taken_at),
+                floor.meta.binlog_file,
+                floor.server_uuid,
+                expired_fulls,
+                expired_binlogs
+            ));
+        }
+    }
+}
+
 /// `<...>/full/<rfc>.sql.gz` -> `<...>/full/<rfc>.meta.json`.
 pub fn meta_key_for_dump(dump_key: &str) -> String {
     match dump_key.strip_suffix(".sql.gz") {
@@ -896,6 +1245,7 @@ mod tests {
             binlog_pos: 4,
             server_uuid: server_uuid.to_string(),
             mysql_version: "8.4.3".to_string(),
+            gtid_purged: None,
         }
     }
 
@@ -1341,7 +1691,34 @@ mod tests {
             full_objects_seen,
             orphan_dumps: Vec::new(),
             binlogs: binlogs.iter().map(|s| s.to_string()).collect(),
+            binlog_ages: BTreeMap::new(),
         }
+    }
+
+    /// A full taken from a GTID-enabled source — what marks an archive as one
+    /// shared history (`archive_shares_history`).
+    fn gtid_full(server_uuid: &str, taken_at: &str, coord: &str, purged: &str) -> FullBackupRef {
+        let mut f = full_at(server_uuid, taken_at, coord);
+        f.meta.gtid_purged = Some(purged.to_string());
+        f
+    }
+
+    /// A lineage whose binlogs carry upload times — `(name, uploaded_at)`.
+    fn aged_lineage(
+        server_uuid: &str,
+        fulls: Vec<FullBackupRef>,
+        binlogs: &[(&str, &str)],
+    ) -> LineageObjects {
+        let mut l = lineage(
+            server_uuid,
+            fulls,
+            &binlogs.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        );
+        l.binlog_ages = binlogs
+            .iter()
+            .map(|(n, ts)| (n.to_string(), at(ts)))
+            .collect();
+        l
     }
 
     fn at(ts: &str) -> DateTime<Utc> {
@@ -1357,6 +1734,7 @@ mod tests {
         RetentionInput {
             lineages,
             active_server_uuid: active.map(|s| s.to_string()),
+            shared_history_marker: false,
             now: at(now),
             horizon: chrono::Duration::days(days),
         }
@@ -1839,5 +2217,432 @@ mod tests {
             meta_key_for_dump("binlog/server-a/full/2026-08-27T00:00:00.000Z.sql.gz"),
             "binlog/server-a/full/2026-08-27T00:00:00.000Z.meta.json"
         );
+    }
+
+    // --- GTID: dump set parsing, set holes, key-encoded taken_at ----------------
+
+    #[test]
+    fn gtid_purged_parses_the_8_0_form_across_lines() {
+        let head = "-- MySQL dump 8.4.3\n\
+                    SET @@SESSION.SQL_LOG_BIN= 0;\n\
+                    --\n-- GTID state at the beginning of the backup\n--\n\
+                    SET @@GLOBAL.GTID_PURGED=/*!80000 '+'*/ '8f0e1c2a-0000-0000-0000-000000000001:1-13,\n\
+                    9a110000-0000-0000-0000-000000000002:1-2';\n\
+                    -- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='binlog.000004', SOURCE_LOG_POS=197;\n";
+        assert_eq!(
+            parse_gtid_purged(head).as_deref(),
+            Some(
+                "8f0e1c2a-0000-0000-0000-000000000001:1-13,9a110000-0000-0000-0000-000000000002:1-2"
+            )
+        );
+        // The coordinate parser is untouched by the GTID line ahead of it.
+        assert_eq!(
+            parse_change_master_coords(head),
+            Some(("binlog.000004".to_string(), 197))
+        );
+    }
+
+    #[test]
+    fn gtid_purged_parses_the_bare_form_and_the_empty_set() {
+        assert_eq!(
+            parse_gtid_purged("SET @@GLOBAL.GTID_PURGED='aaaa:1-5';\n").as_deref(),
+            Some("aaaa:1-5")
+        );
+        // A GTID server with no history yet: present, empty — still a GTID
+        // source, which restore must treat differently from an anonymous one.
+        assert_eq!(
+            parse_gtid_purged("SET @@GLOBAL.GTID_PURGED=/*!80000 '+'*/ '';\n").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn gtid_purged_is_absent_on_an_anonymous_dump() {
+        let head = "-- MySQL dump\n-- CHANGE MASTER TO MASTER_LOG_FILE='binlog.000003', MASTER_LOG_POS=157;\n";
+        assert_eq!(parse_gtid_purged(head), None);
+    }
+
+    #[test]
+    fn gtid_set_holes_finds_every_skipped_range_per_uuid() {
+        let holes = gtid_set_holes("aaaa:1-5:8-9:12,\nbbbb:1-3,\ncccc:4-6");
+        assert_eq!(
+            holes,
+            vec![
+                GtidHole {
+                    uuid: "aaaa".to_string(),
+                    from: 6,
+                    to: 7
+                },
+                GtidHole {
+                    uuid: "aaaa".to_string(),
+                    from: 10,
+                    to: 11
+                },
+            ]
+        );
+        assert_eq!(holes[0].to_string(), "aaaa:6-7");
+        assert_eq!(
+            GtidHole {
+                uuid: "x".to_string(),
+                from: 4,
+                to: 4
+            }
+            .to_string(),
+            "x:4"
+        );
+        // Contiguous sets, single numbers, adjacent intervals and the empty
+        // set all read as complete.
+        assert!(gtid_set_holes("aaaa:1-100,bbbb:7").is_empty());
+        assert!(gtid_set_holes("aaaa:1-5:6-9").is_empty());
+        assert!(gtid_set_holes("").is_empty());
+        // Unparseable ranges are ignored, not reported as holes.
+        assert!(gtid_set_holes("aaaa:1-5:garbage").is_empty());
+    }
+
+    #[test]
+    fn full_taken_at_is_read_from_either_full_object_name() {
+        let t = at("2026-08-27T00:00:00.000Z");
+        assert_eq!(
+            full_taken_at_from_key("binlog/server-a/full/2026-08-27T00:00:00.000Z.sql.gz"),
+            Some(t)
+        );
+        assert_eq!(
+            full_taken_at_from_key("binlog/server-a/full/2026-08-27T00:00:00.000Z.meta.json"),
+            Some(t)
+        );
+        assert_eq!(
+            full_taken_at_from_key("binlog/server-a/binlog/binlog.000001"),
+            None
+        );
+        assert_eq!(
+            full_taken_at_from_key("binlog/server-a/full/not-a-time.sql.gz"),
+            None
+        );
+    }
+
+    // --- retention over one shared history (Group Replication) -----------------
+
+    #[test]
+    fn shared_history_is_detected_from_any_gtid_full() {
+        let anon = vec![lineage(
+            "a",
+            vec![full("a", "2026-08-20T00:00:00.000Z")],
+            &[],
+        )];
+        assert!(!archive_shares_history(&anon));
+        let shared = vec![
+            lineage("a", vec![full("a", "2026-08-20T00:00:00.000Z")], &[]),
+            lineage(
+                "b",
+                vec![gtid_full(
+                    "b",
+                    "2026-08-21T00:00:00.000Z",
+                    "binlog.000001",
+                    "g:1-9",
+                )],
+                &[],
+            ),
+        ];
+        assert!(archive_shares_history(&shared));
+    }
+
+    #[test]
+    fn shared_history_keeps_a_full_less_primary_lineage_whole() {
+        // X was primary and took the only full; Y took over (no full of its
+        // own — the archive-wide cadence said none was due) and has archived
+        // its tenure since. Every one of Y's binlogs is the only carrier of
+        // the group's transactions after the handoff; none may expire, and
+        // Y — the active lineage — has no full to be "waiting for".
+        let x = aged_lineage(
+            "x",
+            vec![gtid_full(
+                "x",
+                "2026-08-20T00:00:00.000Z",
+                "binlog.000003",
+                "g:1-10",
+            )],
+            &[
+                ("binlog.000001", "2026-08-19T00:00:00.000Z"),
+                ("binlog.000002", "2026-08-19T12:00:00.000Z"),
+                ("binlog.000003", "2026-08-20T00:01:00.000Z"),
+                ("binlog.000004", "2026-08-20T06:00:00.000Z"),
+            ],
+        );
+        let y = aged_lineage(
+            "y",
+            vec![],
+            &[
+                ("binlog.000001", "2026-08-20T06:05:00.000Z"),
+                ("binlog.000002", "2026-08-21T00:00:00.000Z"),
+            ],
+        );
+        let plan = plan_retention(&input(vec![x, y], Some("y"), "2026-08-22T00:00:00.000Z", 7));
+        assert!(plan.expired_full_keys.is_empty(), "{plan:?}");
+        // Only X's files strictly below its own full's coordinate expire.
+        assert_eq!(
+            plan.expired_binlogs,
+            vec![
+                ("x".to_string(), "binlog.000001".to_string()),
+                ("x".to_string(), "binlog.000002".to_string()),
+            ]
+        );
+        assert!(plan.retired_lineages.is_empty(), "{plan:?}");
+        assert!(
+            !plan.notes.iter().any(|n| n.contains("unrestorable")),
+            "a full-less lineage is not unrestorable in a shared history: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn shared_history_ranks_fulls_archive_wide_and_expires_by_age_against_the_floor() {
+        // Fulls alternate between lineages as the primary moved around. With a
+        // 2-day horizon at 08-27 the cutoff is 08-25: fulls on 08-26 (y) and
+        // 08-25T12 (x) are inside it, and the boundary rule keeps the 08-24 (y)
+        // full as the floor. Everything older than the floor expires — x's
+        // 08-22 full, and every binlog UPLOADED before 08-24T00:00 in lineages
+        // other than the floor's (which trims by sequence instead).
+        let x = aged_lineage(
+            "x",
+            vec![
+                gtid_full("x", "2026-08-22T00:00:00.000Z", "binlog.000002", "g:1-100"),
+                gtid_full("x", "2026-08-25T12:00:00.000Z", "binlog.000009", "g:1-500"),
+            ],
+            &[
+                ("binlog.000001", "2026-08-21T00:00:00.000Z"),
+                ("binlog.000002", "2026-08-22T00:01:00.000Z"),
+                ("binlog.000005", "2026-08-23T23:59:00.000Z"),
+                ("binlog.000006", "2026-08-24T00:30:00.000Z"),
+                ("binlog.000009", "2026-08-25T12:01:00.000Z"),
+            ],
+        );
+        let y = aged_lineage(
+            "y",
+            vec![
+                gtid_full("y", "2026-08-24T00:00:00.000Z", "binlog.000004", "g:1-300"),
+                gtid_full("y", "2026-08-26T00:00:00.000Z", "binlog.000012", "g:1-900"),
+            ],
+            &[
+                ("binlog.000001", "2026-08-23T00:00:00.000Z"),
+                ("binlog.000003", "2026-08-23T23:00:00.000Z"),
+                ("binlog.000004", "2026-08-24T00:01:00.000Z"),
+                ("binlog.000012", "2026-08-26T00:01:00.000Z"),
+            ],
+        );
+        let oldest_x_dump = x.fulls[0].dump_key.clone();
+        let plan = plan_retention(&input(vec![x, y], Some("y"), "2026-08-27T00:00:00.000Z", 2));
+        assert_eq!(
+            plan.expired_full_keys,
+            vec![oldest_x_dump.clone(), meta_key_for_dump(&oldest_x_dump)]
+        );
+        let mut expired = plan.expired_binlogs.clone();
+        expired.sort();
+        assert_eq!(
+            expired,
+            vec![
+                ("x".to_string(), "binlog.000001".to_string()),
+                ("x".to_string(), "binlog.000002".to_string()),
+                ("x".to_string(), "binlog.000005".to_string()),
+                // y (the floor's lineage) trims by sequence below 000004.
+                ("y".to_string(), "binlog.000001".to_string()),
+                ("y".to_string(), "binlog.000003".to_string()),
+            ]
+        );
+        assert!(plan.retired_lineages.is_empty(), "{plan:?}");
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("floor full") && n.contains("predates")));
+    }
+
+    #[test]
+    fn shared_history_retires_a_dead_lineage_only_once_nothing_of_it_survives_the_floor() {
+        // z was primary long ago; everything it holds predates the floor.
+        let z = aged_lineage(
+            "z",
+            vec![gtid_full(
+                "z",
+                "2026-08-01T00:00:00.000Z",
+                "binlog.000001",
+                "g:1-5",
+            )],
+            &[
+                ("binlog.000001", "2026-08-01T00:01:00.000Z"),
+                ("binlog.000002", "2026-08-02T00:00:00.000Z"),
+            ],
+        );
+        let x = aged_lineage(
+            "x",
+            vec![
+                gtid_full("x", "2026-08-20T00:00:00.000Z", "binlog.000001", "g:1-50"),
+                gtid_full("x", "2026-08-26T00:00:00.000Z", "binlog.000007", "g:1-90"),
+            ],
+            &[
+                ("binlog.000001", "2026-08-20T00:01:00.000Z"),
+                ("binlog.000007", "2026-08-26T00:01:00.000Z"),
+            ],
+        );
+        let z_dump = z.fulls[0].dump_key.clone();
+        let plan = plan_retention(&input(vec![z, x], Some("x"), "2026-08-27T00:00:00.000Z", 2));
+        assert_eq!(plan.retired_lineages, vec!["z".to_string()]);
+        assert!(plan.expired_full_keys.contains(&z_dump), "{plan:?}");
+        assert!(plan
+            .expired_binlogs
+            .contains(&("z".to_string(), "binlog.000002".to_string())));
+
+        // Same z, but one of its binlogs was uploaded AFTER the floor full was
+        // taken: it may carry transactions the floor dump lacks. z stays.
+        let mut z2 = aged_lineage(
+            "z",
+            vec![gtid_full(
+                "z",
+                "2026-08-01T00:00:00.000Z",
+                "binlog.000001",
+                "g:1-5",
+            )],
+            &[
+                ("binlog.000001", "2026-08-01T00:01:00.000Z"),
+                ("binlog.000002", "2026-08-20T00:30:00.000Z"),
+            ],
+        );
+        z2.server_uuid = "z".to_string();
+        let x2 = aged_lineage(
+            "x",
+            vec![
+                gtid_full("x", "2026-08-20T00:00:00.000Z", "binlog.000001", "g:1-50"),
+                gtid_full("x", "2026-08-26T00:00:00.000Z", "binlog.000007", "g:1-90"),
+            ],
+            &[
+                ("binlog.000001", "2026-08-20T00:01:00.000Z"),
+                ("binlog.000007", "2026-08-26T00:01:00.000Z"),
+            ],
+        );
+        let plan = plan_retention(&input(
+            vec![z2, x2],
+            Some("x"),
+            "2026-08-27T00:00:00.000Z",
+            2,
+        ));
+        assert!(plan.retired_lineages.is_empty(), "{plan:?}");
+        assert!(!plan
+            .expired_binlogs
+            .contains(&("z".to_string(), "binlog.000002".to_string())));
+    }
+
+    #[test]
+    fn shared_history_keeps_binlogs_with_unknown_age_and_honors_the_count_floor() {
+        // Archiving broke weeks ago: both fulls are past a 2-day horizon, yet
+        // MIN_ACTIVE_FULLS_KEPT keeps them (archive-wide), so the floor is the
+        // OLDEST full and nothing in its lineage is below its coordinate; the
+        // age-less binlog in the other lineage is kept because nothing proves
+        // it old.
+        let x = aged_lineage(
+            "x",
+            vec![
+                gtid_full("x", "2026-08-01T00:00:00.000Z", "binlog.000001", "g:1-5"),
+                gtid_full("x", "2026-08-02T00:00:00.000Z", "binlog.000003", "g:1-9"),
+            ],
+            &[
+                ("binlog.000001", "2026-08-01T00:01:00.000Z"),
+                ("binlog.000003", "2026-08-02T00:01:00.000Z"),
+            ],
+        );
+        let y = lineage("y", vec![], &["binlog.000001"]);
+        let plan = plan_retention(&input(vec![x, y], Some("y"), "2026-08-27T00:00:00.000Z", 2));
+        assert!(plan.expired_full_keys.is_empty(), "{plan:?}");
+        assert!(plan.expired_binlogs.is_empty(), "{plan:?}");
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("upload time is unknown")));
+
+        // A third, in-horizon full moves the floor up to the 08-02 full: now
+        // x's 000001 (below coordinate 000003) expires, and y's age-less
+        // binlog is STILL kept.
+        let x = aged_lineage(
+            "x",
+            vec![
+                gtid_full("x", "2026-08-01T00:00:00.000Z", "binlog.000001", "g:1-5"),
+                gtid_full("x", "2026-08-02T00:00:00.000Z", "binlog.000003", "g:1-9"),
+                gtid_full("x", "2026-08-26T00:00:00.000Z", "binlog.000009", "g:1-50"),
+            ],
+            &[
+                ("binlog.000001", "2026-08-01T00:01:00.000Z"),
+                ("binlog.000003", "2026-08-02T00:01:00.000Z"),
+                ("binlog.000009", "2026-08-26T00:01:00.000Z"),
+            ],
+        );
+        let y = lineage("y", vec![], &["binlog.000001"]);
+        let plan = plan_retention(&input(vec![x, y], Some("y"), "2026-08-27T00:00:00.000Z", 2));
+        assert_eq!(
+            plan.expired_binlogs,
+            vec![("x".to_string(), "binlog.000001".to_string())]
+        );
+        assert_eq!(
+            plan.expired_full_keys.len(),
+            2,
+            "the 08-01 full (dump + meta) is below the floor and expires: {plan:?}"
+        );
+        assert!(plan.expired_full_keys[0].contains("2026-08-01T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn shared_history_marker_alone_selects_the_shared_rules() {
+        // A standalone server converted to HA: its only full is anonymous
+        // (pre-conversion), the new primary has archived GTID binlogs since,
+        // and a peer's lineage (no full) carries the tenure after a failover.
+        // Under the independent-histories rules that peer lineage would be
+        // "unrestorable" and expire; the marker says otherwise.
+        let x = aged_lineage(
+            "x",
+            vec![full_at("x", "2026-08-20T00:00:00.000Z", "binlog.000002")],
+            &[
+                ("binlog.000002", "2026-08-20T00:01:00.000Z"),
+                ("binlog.000003", "2026-08-21T00:00:00.000Z"),
+            ],
+        );
+        let y = aged_lineage(
+            "y",
+            vec![],
+            &[("binlog.000001", "2026-08-22T00:00:00.000Z")],
+        );
+        // Active = x (it holds the full) so the independent rules get past
+        // their own "active lineage has a full" gate and reach y.
+        let mut in_ = input(
+            vec![x.clone(), y.clone()],
+            Some("x"),
+            "2026-08-27T00:00:00.000Z",
+            7,
+        );
+        assert!(!archive_shares_history(&in_.lineages));
+        let plan = plan_retention(&in_);
+        assert!(
+            plan.expired_binlogs
+                .contains(&("y".to_string(), "binlog.000001".to_string())),
+            "without the marker the independent rules retire the full-less lineage: {plan:?}"
+        );
+        in_.shared_history_marker = true;
+        let plan = plan_retention(&in_);
+        assert!(
+            plan.is_empty(),
+            "with the marker nothing after the floor expires: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn shared_history_is_inert_while_any_full_is_unreadable() {
+        let mut x = aged_lineage(
+            "x",
+            vec![gtid_full(
+                "x",
+                "2026-08-20T00:00:00.000Z",
+                "binlog.000003",
+                "g:1-10",
+            )],
+            &[("binlog.000001", "2026-08-19T00:00:00.000Z")],
+        );
+        x.full_objects_seen = 2; // one more meta exists than could be read
+        let plan = plan_retention(&input(vec![x], Some("x"), "2026-08-27T00:00:00.000Z", 2));
+        assert!(plan.is_empty(), "{plan:?}");
+        assert!(plan.notes.iter().any(|n| n.contains("could not be read")));
     }
 }

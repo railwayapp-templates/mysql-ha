@@ -21,20 +21,23 @@
 //! mysqld is alive. This is the state a reverted (HA → standalone) service
 //! runs in while it still uses this image.
 //!
-//! Point-in-time recovery (standalone mode only, this version — see
-//! pitr.rs/archiver.rs/restore.rs): two independent env-gated concerns layer
-//! on top of the standalone path.
-//!   - BINLOG_ARCHIVE_BUCKET set: the standalone conf enables the binlog
-//!     (instead of the plain no-binlog rendering) and an archiver task ships
-//!     full backups + binlogs to an S3-compatible bucket.
+//! Point-in-time recovery (see pitr.rs/archiver.rs/restore.rs): two
+//! independent env-gated concerns layer on top of either mode.
+//!   - BINLOG_ARCHIVE_BUCKET set: an archiver ships full backups + binlogs to
+//!     an S3-compatible bucket. Standalone, the archive conf turns the binlog
+//!     on (the plain rendering leaves it off) and the archiver runs for the
+//!     server's whole life. On a Group Replication member the binlog is
+//!     already on (GR needs it) and the archiver runs only while THIS node is
+//!     the writable primary — the role supervisor in archiver.rs starts and
+//!     stops it as the role moves, so exactly one member archives at a time
+//!     and every member is configured identically.
 //!   - BINLOG_RECOVER_FROM_BUCKET + MYSQL_RECOVERY_TARGET_TIME set, on an
 //!     uninitialized (fresh) datadir: restore-on-boot loads the newest
 //!     qualifying full backup and replays binlogs up to the target instant
-//!     before mysqld ever starts serving.
-//!
-//! Both are refused (warned, not fatal) whenever GR_SEEDS is also set — this
-//! version's archiver/restore paths are standalone-only and must never
-//! touch the Group Replication path.
+//!     before mysqld ever starts serving. Standalone only: a restore produces
+//!     a NEW standalone server (the platform's fork), never a group member,
+//!     so the recover contract is refused (warned, not fatal) while GR_SEEDS
+//!     is set.
 
 mod archiver;
 mod config;
@@ -161,23 +164,22 @@ async fn main() -> Result<()> {
         telemetry.clone(),
     ));
 
+    // Behind /pitr in both modes; the archiver (or its role supervisor)
+    // writes it, the health server reads it.
+    let pitr_status = archiver::PitrStatus::new(config.archive_enabled());
+
     let mut boot_note = None;
     if config.gr_enabled() {
-        // PITR archiving is standalone-only in this version — the archiver
-        // and the GR orchestrator have never been exercised together, and
-        // this version doesn't attempt it. Warn and fall through to the
-        // GR path completely unchanged rather than silently ignoring the
-        // variable or refusing to boot.
-        if config.archive_enabled() {
-            warn!(
-                "BINLOG_ARCHIVE_BUCKET is set but GR_SEEDS is also set; binlog archiving is \
-                 standalone-only for now — continuing without archiving"
-            );
-        }
+        // A restore produces a new STANDALONE server; restoring into a group
+        // member is not a thing this image does (the group's own recovery
+        // channel is how a member gets its data). Warn and fall through to
+        // the GR path unchanged rather than silently ignoring the variables
+        // or refusing to boot.
         if config.restore_enabled() {
             warn!(
                 "BINLOG_RECOVER_FROM_BUCKET/MYSQL_RECOVERY_TARGET_TIME are set but GR_SEEDS is \
-                 also set; point-in-time restore is standalone-only for now — skipping restore"
+                 also set; point-in-time restore only runs on a standalone server — skipping \
+                 restore (a group member gets its data from the group, not from the archive)"
             );
         }
 
@@ -210,9 +212,24 @@ async fn main() -> Result<()> {
                 data_dir: config.data_dir.clone(),
                 adoption_checked: adoption_checked.clone(),
                 membership_fenced: membership_fenced.clone(),
+                pitr: pitr_status.clone(),
             }),
             telemetry.clone(),
         ));
+
+        // Archiving follows the writable-primary role (see archiver.rs). The
+        // supervisor waits for mysqld itself and reads the role live, so it
+        // needs nothing from orchestrate — and it shares the membership fence
+        // so a fenced survivor never archives as if it were a primary.
+        if config.archive_enabled() {
+            tokio::spawn(archiver::run_group_primary_supervisor(
+                config.clone(),
+                sql.clone(),
+                telemetry.clone(),
+                membership_fenced.clone(),
+                pitr_status.clone(),
+            ));
+        }
 
         boot_note = Some(self_heal::PlannedShutdownNote {
             data_dir: config.data_dir.clone(),
@@ -271,11 +288,17 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Gated on GR_SEEDS itself for the same reason as the restore gate
+        // above: a half-reverted config (GR_ENABLED=false with GR_SEEDS still
+        // present) must not start a standalone archiver — rendering the
+        // standalone archive conf over a datadir that ran as a group member
+        // is not a transition this path owns.
         let archiving = config.archive_enabled() && config.gr_seeds.is_none();
         if config.archive_enabled() && config.gr_seeds.is_some() {
             warn!(
-                "BINLOG_ARCHIVE_BUCKET is set but GR_SEEDS is also set; binlog archiving is \
-                 standalone-only for now — continuing without archiving"
+                "BINLOG_ARCHIVE_BUCKET is set with GR_ENABLED=false but GR_SEEDS still present; \
+                 not archiving under a half-reverted HA config — remove GR_SEEDS to archive \
+                 standalone"
             );
         }
         if archiving {
@@ -297,6 +320,7 @@ async fn main() -> Result<()> {
                 // No orchestrate task runs in standalone mode to raise this
                 // — pre-set so /gr/state behaves exactly as before here.
                 adoption_checked: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                pitr: pitr_status.clone(),
             }),
             telemetry.clone(),
         ));
@@ -310,6 +334,8 @@ async fn main() -> Result<()> {
                 config.clone(),
                 sql.clone(),
                 telemetry.clone(),
+                archiver::ArchiveMode::Standalone,
+                pitr_status.clone(),
             ));
         }
     }

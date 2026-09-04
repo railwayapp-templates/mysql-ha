@@ -21,7 +21,14 @@
 //!                 uuid — synchronous through the group's consensus, so 200
 //!                 means the switch completed (which /role then reflects);
 //!                 503 carries the group's own refusal as the reason.
+//!   GET /pitr   — point-in-time-recovery archiver status (JSON, see
+//!                 archiver::PitrStatusSnapshot): whether the archive
+//!                 contract is configured on this node and whether THIS node
+//!                 is archiving right now — on a group only the writable
+//!                 primary is. Informational; the platform's enable workflow
+//!                 reads it to confirm archiving started where it expected.
 
+use crate::archiver::PitrStatus;
 use crate::gr::local_gr_state;
 use crate::sql::{role_is_writable_primary, Sql};
 use anyhow::Context;
@@ -57,6 +64,9 @@ pub struct AppState {
     /// routing writes, matching the super_read_only fence the watch imposes.
     /// Always `false` in standalone mode.
     pub membership_fenced: Arc<AtomicBool>,
+    /// Live archiver status behind `/pitr` — written by the archiver (or its
+    /// group-mode supervisor), read here.
+    pub pitr: Arc<PitrStatus>,
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -99,6 +109,10 @@ async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         Ok(false) => (StatusCode::SERVICE_UNAVAILABLE, "not primary"),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "state unavailable"),
     }
+}
+
+async fn pitr(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (StatusCode::OK, Json(state.pitr.snapshot()))
 }
 
 async fn gr_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -186,6 +200,7 @@ async fn run_health_server(health_port: u16, state: Arc<AppState>) -> anyhow::Re
         .route("/health", get(health))
         .route("/role", get(role))
         .route("/gr/state", get(gr_state))
+        .route("/pitr", get(pitr))
         .route("/switchover", post(switchover))
         .with_state(state);
 

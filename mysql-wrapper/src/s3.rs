@@ -94,6 +94,36 @@ impl S3Client {
         Ok(keys)
     }
 
+    /// Like `list_keys_with_prefix`, keeping each object's LastModified (when
+    /// the listing reports one) — the retention planner's binlog ages come
+    /// from this, one paginated LIST instead of a HEAD per object.
+    pub async fn list_objects_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
+        let mut objects = Vec::new();
+        let mut pages = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .into_paginator()
+            .send();
+        while let Some(page) = pages.next().await {
+            let page = page.with_context(|| format!("listing objects under {prefix}"))?;
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    let modified = obj.last_modified().and_then(|t| {
+                        chrono::DateTime::from_timestamp(t.secs(), t.subsec_nanos())
+                            .map(|dt| dt.with_timezone(&chrono::Utc))
+                    });
+                    objects.push((key.to_string(), modified));
+                }
+            }
+        }
+        Ok(objects)
+    }
+
     pub async fn get_object_bytes(&self, key: &str) -> Result<Vec<u8>> {
         let resp = self
             .client

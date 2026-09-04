@@ -1,14 +1,34 @@
-//! Continuous binlog archiving to an S3-compatible bucket — standalone mode
-//! only (see main.rs's gate: this is never spawned while GR_SEEDS is set).
+//! Continuous binlog archiving to an S3-compatible bucket, in either of the
+//! wrapper's two modes (`ArchiveMode`):
+//!
+//!   - **Standalone**: main.rs spawns `run` directly; this server's lineage is
+//!     the whole archive.
+//!   - **Group Replication**: main.rs spawns `run_group_primary_supervisor`,
+//!     which runs `run` only while THIS node is the group's writable primary
+//!     (the /role fence's own verdict) and stops it the moment it isn't. Every
+//!     member logs the same group transactions under the same GTIDs, so the
+//!     primary's binlogs are a complete stream of the group's history, and
+//!     after a switchover or failover the NEW primary's archiver picks up in
+//!     its own `server-<uuid>/` lineage — including, in its retained closed
+//!     binlogs, the transactions the old primary's never-uploaded active file
+//!     took down with it. Restore stitches those lineages back together by
+//!     GTID (restore.rs).
 //!
 //! Four independent loops, spawned together by `run` once mysqld is ready:
-//!   - full backups: one immediately if the bucket holds none for this
-//!     server_uuid, then every `BINLOG_FULL_BACKUP_INTERVAL_SECONDS`.
+//!   - full backups: one when the archive holds none, then every
+//!     `BINLOG_FULL_BACKUP_INTERVAL_SECONDS` after the newest one. "The
+//!     archive" is this server's own lineage standalone, and EVERY lineage
+//!     for a group primary — a member that takes over mid-interval inherits
+//!     the cadence rather than dumping the whole dataset on failover, which
+//!     is exactly when the cluster can least afford it.
 //!   - binlog shipping (~every 10s): upload every CLOSED binlog not yet
-//!     uploaded, then reclaim (`PURGE BINARY LOGS TO`) whatever is now
-//!     provably safe — never a file that hasn't been confirmed uploaded, so
-//!     the volume is the spool during a bucket outage (uploads retry with
-//!     backoff; purge waits).
+//!     uploaded, then — standalone only — reclaim (`PURGE BINARY LOGS TO`)
+//!     whatever is now provably safe — never a file that hasn't been
+//!     confirmed uploaded, so the volume is the spool during a bucket outage
+//!     (uploads retry with backoff; purge waits). A group primary never
+//!     purges by upload: its peers recover from each other out of retained
+//!     binlogs (a purged donor forces a full clone), and mysqld's own expiry
+//!     in the GR config bounds the disk instead.
 //!   - rotation: `FLUSH BINARY LOGS` every `BINLOG_ROTATE_INTERVAL_SECONDS`,
 //!     bounding the recovery point objective — the same role
 //!     `archive_timeout` plays for a WAL archive.
@@ -28,14 +48,16 @@
 use crate::config::Config;
 use crate::pitr::{self, FullBackupMeta, S3Location};
 use crate::s3::S3Client;
-use crate::sql::Sql;
+use crate::sql::{role_is_writable_primary, Sql};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use common::{Telemetry, TelemetryEvent};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -44,15 +66,173 @@ use tracing::{error, info, warn};
 const SHIP_POLL: Duration = Duration::from_secs(10);
 const FULL_BACKUP_RETRY_DELAY: Duration = Duration::from_secs(60);
 const UPLOAD_STATE_FILE: &str = ".pitr_uploaded_binlogs.json";
+/// How often the group-mode supervisor re-reads this node's role. The same
+/// order as HAProxy's /role probe: a demoted primary stops archiving within
+/// one poll, and a promoted one starts within one.
+const ROLE_POLL: Duration = Duration::from_secs(5);
+
+/// How the archiver relates to the server it runs beside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveMode {
+    /// A lone server: this lineage is the whole archive, and the archiver
+    /// itself reclaims uploaded binlogs from local disk (mysqld's own expiry
+    /// is off — see `mysql_conf::render_standalone_archive_conf`).
+    Standalone,
+    /// The writable primary of a Group Replication group. Local binlogs are
+    /// never reclaimed by upload (see the module doc), and fulls are due
+    /// archive-wide rather than per lineage.
+    GroupPrimary,
+}
+
+impl ArchiveMode {
+    fn label(self) -> &'static str {
+        match self {
+            ArchiveMode::Standalone => "standalone",
+            ArchiveMode::GroupPrimary => "group-primary",
+        }
+    }
+}
+
+/// What the archiver is doing right now, as the health server's `/pitr`
+/// endpoint reports it (JSON). Read by the platform's enable workflow to
+/// confirm archiving actually started on the node it just promoted, and by
+/// the fleet monitor. Purely informational — nothing routes on it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PitrStatusSnapshot {
+    /// `BINLOG_ARCHIVE_BUCKET` (and siblings) are set on this node.
+    pub archive_configured: bool,
+    /// The archiver loops are running on THIS node right now. False on a
+    /// group secondary even with the contract configured — its primary
+    /// archives for it.
+    pub archiving: bool,
+    /// `standalone` / `group-primary`, while archiving.
+    pub mode: Option<String>,
+    /// The lineage this node archives under (`server-<uuid>/`).
+    pub server_uuid: Option<String>,
+    pub last_full_backup_at: Option<String>,
+    pub last_shipped_binlog: Option<String>,
+    pub last_shipped_at: Option<String>,
+    /// The most recent loop failure, if any, verbatim.
+    pub last_error: Option<String>,
+}
+
+/// Shared, cheaply-cloned handle to the live `PitrStatusSnapshot`.
+pub struct PitrStatus {
+    inner: RwLock<PitrStatusSnapshot>,
+}
+
+impl PitrStatus {
+    pub fn new(archive_configured: bool) -> Arc<Self> {
+        Arc::new(Self {
+            inner: RwLock::new(PitrStatusSnapshot {
+                archive_configured,
+                ..PitrStatusSnapshot::default()
+            }),
+        })
+    }
+
+    pub fn snapshot(&self) -> PitrStatusSnapshot {
+        self.inner
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    fn update(&self, f: impl FnOnce(&mut PitrStatusSnapshot)) {
+        match self.inner.write() {
+            Ok(mut guard) => f(&mut guard),
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+
+    fn note_error(&self, error: &anyhow::Error) {
+        let text = error.to_string();
+        self.update(|s| s.last_error = Some(text));
+    }
+}
+
+/// Group Replication mode: run the archiver on this node exactly while it is
+/// the group's writable primary, re-deciding every `ROLE_POLL` from the same
+/// verdict the /role fence answers with (`sql::role_is_writable_primary`,
+/// outranked by the membership fence). A demotion aborts the running loops
+/// mid-flight — the new primary archives from here on, and anything this
+/// node had not confirmed uploaded is re-shipped by whoever is primary next
+/// (its own upload state is per lineage, so on re-promotion it resumes its
+/// own). A verdict that cannot be read leaves the current state alone: a
+/// transient SQL error must neither stop a healthy archiver nor start one.
+pub async fn run_group_primary_supervisor(
+    config: Arc<Config>,
+    sql: Sql,
+    telemetry: Arc<Telemetry>,
+    membership_fenced: Arc<AtomicBool>,
+    status: Arc<PitrStatus>,
+) {
+    wait_for_mysqld(&sql).await;
+    info!("PITR archiving is configured on a Group Replication member; archiving follows the writable-primary role");
+
+    let mut running: Option<tokio::task::JoinHandle<()>> = None;
+    loop {
+        if running.as_ref().is_some_and(|h| h.is_finished()) {
+            // `run` only returns when it could not even start (no S3
+            // client, no server_uuid); it has already logged why.
+            running = None;
+            status.update(|s| s.archiving = false);
+        }
+
+        let verdict = async {
+            let self_uuid = sql.server_uuid().await?;
+            let members = sql.group_members().await?;
+            anyhow::Ok(
+                role_is_writable_primary(&members, &self_uuid)
+                    && !membership_fenced.load(Ordering::Acquire),
+            )
+        }
+        .await;
+
+        match (verdict, running.is_some()) {
+            (Ok(true), false) => {
+                info!("this node is the group's writable primary; starting the PITR archiver");
+                running = Some(tokio::spawn(run(
+                    config.clone(),
+                    sql.clone(),
+                    telemetry.clone(),
+                    ArchiveMode::GroupPrimary,
+                    status.clone(),
+                )));
+            }
+            (Ok(false), true) => {
+                warn!(
+                    "this node is no longer the group's writable primary; stopping the PITR \
+                     archiver — the new primary archives from here on"
+                );
+                if let Some(handle) = running.take() {
+                    handle.abort();
+                }
+                status.update(|s| {
+                    s.archiving = false;
+                    s.mode = None;
+                });
+            }
+            _ => {}
+        }
+        tokio::time::sleep(ROLE_POLL).await;
+    }
+}
 /// mysqldump emits the `CHANGE MASTER TO` / `CHANGE REPLICATION SOURCE TO`
 /// coordinate line within the first few KB of output; this cap bounds how
 /// much of the (uncompressed) stream is buffered in memory to find it.
 const COORD_SCAN_CAP: usize = 256 * 1024;
 
-/// Spawn and run the three archiver loops forever. Only returns if one of
+/// Spawn and run the four archiver loops forever. Only returns if one of
 /// them panics (logged, not propagated) or the S3 client/server_uuid can't
 /// be obtained at startup.
-pub async fn run(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
+pub async fn run(
+    config: Arc<Config>,
+    sql: Sql,
+    telemetry: Arc<Telemetry>,
+    mode: ArchiveMode,
+    status: Arc<PitrStatus>,
+) {
     wait_for_mysqld(&sql).await;
 
     let location = config
@@ -78,12 +258,33 @@ pub async fn run(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
             return;
         }
     };
+    if mode == ArchiveMode::GroupPrimary {
+        // Declare the archive one shared history before the first byte of
+        // GTID binlog lands in it (see pitr::shared_history_marker_key).
+        // Idempotent; a failure here is retried on the next start and is
+        // never silent for a restore — an undeclared GTID binlog fails
+        // loudly under the anonymous replay rather than replaying wrong.
+        let marker = pitr::shared_history_marker_key(&location);
+        if let Err(e) = s3
+            .put_object_bytes(&marker, b"group-replication".to_vec())
+            .await
+        {
+            warn!(error = %e, key = %marker, "could not write the shared-history marker; will retry on the next archiver start");
+            status.note_error(&e);
+        }
+    }
     info!(
         %server_uuid,
         bucket = %location.bucket,
         path = %location.path,
+        mode = mode.label(),
         "starting PITR archiver"
     );
+    status.update(|s| {
+        s.archiving = true;
+        s.mode = Some(mode.label().to_string());
+        s.server_uuid = Some(server_uuid.clone());
+    });
 
     // A container that crashed before ever confirming a HEAD must not trust
     // its own "uploaded" bookkeeping — reconcile against the bucket once,
@@ -97,6 +298,8 @@ pub async fn run(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
         s3.clone(),
         location.clone(),
         server_uuid.clone(),
+        mode,
+        status.clone(),
     ));
     let ship_task = tokio::spawn(binlog_shipping_loop(
         config.clone(),
@@ -105,6 +308,8 @@ pub async fn run(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
         s3.clone(),
         location.clone(),
         server_uuid.clone(),
+        mode,
+        status.clone(),
     ));
     let rotate_task = tokio::spawn(rotation_loop(
         config.clone(),
@@ -155,6 +360,28 @@ async fn wait_for_mysqld(sql: &Sql) {
 
 // --- full backups -----------------------------------------------------------
 
+/// The newest complete full's `taken_at` in the part of the archive this
+/// mode's cadence is measured against: this server's own lineage standalone,
+/// every lineage for a group primary (see the module doc). Read off the
+/// listing alone — the instant is encoded in the object name.
+async fn newest_full_taken_at(
+    s3: &S3Client,
+    location: &S3Location,
+    server_uuid: &str,
+    mode: ArchiveMode,
+) -> Result<Option<DateTime<Utc>>> {
+    let prefix = match mode {
+        ArchiveMode::Standalone => pitr::full_prefix(location, server_uuid),
+        ArchiveMode::GroupPrimary => pitr::base_prefix(location),
+    };
+    let keys = s3.list_keys_with_prefix(&prefix).await?;
+    Ok(keys
+        .iter()
+        .filter(|k| k.ends_with(".meta.json"))
+        .filter_map(|k| pitr::full_taken_at_from_key(k))
+        .max())
+}
+
 async fn full_backup_loop(
     config: Arc<Config>,
     sql: Sql,
@@ -162,51 +389,67 @@ async fn full_backup_loop(
     s3: S3Client,
     location: S3Location,
     server_uuid: String,
+    mode: ArchiveMode,
+    status: Arc<PitrStatus>,
 ) {
     let interval = Duration::from_secs(config.binlog_full_backup_interval_seconds);
 
-    let needs_initial = match s3
-        .list_keys_with_prefix(&pitr::full_prefix(&location, &server_uuid))
+    loop {
+        // Re-read the archive every cycle rather than sleeping a fixed
+        // interval from our own last dump: in group mode another member may
+        // have taken a full while this one waited (or was a secondary), and
+        // that full resets the cadence for everyone.
+        let now = Utc::now();
+        let (newest, listing_failed) = match newest_full_taken_at(
+            &s3,
+            &location,
+            &server_uuid,
+            mode,
+        )
         .await
-    {
-        Ok(keys) => !keys.iter().any(|k| k.ends_with(".meta.json")),
-        Err(e) => {
-            warn!(error = %e, "could not check the bucket for an existing full backup; assuming none and taking one now");
-            true
-        }
-    };
-
-    if needs_initial {
-        loop {
-            match take_full_backup(&config, &sql, &s3, &location, &server_uuid).await {
-                Ok(()) => {
-                    info!("initial full backup completed");
-                    break;
-                }
-                Err(e) => {
-                    error!(error = %e, "initial full backup failed; retrying");
-                    telemetry.send(TelemetryEvent::ComponentError {
-                        component: "mysql-wrapper".to_string(),
-                        error: e.to_string(),
-                        context: "pitr_full_backup".to_string(),
-                    });
-                    tokio::time::sleep(FULL_BACKUP_RETRY_DELAY).await;
-                }
+        {
+            Ok(newest) => (newest, false),
+            Err(e) => {
+                warn!(error = %e, "could not check the archive for an existing full backup; assuming none and taking one now");
+                (None, true)
+            }
+        };
+        if let Some(taken_at) = newest {
+            let due_at = taken_at + chrono::Duration::from_std(interval).unwrap_or_default();
+            if due_at > now {
+                let wait = (due_at - now).to_std().unwrap_or(interval).min(interval);
+                tokio::time::sleep(wait).await;
+                continue;
             }
         }
-    }
 
-    loop {
-        tokio::time::sleep(interval).await;
+        let kind = if newest.is_none() && !listing_failed {
+            "initial"
+        } else {
+            "scheduled"
+        };
         match take_full_backup(&config, &sql, &s3, &location, &server_uuid).await {
-            Ok(()) => info!("scheduled full backup completed"),
+            Ok(taken_at) => {
+                status.update(|s| {
+                    s.last_full_backup_at = Some(pitr::format_rfc3339_millis(taken_at))
+                });
+                // Both spellings are load-bearing for the e2e harness, which
+                // waits on them by name.
+                if kind == "initial" {
+                    info!("initial full backup completed");
+                } else {
+                    info!("scheduled full backup completed");
+                }
+            }
             Err(e) => {
-                error!(error = %e, "scheduled full backup failed; will retry next cycle");
+                error!(error = %e, kind, "full backup failed; retrying");
+                status.note_error(&e);
                 telemetry.send(TelemetryEvent::ComponentError {
                     component: "mysql-wrapper".to_string(),
                     error: e.to_string(),
                     context: "pitr_full_backup".to_string(),
                 });
+                tokio::time::sleep(FULL_BACKUP_RETRY_DELAY).await;
             }
         }
     }
@@ -224,8 +467,8 @@ async fn take_full_backup(
     s3: &S3Client,
     location: &S3Location,
     server_uuid: &str,
-) -> Result<()> {
-    let taken_at = chrono::Utc::now();
+) -> Result<DateTime<Utc>> {
+    let taken_at = Utc::now();
     let rfc = pitr::format_rfc3339_millis(taken_at);
     let dump_key = pitr::full_dump_key(location, server_uuid, &rfc);
     let meta_key = pitr::full_meta_key(location, server_uuid, &rfc);
@@ -300,6 +543,10 @@ async fn take_full_backup(
     let (binlog_file, binlog_pos) = pitr::parse_change_master_coords(&dump_head).with_context(
         || "could not find a CHANGE MASTER TO / CHANGE REPLICATION SOURCE TO coordinate line in mysqldump's output",
     )?;
+    // Present exactly when the source runs with GTIDs (every Group
+    // Replication member does): the set of transactions the dump already
+    // holds, by identity. Restore replays other lineages against it.
+    let gtid_purged = pitr::parse_gtid_purged(&dump_head);
     let mysql_version = sql
         .mysql_version()
         .await
@@ -311,13 +558,14 @@ async fn take_full_backup(
         binlog_pos,
         server_uuid: server_uuid.to_string(),
         mysql_version,
+        gtid_purged,
     };
     let meta_json = serde_json::to_vec_pretty(&meta).context("serializing full-backup meta")?;
     s3.put_object_bytes(&meta_key, meta_json)
         .await
         .context("uploading full-backup meta.json")?;
 
-    Ok(())
+    Ok(taken_at)
 }
 
 /// Probe the installed `mysqldump`'s supported coordinate flag via its own
@@ -379,10 +627,24 @@ async fn binlog_shipping_loop(
     s3: S3Client,
     location: S3Location,
     server_uuid: String,
+    mode: ArchiveMode,
+    status: Arc<PitrStatus>,
 ) {
+    let reclaim_local = mode == ArchiveMode::Standalone;
     loop {
-        if let Err(e) = ship_once(&config, &sql, &s3, &location, &server_uuid).await {
+        if let Err(e) = ship_once(
+            &config,
+            &sql,
+            &s3,
+            &location,
+            &server_uuid,
+            reclaim_local,
+            &status,
+        )
+        .await
+        {
             warn!(error = %e, "binlog shipping pass failed; retrying next cycle");
+            status.note_error(&e);
             telemetry.send(TelemetryEvent::ComponentError {
                 component: "mysql-wrapper".to_string(),
                 error: e.to_string(),
@@ -452,6 +714,13 @@ async fn retention_pass(
 ) -> Result<()> {
     let now = chrono::Utc::now();
     let lineages = read_archive_lineages(s3, location, now).await?;
+    // Fail the pass rather than guess: reading this as "absent" on an S3
+    // error would apply the independent-histories rules to a shared history
+    // and could retire a full-less primary lineage.
+    let shared_history_marker = s3
+        .exists(&pitr::shared_history_marker_key(location))
+        .await
+        .context("checking the archive for the shared-history marker")?;
     let input = pitr::RetentionInput {
         lineages,
         // Passing our OWN uuid is what makes "dead lineage" meaningful. The
@@ -459,6 +728,7 @@ async fn retention_pass(
         active_server_uuid: Some(server_uuid.to_string()),
         now,
         horizon,
+        shared_history_marker,
     };
     let plan = pitr::plan_retention(&input);
 
@@ -548,11 +818,9 @@ async fn read_archive_lineages(
     location: &S3Location,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<pitr::LineageObjects>> {
-    use std::collections::BTreeMap;
-
     let base = pitr::base_prefix(location);
-    let keys = s3
-        .list_keys_with_prefix(&base)
+    let objects = s3
+        .list_objects_with_prefix(&base)
         .await
         .context("listing the PITR archive bucket for retention")?;
 
@@ -560,10 +828,11 @@ async fn read_archive_lineages(
         metas: Vec<String>,
         dumps: BTreeSet<String>,
         binlogs: Vec<String>,
+        binlog_ages: BTreeMap<String, DateTime<Utc>>,
     }
     let mut per_lineage: BTreeMap<String, Raw> = BTreeMap::new();
 
-    for key in &keys {
+    for (key, modified) in &objects {
         let Some(uuid) = pitr::server_uuid_from_key(location, key) else {
             continue;
         };
@@ -571,6 +840,7 @@ async fn read_archive_lineages(
             metas: Vec::new(),
             dumps: BTreeSet::new(),
             binlogs: Vec::new(),
+            binlog_ages: BTreeMap::new(),
         });
         if key.contains("/full/") {
             if key.ends_with(".meta.json") {
@@ -581,6 +851,9 @@ async fn read_archive_lineages(
         } else if key.contains("/binlog/") {
             if let Some(name) = key.rsplit('/').next() {
                 entry.binlogs.push(name.to_string());
+                if let Some(modified) = modified {
+                    entry.binlog_ages.insert(name.to_string(), *modified);
+                }
             }
         }
     }
@@ -656,17 +929,22 @@ async fn read_archive_lineages(
             full_objects_seen: raw.metas.len(),
             orphan_dumps,
             binlogs: raw.binlogs,
+            binlog_ages: raw.binlog_ages,
         });
     }
     Ok(out)
 }
 
+/// One shipping pass. `reclaim_local` is the standalone-only PURGE step — a
+/// group primary leaves local reclaim to mysqld's own expiry (module doc).
 async fn ship_once(
     config: &Config,
     sql: &Sql,
     s3: &S3Client,
     location: &S3Location,
     server_uuid: &str,
+    reclaim_local: bool,
+    status: &PitrStatus,
 ) -> Result<()> {
     let (active, _pos) = sql
         .binary_log_status()
@@ -709,8 +987,15 @@ async fn ship_once(
         state.uploaded.insert(name.clone());
         write_upload_state(&config.data_dir, &state)?;
         info!(file = %name, "binlog uploaded");
+        status.update(|s| {
+            s.last_shipped_binlog = Some(name.clone());
+            s.last_shipped_at = Some(pitr::format_rfc3339_millis(Utc::now()));
+        });
     }
 
+    if !reclaim_local {
+        return Ok(());
+    }
     if let Some(cut) = pitr::purge_cut(&disk_files, &active, &state.uploaded, &state.lost) {
         sql.purge_binary_logs_to(&cut)
             .await

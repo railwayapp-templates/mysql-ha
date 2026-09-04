@@ -121,17 +121,34 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
   the volume. Thresholds: `BOOT_LOOP_THRESHOLD`, `BOOT_READY_BUDGET_SECONDS`,
   `STUCK_MEMBER_DWELL_SECONDS`, `SELF_HEAL_ATTEMPT_CAP`,
   `SELF_HEAL_BACKOFF_BASE_SECONDS`.
-- **Point-in-time recovery — standalone mode only.** Two independent,
-  env-gated concerns layered on the standalone (non-GR) path (see
-  `pitr.rs`/`archiver.rs`/`restore.rs`):
+- **Point-in-time recovery.** Two independent, env-gated concerns (see
+  `pitr.rs`/`archiver.rs`/`restore.rs`), layered on either mode:
   - **Continuous archiving**, gated by `BINLOG_ARCHIVE_BUCKET` (plus
     `_KEY`/`_SECRET`/`_REGION`/`_ENDPOINT`, and `_PATH`, default `/binlog`):
-    enables the binlog, takes an initial `mysqldump` full backup (then one
-    every `BINLOG_FULL_BACKUP_INTERVAL_SECONDS`, default a day) and
-    continuously ships closed binlogs to an S3-compatible bucket, rotating
-    every `BINLOG_ROTATE_INTERVAL_SECONDS` (default 60s) to bound the
-    recovery point objective. A binlog is only purged locally once its
-    upload is confirmed — the volume is the spool during a bucket outage.
+    takes a `mysqldump` full backup when the archive holds none (then one
+    every `BINLOG_FULL_BACKUP_INTERVAL_SECONDS` after the newest, default a
+    day) and continuously ships closed binlogs to an S3-compatible bucket,
+    rotating every `BINLOG_ROTATE_INTERVAL_SECONDS` (default 60s) to bound
+    the recovery point objective.
+    - *Standalone*: the archive conf turns the binlog on (the plain
+      rendering leaves it off), and a binlog is only purged locally once its
+      upload is confirmed — the volume is the spool during a bucket outage.
+    - *Group Replication*: every member carries the same variables, and the
+      archiver runs only on the member whose `/role` is the writable primary
+      — a role supervisor starts it on promotion and stops it on demotion,
+      so exactly one member archives at a time. Each member archives under
+      its own `server-<uuid>/` lineage, and because every member logs the
+      same group transactions under the same GTIDs, the lineages together
+      are one history: after a failover the new primary's retained closed
+      binlogs carry the transactions the old primary's never-uploaded active
+      file took down with it. The primary never purges binlogs by upload
+      (peers recover from each other out of retained binlogs; a purged donor
+      forces a full clone) — the GR config's own 3-day expiry bounds the
+      disk, so an archiver down longer than that leaves a loud, permanent
+      gap rather than a silent one. Fulls are due archive-wide, not per
+      lineage: a member that takes over mid-interval inherits the cadence
+      instead of dumping the whole dataset on failover. `GET /pitr` on the
+      health port reports whether THIS node is archiving.
   - **Archive retention**, `BINLOG_RETENTION_DAYS`: how far back the archive
     stays restorable. **Unset — the common case — assumes
     `DEFAULT_BINLOG_RETENTION_DAYS` (7)**, so the image bounds every service's
@@ -166,6 +183,18 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     in `pitr::plan_retention` as pure logic, unit-tested without a bucket;
     `archiver.rs` only executes a plan.
 
+    A Group Replication archive is one shared history with several writers,
+    and the planner switches rules once any full carries a GTID set: fulls
+    rank archive-wide (the count floor applies to the archive, not per
+    lineage), the oldest retained full's `taken_at` is the one instant that
+    divides the archive, and in every OTHER lineage a binlog expires only when
+    it was uploaded before that instant (upload time ≥ close time ≥ every
+    event in it, so it holds nothing the floor dump lacks). A lineage with no
+    full of its own — the common shape after a failover — is never
+    "unrestorable", and a dead lineage retires only when none of its objects
+    survive the floor. A binlog whose upload time the listing did not report
+    is kept, and a pass that could not read every full expires nothing.
+
     Two rules exist because their absence was a data-loss bug, not because
     they were designed up front — both are regression-tested: a lineage whose
     fulls **exist but could not be read** this pass (an S3 blip, a corrupt
@@ -183,10 +212,19 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     `_KEY`/`_SECRET`/`_REGION`/`_ENDPOINT`/`_PATH` shape) together with
     `MYSQL_RECOVERY_TARGET_TIME` (ISO-8601 UTC): on a fresh volume only,
     loads the newest full backup at or before the target instant and
-    replays binlogs up to it before mysqld ever starts serving.
-  - Both are refused (logged, not fatal) whenever `GR_SEEDS` is set — the
-    archiver/restore paths are standalone-only in this version and never
-    touch the Group Replication path.
+    replays binlogs up to it before mysqld ever starts serving. On an
+    archive written by a Group Replication group it replays the full's own
+    lineage from its coordinate and then every other lineage from its first
+    archived file, with the restore-phase mysqld on
+    `gtid_mode=ON_PERMISSIVE` so the server applies each GTID once, whichever
+    lineage delivers it first (and still accepts anonymous binlogs from
+    before a standalone→HA conversion). Completeness is then proven on the
+    result: a hole in any UUID's `gtid_executed` interval set, or a dump
+    transaction missing from it, refuses the restore — the shared-history
+    form of the single-lineage gap check.
+  - Restore is standalone-only: a restore produces a new standalone server,
+    so the recover contract is refused (logged, not fatal) while `GR_SEEDS`
+    is set. Archiving runs in both modes.
 
 ## Conversion notes
 
@@ -266,15 +304,21 @@ series), the unconnectable-member self-heal (a boot-wedged corrupted datadir
 reprovisions from the group; an applier-wedged ERROR member reclones; and the
 negative guard — no quorum-confirmed donor, no wipe, ever), and point-in-time
 recovery (continuous archiving to a bucket, then restoring a second node onto
-an arbitrary timestamp and asserting only the pre-target writes are present).
+an arbitrary timestamp and asserting only the pre-target writes are present —
+standalone, and from a Group Replication trio: the archiver follows the
+primary across a switchover, a paused primary's never-uploaded tail is
+recovered from the next primary's lineage, a binlog deleted from the only
+lineage that carried it refuses the restore on the GTID hole, and a
+standalone-archived volume converted to HA restores across the
+anonymous→GTID boundary).
 
 Deliberately out of scope for v1:
 
 - **No read port.** The edge exposes only the write frontend; a load-balanced
   read port is a future addition.
-- **PITR is standalone-only.** Binlog archiving and restore-on-boot don't run
-  in Group Replication mode yet — the gate vars are refused with a warning
-  instead of interacting with the GR path.
+- **Restore INTO a group.** A point-in-time restore always produces a new
+  standalone server; converting that server to HA afterwards is the platform's
+  ordinary conversion flow, not a restore feature.
 - **Rolling upgrades are not coordinated — and don't need to be, within a
   series.** Data nodes carry a series tag with no auto-update; any redeploy
   re-pulls the tag's current patch. This is safe by the LTS model: Group

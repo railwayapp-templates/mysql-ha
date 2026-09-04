@@ -23,8 +23,11 @@ jobs:
     # (cancelled 2026-08-31 01:04Z). This branch's retention scenario adds
     # ~10 min of bucket sweeps on its own clock on top of that. 90 fits the
     # suite plus variance without masking a hang: every scenario still fails
-    # on its own internal waits, far below the cap.
-    timeout-minutes: 90
+    # on its own internal waits, far below the cap. The three HA PITR
+    # scenarios (a trio + minio + one or two restore nodes each, ~7 min
+    # apiece) pushed the suite past 90 on 2026-09-04; 120 keeps the same
+    # margin over the new length.
+    timeout-minutes: 120
 
     steps:
       - name: Checkout sources
