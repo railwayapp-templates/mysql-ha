@@ -173,8 +173,9 @@ pub async fn run_group_primary_supervisor(
     let mut running: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         if running.as_ref().is_some_and(|h| h.is_finished()) {
-            // `run` only returns when it could not even start (no S3
-            // client, no server_uuid); it has already logged why.
+            // `run` returns when it could not even start (no S3 client, no
+            // server_uuid) or when every loop has ended; it has logged why.
+            // The next primary verdict starts it again.
             running = None;
             status.update(|s| s.archiving = false);
         }
@@ -291,55 +292,98 @@ pub async fn run(
     // up front, every boot.
     reconcile_upload_state(&s3, &location, &config.data_dir, &server_uuid).await;
 
-    let full_task = tokio::spawn(full_backup_loop(
-        config.clone(),
-        sql.clone(),
-        telemetry.clone(),
-        s3.clone(),
-        location.clone(),
-        server_uuid.clone(),
-        mode,
-        status.clone(),
-    ));
-    let ship_task = tokio::spawn(binlog_shipping_loop(
-        config.clone(),
-        sql.clone(),
-        telemetry.clone(),
-        s3.clone(),
-        location.clone(),
-        server_uuid.clone(),
-        mode,
-        status.clone(),
-    ));
-    let rotate_task = tokio::spawn(rotation_loop(
-        config.clone(),
-        sql.clone(),
-        telemetry.clone(),
-    ));
-    let retention_task = tokio::spawn(retention_loop(
-        config.clone(),
-        telemetry.clone(),
-        s3.clone(),
-        location.clone(),
-        server_uuid.clone(),
-    ));
+    // One JoinSet owns every loop, so dropping it aborts them all together —
+    // which is exactly what the group-mode supervisor's abort of this task
+    // does on demotion. Plain `tokio::spawn` handles would detach instead:
+    // the loops would keep shipping from a secondary after the supervisor
+    // had already reported the archiver stopped.
+    let mut loops = tokio::task::JoinSet::new();
+    loops.spawn({
+        let (config, sql, telemetry, s3, location, server_uuid, status) = (
+            config.clone(),
+            sql.clone(),
+            telemetry.clone(),
+            s3.clone(),
+            location.clone(),
+            server_uuid.clone(),
+            status.clone(),
+        );
+        async move {
+            full_backup_loop(
+                config,
+                sql,
+                telemetry,
+                s3,
+                location,
+                server_uuid,
+                mode,
+                status,
+            )
+            .await;
+            "full_backup"
+        }
+    });
+    loops.spawn({
+        let (config, sql, telemetry, s3, location, server_uuid, status) = (
+            config.clone(),
+            sql.clone(),
+            telemetry.clone(),
+            s3.clone(),
+            location.clone(),
+            server_uuid.clone(),
+            status.clone(),
+        );
+        async move {
+            binlog_shipping_loop(
+                config,
+                sql,
+                telemetry,
+                s3,
+                location,
+                server_uuid,
+                mode,
+                status,
+            )
+            .await;
+            "binlog_shipping"
+        }
+    });
+    loops.spawn({
+        let (config, sql, telemetry) = (config.clone(), sql.clone(), telemetry.clone());
+        async move {
+            rotation_loop(config, sql, telemetry).await;
+            "rotation"
+        }
+    });
+    loops.spawn({
+        let (config, telemetry, s3, location, server_uuid) = (
+            config.clone(),
+            telemetry.clone(),
+            s3.clone(),
+            location.clone(),
+            server_uuid.clone(),
+        );
+        async move {
+            retention_loop(config, telemetry, s3, location, server_uuid).await;
+            "retention"
+        }
+    });
 
-    // None of these loops return in normal operation; if one panics, say so
-    // loudly instead of the archiver silently going dark (mirrors
+    // None of these loops return in normal operation (retention does when
+    // opted out, and says so itself); if one panics, say so loudly instead of
+    // the archiver silently going dark (mirrors
     // health_server::run_health_server_supervised's rationale).
-    for (name, task) in [
-        ("full_backup", full_task),
-        ("binlog_shipping", ship_task),
-        ("rotation", rotate_task),
-        ("retention", retention_task),
-    ] {
-        if let Err(e) = task.await {
-            error!(loop_name = name, error = ?e, "PITR archiver loop exited unexpectedly");
-            telemetry.send(TelemetryEvent::ComponentError {
-                component: "mysql-wrapper".to_string(),
-                error: format!("PITR archiver loop {name} exited unexpectedly: {e}"),
-                context: "pitr_archiver_loop".to_string(),
-            });
+    while let Some(outcome) = loops.join_next().await {
+        match outcome {
+            Ok(name) => info!(loop_name = name, "PITR archiver loop finished"),
+            Err(e) => {
+                error!(error = ?e, "PITR archiver loop exited unexpectedly");
+                telemetry.send(TelemetryEvent::ComponentError {
+                    component: "mysql-wrapper".to_string(),
+                    error: format!("PITR archiver loop exited unexpectedly: {e}"),
+                    context: "pitr_archiver_loop".to_string(),
+                });
+            }
         }
     }
 }

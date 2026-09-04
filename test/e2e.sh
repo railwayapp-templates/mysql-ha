@@ -2590,6 +2590,17 @@ t_pitr_ha_archives_from_the_primary_and_follows_switchover() {
   [ "$(pitr_field mysql-2 "$primary" archiving)" = "false" ] && ok "/pitr on the demoted node reports not archiving" || bad "/pitr on the demoted node still reports archiving"
   [ "$(pitr_field mysql-2 "$target" archiving)" = "true" ] && ok "/pitr on the promoted node reports archiving" || bad "/pitr on the promoted node does not report archiving"
 
+  # The demoted node must have actually STOPPED, not just said so: its
+  # lineage in the bucket may not grow after the demotion. Give an in-flight
+  # upload a moment to land, take the count, then FLUSH on the demoted node
+  # (closing a new file its archiver would ship if it were still alive) and
+  # wait out two ship polls.
+  local old_uuid old_count
+  old_uuid="$(sql "$primary" "SELECT @@server_uuid")"
+  sleep 15
+  old_count="$(mc_count "e2e-pitr-ha/server-$old_uuid/binlog/")" || { bad "could not count the demoted node's lineage"; return; }
+  sql "$primary" "FLUSH BINARY LOGS;"
+
   # Tenure 2, on the new primary: a row before T, a row after T.
   sql "$target" "INSERT INTO t.kv VALUES (2,'tenure-2');"
   sleep 2
@@ -2604,6 +2615,13 @@ t_pitr_ha_archives_from_the_primary_and_follows_switchover() {
   sql "$target" "FLUSH BINARY LOGS;"
   wait_uploaded "$target" "$f2" || { bad "tenure-2 binlog never shipped"; docker logs "$target" 2>&1 | tail -40; return; }
   ok "tenure-2 binlog $f2 shipped under $target's lineage"
+
+  sleep 25
+  local old_count_after
+  old_count_after="$(mc_count "e2e-pitr-ha/server-$old_uuid/binlog/")" || { bad "could not recount the demoted node's lineage"; return; }
+  [ "$old_count_after" = "$old_count" ] \
+    && ok "the demoted node's lineage stopped growing ($old_count objects) — its archiver loops really stopped" \
+    || bad "the demoted node kept shipping after demotion ($old_count -> $old_count_after objects in its lineage)"
 
   local fulls lineages
   fulls="$(mc_count_matching e2e-pitr-ha/ .meta.json)" || { bad "could not count fulls"; return; }
