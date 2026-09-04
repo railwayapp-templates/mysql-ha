@@ -4,6 +4,15 @@ on:
   pull_request:
   push:
     branches: [main]
+  # A targeted run: only the named scenarios (the harness takes t_* names as
+  # arguments). For iterating on one scenario's failure without paying for
+  # the whole ~100-minute suite; the pull_request run still covers everything.
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: "Space-separated t_* scenario names (empty = whole suite)"
+        type: string
+        default: ""
 
 concurrency:
   group: e2e-${{ github.ref }}
@@ -52,7 +61,7 @@ jobs:
         # GitHub's default `run:` shell has no pipefail, so without it the
         # pipe to tee swallows the harness's failure-count exit code and the
         # job reports success no matter how many scenarios failed.
-        run: set -o pipefail; ./test/e2e.sh 2>&1 | tee e2e.log
+        run: set -o pipefail; ./test/e2e.sh ${{ inputs.tests }} 2>&1 | tee e2e.log
 
       - name: Upload log
         if: always()

@@ -539,6 +539,14 @@ async fn take_full_backup(
         .arg("--events")
         .arg("--triggers")
         .arg("--all-databases")
+        // The server's own GTID bookkeeping must never travel inside the
+        // dump: `SET @@GLOBAL.GTID_PURGED` (which mysqldump emits for a GTID
+        // source) is what carries the dump's GTID state, and a restore that
+        // ALSO replayed this table's rows would collide with the rows the
+        // restored server writes for the same GTIDs (duplicate primary key
+        // on (source_uuid, interval_start)) — aborting the load. Empty on a
+        // gtid_mode=OFF standalone, so this changes nothing there.
+        .arg("--ignore-table=mysql.gtid_executed")
         .arg(data_flag)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
