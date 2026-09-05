@@ -201,6 +201,16 @@ mc_count() {
   return 1
 }
 
+# mc_exists <exact-key> — true/false on whether exactly this object exists.
+# `mc find` walks a path's CHILDREN, so a leaf key with nothing "inside" it
+# reports zero matches regardless of whether the leaf itself exists — every
+# object this suite checks by exact key (the shared-history marker, one per
+# archive) needs `mc stat` instead, which resolves the key directly.
+mc_exists() {
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc stat e2e/$PITR_BUCKET/$1 >/dev/null 2>&1"
+}
+
 # mc_count_matching <prefix> <substring> — objects under a prefix whose key
 # contains a substring. Same fail-loud contract as mc_count.
 mc_count_matching() {
@@ -2628,7 +2638,7 @@ t_pitr_ha_archives_from_the_primary_and_follows_switchover() {
   [ "$fulls" = "1" ] && ok "the switchover took no new full backup (archive-wide cadence; 1 full)" || bad "expected exactly 1 full backup after the switchover, found $fulls"
   lineages="$(mc_lineage_count e2e-pitr-ha/)" || { bad "could not count lineages"; return; }
   [ "$lineages" = "2" ] && ok "two lineages in the archive (one per tenure)" || bad "expected 2 lineages, found $lineages"
-  mc_count e2e-pitr-ha/shared-history >/dev/null && [ "$(mc_count e2e-pitr-ha/shared-history)" = "1" ] \
+  mc_exists e2e-pitr-ha/shared-history \
     && ok "shared-history marker present" || bad "shared-history marker missing"
 
   # Restore to T: the full sits in tenure 1's lineage, tenure-2's row only in
@@ -2820,7 +2830,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   sql "$solo" "FLUSH BINARY LOGS;"
   wait_uploaded "$solo" "$f1" || { bad "pre-conversion binlog never shipped"; return; }
   ok "standalone life archived: anonymous full + binlog $f1"
-  [ "$(mc_count e2e-pitr-conv/shared-history)" = "0" ] && ok "no shared-history marker while standalone" || bad "marker present before any group archived"
+  mc_exists e2e-pitr-conv/shared-history && bad "marker present before any group archived" || ok "no shared-history marker while standalone"
   docker stop "$solo" >/dev/null && docker rm "$solo" >/dev/null
 
   # Convert: node 1 adopts the volume (same server_uuid, same lineage), the
@@ -2832,8 +2842,8 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   wait_until 90 "archiver resumed on the adopting primary" \
     bash -c 'docker logs mysql-1 2>&1 | grep -q "starting PITR archiver"' \
     || { bad "archiving did not resume after conversion"; docker logs mysql-1 2>&1 | tail -40; return; }
-  wait_until 60 "shared-history marker written" bash -c '[ "$(mc_count e2e-pitr-conv/shared-history 2>/dev/null)" = "1" ]' \
-    || { bad "the group primary never wrote the shared-history marker"; return; }
+  wait_until 60 "shared-history marker written" mc_exists e2e-pitr-conv/shared-history \
+    || { bad "the group primary never wrote the shared-history marker"; dump_node_log mysql-1; return; }
   ok "archiving continued on the primary and the archive is now declared a shared history"
 
   sql mysql-1 "INSERT INTO t.kv VALUES (2,'post-conversion');"
