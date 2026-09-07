@@ -295,6 +295,32 @@ fn group_active_from(member_state: Option<&str>, members: &[MemberRow]) -> bool 
     }
 }
 
+/// The block size this joiner must adopt before `START GROUP_REPLICATION`,
+/// or `None` when there is nothing to change.
+///
+/// `group_replication_gtid_assignment_block_size` is a property of the
+/// GROUP, not of the member: Group Replication expels a member whose value
+/// differs from the group's and does so on every retry, forever
+/// (`MY-011527`). The value cannot be derived, only observed — a group
+/// formed under a different default carries that default for life — so a
+/// joiner takes it off the live group's `/gr/state` advert, exactly as it
+/// takes `group_name`.
+///
+/// Only group-active peers count: a peer that is not in the group is
+/// advertising its own configured value, which is no more authoritative
+/// than ours. A peer on an older build advertises nothing, which leaves the
+/// joiner on its configured value — the behaviour before this existed.
+fn block_size_to_adopt(local: Option<u64>, answers: &[(String, PeerAnswer)]) -> Option<u64> {
+    let group = answers.iter().find_map(|(_, a)| match a {
+        PeerAnswer::State(s) if s.group_active => s.gtid_assignment_block_size,
+        _ => None,
+    })?;
+    match local {
+        Some(mine) if mine == group => None,
+        _ => Some(group),
+    }
+}
+
 /// This node's own Group Replication state, in the same shape peers report.
 pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
     let self_uuid = sql.server_uuid().await?;
@@ -320,6 +346,9 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
         pre_gtid_data: has_pre_gtid_data(data_dir) || sql.group_pre_gtid_flag().await,
         server_uuid: Some(self_uuid),
         group_name: read_group_name_marker(data_dir),
+        // Best-effort: a state probe must never fail over an advisory
+        // field. A peer that cannot report it reads as "older build".
+        gtid_assignment_block_size: sql.gtid_assignment_block_size().await.ok(),
         waiver_generation: read_waiver_generation(data_dir),
     })
 }
@@ -1710,6 +1739,36 @@ pub async fn orchestrate(
                 }
             }
 
+            // The group's GTID block size is group-wide state, like the
+            // group name above: a member carrying a different value is
+            // expelled the moment it joins, on every retry, forever
+            // (MY-011527 — live 2026-09-05 on a member that redeployed onto
+            // an image whose default had changed under a group already
+            // formed on the old one). Adopt before joining; the local
+            // my.cnf value is only the bootstrap default.
+            let local_block_size = sql.gtid_assignment_block_size().await.ok();
+            if let Some(group_block_size) = block_size_to_adopt(local_block_size, &answers) {
+                match sql.set_gtid_assignment_block_size(group_block_size).await {
+                    Ok(()) => info!(
+                        from = ?local_block_size,
+                        to = group_block_size,
+                        "adopting the live group's GTID assignment block size"
+                    ),
+                    Err(e) => {
+                        // Joining anyway would be expelled on arrival; wait
+                        // and retry rather than burn attempts the group will
+                        // refuse.
+                        warn!(
+                            error = %e,
+                            group_block_size,
+                            "could not adopt the live group's GTID assignment block size; retrying"
+                        );
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                        continue;
+                    }
+                }
+            }
+
             info!("a live group exists — joining");
             match sql.start_group_replication().await {
                 Ok(()) => info!("START GROUP_REPLICATION succeeded"),
@@ -2058,6 +2117,7 @@ mod tests {
             pre_gtid_data: false,
             server_uuid: Some("someone".to_string()),
             group_name: Some(group_name.to_string()),
+            gtid_assignment_block_size: None,
             waiver_generation: 0,
         })
     }
@@ -2620,6 +2680,7 @@ mod tests {
             pre_gtid_data: false,
             server_uuid: server_uuid.map(str::to_string),
             group_name: None,
+            gtid_assignment_block_size: None,
             waiver_generation: 0,
         })
     }
@@ -2642,6 +2703,7 @@ mod tests {
             pre_gtid_data: false,
             server_uuid: None,
             group_name: None,
+            gtid_assignment_block_size: None,
             waiver_generation: 0,
         })
     }
@@ -2695,6 +2757,7 @@ mod tests {
                 pre_gtid_data: false,
                 server_uuid: None,
                 group_name: None,
+                gtid_assignment_block_size: None,
                 waiver_generation: 0,
             }),
         )];
@@ -2857,6 +2920,73 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(read_membership_high_water(&data_dir), Some(0));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A member whose GTID block size differs from the group's is expelled
+    /// on arrival, on every retry, forever (MY-011527). The joiner adopts
+    /// the group's value first -- and only from a member that is actually
+    /// IN the group.
+    #[test]
+    fn a_joiner_adopts_the_live_groups_gtid_block_size() {
+        fn peer(active: bool, size: Option<u64>) -> (String, PeerAnswer) {
+            (
+                "peer.railway.internal".to_string(),
+                PeerAnswer::State(GrState {
+                    group_active: active,
+                    member_state: Some(if active { "ONLINE" } else { "OFFLINE" }.to_string()),
+                    member_role: None,
+                    gtid_executed: Some("uuid:1-3".to_string()),
+                    members_total: 3,
+                    members_reachable: 3,
+                    pre_gtid_data: false,
+                    server_uuid: Some("someone".to_string()),
+                    group_name: Some("group".to_string()),
+                    gtid_assignment_block_size: size,
+                    waiver_generation: 0,
+                }),
+            )
+        }
+
+        // The live case this exists for: the group formed on the old default
+        // and this member booted on an image that pins 1.
+        assert_eq!(
+            block_size_to_adopt(Some(1), &[peer(true, Some(1_000_000))]),
+            Some(1_000_000)
+        );
+        // And the mirror: a group formed on the pin, a member arriving with
+        // the default. Adoption is not one-directional.
+        assert_eq!(
+            block_size_to_adopt(Some(1_000_000), &[peer(true, Some(1))]),
+            Some(1)
+        );
+        // Already agreed: nothing to set, so nothing is set.
+        assert_eq!(block_size_to_adopt(Some(1), &[peer(true, Some(1))]), None);
+
+        // A peer that is NOT in the group advertises its own configured
+        // value, which is no more authoritative than ours.
+        assert_eq!(
+            block_size_to_adopt(Some(1), &[peer(false, Some(1_000_000))]),
+            None
+        );
+        // An older build advertises nothing: the joiner stays on its
+        // configured value, exactly as it did before this existed.
+        assert_eq!(block_size_to_adopt(Some(1), &[peer(true, None)]), None);
+        // No peers at all (bootstrap territory) changes nothing.
+        assert_eq!(block_size_to_adopt(Some(1), &[]), None);
+        // Local value unreadable: take the group's rather than assume ours
+        // matches -- being expelled forever is the worse failure.
+        assert_eq!(
+            block_size_to_adopt(None, &[peer(true, Some(1_000_000))]),
+            Some(1_000_000)
+        );
+        // An unreachable peer is not a vote.
+        assert_eq!(
+            block_size_to_adopt(
+                Some(1),
+                &[("down.railway.internal".to_string(), PeerAnswer::Unreachable)]
+            ),
+            None
+        );
     }
 
     #[test]

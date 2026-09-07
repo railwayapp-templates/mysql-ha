@@ -27,7 +27,11 @@
 //!     (1,000,000) opens a same-sized, un-lost gap in the group's GTID
 //!     sequence on every switchover/failover to a member generating its
 //!     first transaction, which PITR's hole check cannot distinguish from
-//!     real data loss. Harmless to pin at 1 in single-primary mode.
+//!     real data loss. Harmless to pin at 1 in single-primary mode. This
+//!     is the value for a group this node BOOTSTRAPS: the setting is
+//!     group-wide, and a joiner adopts the live group's value instead
+//!     (`gr::block_size_to_adopt`) — a group formed under the old default
+//!     keeps it, because a member that disagrees is expelled on arrival.
 
 use crate::config::Config;
 use anyhow::{Context, Result};
@@ -183,6 +187,10 @@ loose-group_replication_paxos_single_leader = ON
 # from a real archived-binlog hole. Pinning this to 1 keeps the group's GTID
 # sequence gapless in single-primary mode, where only one member ever writes
 # at a time and the block's collision-avoidance purpose does not apply.
+# This value applies to a group this node BOOTSTRAPS. It is group-wide state:
+# a member whose value differs from its group's is expelled on arrival, on
+# every retry, forever (MY-011527), so a joiner adopts the live group's value
+# over this one before START GROUP_REPLICATION.
 loose-group_replication_gtid_assignment_block_size = 1
 # caching_sha2_password without client-side TLS certs needs RSA key exchange
 # on the recovery channel.

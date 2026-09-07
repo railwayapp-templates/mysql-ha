@@ -205,6 +205,34 @@ impl Sql {
         .await
     }
 
+    /// This server's `group_replication_gtid_assignment_block_size`. For a
+    /// group-active member this IS the group's value: Group Replication
+    /// refuses to keep a member whose value differs from the group's.
+    pub async fn gtid_assignment_block_size(&self) -> Result<u64> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            let size: Option<u64> = conn
+                .query_first("SELECT @@global.group_replication_gtid_assignment_block_size")
+                .await?;
+            size.context("group_replication_gtid_assignment_block_size returned no row")
+        })
+        .await
+    }
+
+    /// Adopt the group's block size before joining it. Dynamic only while
+    /// the plugin is stopped, which is exactly when a joiner calls this.
+    pub async fn set_gtid_assignment_block_size(&self, size: u64) -> Result<()> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            conn.query_drop(format!(
+                "SET GLOBAL group_replication_gtid_assignment_block_size = {size}"
+            ))
+            .await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Every member in this node's current view of the group. Empty when
     /// Group Replication has never been started on this node.
     pub async fn group_members(&self) -> Result<Vec<MemberRow>> {
