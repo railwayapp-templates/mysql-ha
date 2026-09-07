@@ -622,6 +622,33 @@ pub fn binlogs_to_replay(mut files: Vec<String>, start_file: &str) -> BinlogRepl
     BinlogReplayPlan { run, gap: None }
 }
 
+/// The lineage's files PAST its first gap, as gap-free runs in order — what a
+/// shared-history restore replays after every lineage's gap-free run (see
+/// restore.rs's replay_shared_history). `files` in any order; `next_present`
+/// is the gap's first file on the far side (`BinlogGap::next_present`). Each
+/// inner run is consecutive, and a new run starts at every further hole:
+/// `[5, 6, 8]` past a gap at 5 → `[[5, 6], [8]]`. Empty when `next_present`
+/// is not among the files.
+pub fn binlog_runs_past_gap(mut files: Vec<String>, next_present: &str) -> Vec<Vec<String>> {
+    files.sort_by(|a, b| binlog_name_cmp(a, b));
+    let Some(start) = files.iter().position(|f| f == next_present) else {
+        return Vec::new();
+    };
+    let mut runs: Vec<Vec<String>> = Vec::new();
+    let mut prev_seq: Option<u64> = None;
+    for name in &files[start..] {
+        let seq = binlog_seq(name);
+        let hole = matches!((prev_seq, seq), (Some(prev), Some(cur)) if cur != prev + 1);
+        if hole || runs.is_empty() {
+            runs.push(vec![name.clone()]);
+        } else if let Some(run) = runs.last_mut() {
+            run.push(name.clone());
+        }
+        prev_seq = seq;
+    }
+    runs
+}
+
 // --- archive retention -------------------------------------------------------
 //
 // Without this the archive grows forever: fulls accumulate every
@@ -1623,6 +1650,53 @@ mod tests {
                 after: String::new(),
                 next_present: "binlog.000004".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn binlog_runs_past_gap_splits_at_every_further_hole() {
+        // Past the gap at 000004, 000004-000005 are one run and 000007 —
+        // behind a second hole — another: each replays as its own stream,
+        // and every hole it skips must show up in gtid_executed afterwards.
+        let disk = files(&[
+            "binlog.000001",
+            "binlog.000002",
+            "binlog.000004",
+            "binlog.000005",
+            "binlog.000007",
+        ]);
+        assert_eq!(
+            binlog_runs_past_gap(disk, "binlog.000004"),
+            vec![
+                vec!["binlog.000004", "binlog.000005"],
+                vec!["binlog.000007"]
+            ]
+        );
+    }
+
+    #[test]
+    fn binlog_runs_past_gap_ignores_files_before_the_gap_and_unordered_input() {
+        let disk = files(&[
+            "binlog.000007",
+            "binlog.000004",
+            "binlog.000001",
+            "binlog.000005",
+        ]);
+        assert_eq!(
+            binlog_runs_past_gap(disk, "binlog.000004"),
+            vec![
+                vec!["binlog.000004", "binlog.000005"],
+                vec!["binlog.000007"]
+            ]
+        );
+    }
+
+    #[test]
+    fn binlog_runs_past_gap_with_the_far_side_missing_is_empty() {
+        let disk = files(&["binlog.000001", "binlog.000002"]);
+        assert_eq!(
+            binlog_runs_past_gap(disk, "binlog.000004"),
+            Vec::<Vec<String>>::new()
         );
     }
 
