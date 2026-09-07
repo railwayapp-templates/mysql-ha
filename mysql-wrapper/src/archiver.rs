@@ -22,13 +22,18 @@
 //!     the cadence rather than dumping the whole dataset on failover, which
 //!     is exactly when the cluster can least afford it.
 //!   - binlog shipping (~every 10s): upload every CLOSED binlog not yet
-//!     uploaded, then — standalone only — reclaim (`PURGE BINARY LOGS TO`)
-//!     whatever is now provably safe — never a file that hasn't been
-//!     confirmed uploaded, so the volume is the spool during a bucket outage
-//!     (uploads retry with backoff; purge waits). A group primary never
-//!     purges by upload: its peers recover from each other out of retained
-//!     binlogs (a purged donor forces a full clone), and mysqld's own expiry
-//!     in the GR config bounds the disk instead.
+//!     uploaded, then reclaim (`PURGE BINARY LOGS TO`) whatever is now
+//!     provably safe — never a file that hasn't been confirmed uploaded, so
+//!     the volume is the spool during a bucket outage (uploads retry with
+//!     backoff; purge waits). A group primary adds one rule: an uploaded
+//!     file also stays for `pitr::GR_BINLOG_EXPIRE_SECONDS`, because its
+//!     peers recover from each other out of retained binlogs (a purged donor
+//!     forces a full clone). While it archives, the primary switches mysqld's
+//!     own expiry off (`run_group_primary_supervisor`) — mysqld cannot know
+//!     what has shipped, so its blind expiry could reclaim an unshipped file
+//!     during a long upload outage and punch a permanent hole into the
+//!     archive; the archiver's reclaim honors both the window and the upload.
+//!     Secondaries keep mysqld's expiry: nothing on them ships.
 //!   - rotation: `FLUSH BINARY LOGS` every `BINLOG_ROTATE_INTERVAL_SECONDS`,
 //!     bounding the recovery point objective — the same role
 //!     `archive_timeout` plays for a WAL archive.
@@ -79,8 +84,9 @@ pub enum ArchiveMode {
     /// is off — see `mysql_conf::render_standalone_archive_conf`).
     Standalone,
     /// The writable primary of a Group Replication group. Local binlogs are
-    /// never reclaimed by upload (see the module doc), and fulls are due
-    /// archive-wide rather than per lineage.
+    /// reclaimed only once uploaded AND older than the group's recovery
+    /// window (see the module doc), and fulls are due archive-wide rather
+    /// than per lineage.
     GroupPrimary,
 }
 
@@ -171,6 +177,11 @@ pub async fn run_group_primary_supervisor(
     info!("PITR archiving is configured on a Group Replication member; archiving follows the writable-primary role");
 
     let mut running: Option<tokio::task::JoinHandle<()>> = None;
+    // Whether this node has switched mysqld's binlog expiry off in favor of
+    // the archiver's reclaim (module doc). Tracked apart from `running`: an
+    // archiver that failed to start still leaves expiry handed over, and a
+    // demotion must hand it back regardless.
+    let mut owns_expiry = false;
     loop {
         if running.as_ref().is_some_and(|h| h.is_finished()) {
             // `run` returns when it could not even start (no S3 client, no
@@ -189,10 +200,23 @@ pub async fn run_group_primary_supervisor(
             )
         }
         .await;
+        let demoted = matches!(verdict, Ok(false));
 
         match (verdict, running.is_some()) {
             (Ok(true), false) => {
                 info!("this node is the group's writable primary; starting the PITR archiver");
+                // While this node archives, mysqld must not reclaim a binlog
+                // the archiver hasn't uploaded: expiry is handed to the
+                // archiver, whose reclaim keeps uploaded files for the same
+                // window (ship_once). Dynamic, not persisted — a restart boots
+                // with the config file's value until this branch runs again.
+                match sql.set_global_binlog_expire_logs_seconds(0).await {
+                    Ok(()) => owns_expiry = true,
+                    Err(e) => {
+                        warn!(error = %e, "could not hand binlog expiry to the archiver; mysqld's own expiry stays in effect on this primary");
+                        status.note_error(&e);
+                    }
+                }
                 running = Some(tokio::spawn(run(
                     config.clone(),
                     sql.clone(),
@@ -215,6 +239,19 @@ pub async fn run_group_primary_supervisor(
                 });
             }
             _ => {}
+        }
+        if demoted && owns_expiry {
+            // Nothing ships from a secondary, so mysqld's own expiry is the
+            // only thing bounding its disk again.
+            match sql
+                .set_global_binlog_expire_logs_seconds(pitr::GR_BINLOG_EXPIRE_SECONDS)
+                .await
+            {
+                Ok(()) => owns_expiry = false,
+                Err(e) => {
+                    warn!(error = %e, "could not hand binlog expiry back to mysqld after demotion; retrying next poll")
+                }
+            }
         }
         tokio::time::sleep(ROLE_POLL).await;
     }
@@ -687,18 +724,8 @@ async fn binlog_shipping_loop(
     mode: ArchiveMode,
     status: Arc<PitrStatus>,
 ) {
-    let reclaim_local = mode == ArchiveMode::Standalone;
     loop {
-        if let Err(e) = ship_once(
-            &config,
-            &sql,
-            &s3,
-            &location,
-            &server_uuid,
-            reclaim_local,
-            &status,
-        )
-        .await
+        if let Err(e) = ship_once(&config, &sql, &s3, &location, &server_uuid, mode, &status).await
         {
             warn!(error = %e, "binlog shipping pass failed; retrying next cycle");
             status.note_error(&e);
@@ -992,15 +1019,17 @@ async fn read_archive_lineages(
     Ok(out)
 }
 
-/// One shipping pass. `reclaim_local` is the standalone-only PURGE step — a
-/// group primary leaves local reclaim to mysqld's own expiry (module doc).
+/// One shipping pass: upload every closed binlog not yet uploaded, then
+/// reclaim local disk by the mode's rule — everything uploaded standalone,
+/// everything uploaded AND past the group's recovery window on a primary
+/// (module doc).
 async fn ship_once(
     config: &Config,
     sql: &Sql,
     s3: &S3Client,
     location: &S3Location,
     server_uuid: &str,
-    reclaim_local: bool,
+    mode: ArchiveMode,
     status: &PitrStatus,
 ) -> Result<()> {
     let (active, _pos) = sql
@@ -1054,10 +1083,20 @@ async fn ship_once(
         });
     }
 
-    if !reclaim_local {
-        return Ok(());
-    }
-    if let Some(cut) = pitr::purge_cut(&disk_files, &active, &state.uploaded, &state.lost) {
+    let cut = match mode {
+        ArchiveMode::Standalone => {
+            pitr::purge_cut(&disk_files, &active, &state.uploaded, &state.lost)
+        }
+        ArchiveMode::GroupPrimary => pitr::purge_cut_retaining_recent(
+            &disk_files,
+            &active,
+            &state.uploaded,
+            &state.lost,
+            &|name| file_age(&config.data_dir, name),
+            Duration::from_secs(pitr::GR_BINLOG_EXPIRE_SECONDS),
+        ),
+    };
+    if let Some(cut) = cut {
         sql.purge_binary_logs_to(&cut)
             .await
             .with_context(|| format!("PURGE BINARY LOGS TO {cut}"))?;
@@ -1075,6 +1114,17 @@ async fn ship_once(
     }
 
     Ok(())
+}
+
+/// A binlog's age on disk by its mtime — the group primary's stand-in for
+/// mysqld's expiry clock (`pitr::purge_cut_retaining_recent`). `None` when
+/// it cannot be read; the caller then keeps the file.
+fn file_age(data_dir: &str, name: &str) -> Option<Duration> {
+    let modified = std::fs::metadata(Path::new(data_dir).join(name))
+        .ok()?
+        .modified()
+        .ok()?;
+    std::time::SystemTime::now().duration_since(modified).ok()
 }
 
 /// The lineage's binlog file names, oldest first, straight from mysqld's own

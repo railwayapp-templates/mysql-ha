@@ -41,14 +41,19 @@
 //!        success would silently lose everything after the hole.
 //!      - Shared history (GTIDs): the full's lineage from its coordinate,
 //!        then EVERY other lineage from its first archived file (see
-//!        replay_shared_history). The restore-phase mysqld runs with
-//!        gtid_mode=ON_PERMISSIVE so the dump's GTID set loads and the
-//!        server skips each GTID it already holds, whichever lineage
+//!        replay_shared_history); a lineage's files past a sequence gap
+//!        replay in a later round, after every lineage's gap-free run. The
+//!        restore-phase mysqld runs with GTIDs on
+//!        (shared_history_restore_args) so the dump's GTID set loads and
+//!        the server skips each GTID it already holds, whichever lineage
 //!        delivers it — that is what makes a failed-over primary's
 //!        never-uploaded tail recoverable from the next primary's lineage.
 //!        Completeness is then proven on the result, not assumed from the
 //!        file names: a hole in any UUID's `gtid_executed` interval set, or
 //!        a dump transaction missing from it, FAILS the restore loudly.
+//!        That is why a gap is not fatal on its own, and why the files past
+//!        it must still replay: cutting the lineage at the hole would leave
+//!        a contiguous, merely SHORT set that the check cannot fault.
 //!      Either way the ACHIEVED recovery point is verified against the
 //!      target (see verify_achieved_point): mysqlbinlog exits 0 when the
 //!      logs simply end before --stop-datetime, so an archive that stopped
@@ -68,7 +73,7 @@ use crate::sql::Sql;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -627,16 +632,23 @@ async fn replay_binlogs(
     Ok(achieved)
 }
 
-/// One lineage's contribution to a shared-history replay.
+/// One gap-free run of one lineage's binlogs in a shared-history replay.
 struct LineageRun {
     server_uuid: String,
     /// Gap-free, in order.
     files: Vec<String>,
     /// `--start-position` for the first file — only the selected full's own
-    /// lineage has one (its recorded dump coordinate); every other lineage
-    /// replays from the start of its first archived file and lets the server
-    /// skip what the dump already holds.
+    /// gap-free run from its start has one (its recorded dump coordinate);
+    /// every other run replays from the start of its first file and lets the
+    /// server skip what is already executed.
     start_position: Option<u64>,
+    /// Replay order across lineages: 0 for a lineage's gap-free run from its
+    /// start, one more for each hole a run sits past. Every round-0 run
+    /// replays before any round-1 run, so a lineage that carried the missing
+    /// transactions (the next primary's, after a failover) delivers them
+    /// before a stream that skips them replays what came after — the
+    /// group's own commit order, as far as the archive allows.
+    round: usize,
 }
 
 fn note_lineage_gap(server_uuid: &str, plan: &pitr::BinlogReplayPlan) {
@@ -645,25 +657,58 @@ fn note_lineage_gap(server_uuid: &str, plan: &pitr::BinlogReplayPlan) {
             lineage = %server_uuid,
             after = %gap.after,
             next_present = %gap.next_present,
-            "lineage has a sequence gap; replaying up to it — another lineage may carry the \
-             missing transactions, and the GTID completeness check after replay decides"
+            "lineage has a sequence gap; its files past the hole replay after every lineage's \
+             gap-free run — another lineage may carry the missing transactions, and the GTID \
+             completeness check after replay decides"
         );
+    }
+}
+
+/// Queue a lineage's files past its gap (when it has one) as later-round
+/// runs, one round per hole they sit past. Skipping them instead would hide
+/// the hole: the replayed set would end short but contiguous, and the
+/// completeness check faults holes, not endings.
+fn push_runs_past_gap(
+    runs: &mut Vec<LineageRun>,
+    server_uuid: &str,
+    files: Vec<String>,
+    gap: Option<&pitr::BinlogGap>,
+) {
+    let Some(gap) = gap else {
+        return;
+    };
+    for (i, run) in pitr::binlog_runs_past_gap(files, &gap.next_present)
+        .into_iter()
+        .enumerate()
+    {
+        runs.push(LineageRun {
+            server_uuid: server_uuid.to_string(),
+            files: run,
+            start_position: None,
+            round: i + 1,
+        });
     }
 }
 
 /// The shared-history replay (module doc, step 5): the selected full's own
 /// lineage from its recorded coordinate, then every other lineage's gap-free
-/// run from its first archived file, each cut at `--stop-datetime`. Order is
-/// immaterial to the result — every lineage is an in-order stream of the same
-/// group history and the server applies each GTID once, whichever stream
-/// delivers it first — so the full's lineage only goes first because it
-/// continues the dump exactly. A sequence gap inside one lineage is not
-/// fatal here: another member's stream may carry those transactions (the
-/// reason for archiving from whichever member is primary), so it is logged
-/// and the verdict left to the completeness check at the end — the restored
-/// server's `gtid_executed` must have no hole in any UUID, and must contain
-/// everything the dump declared. Either failing is the loud, fail-closed
-/// refusal: the archive lost a transaction on every lineage that held it.
+/// run from its first archived file, then — in later rounds — every run that
+/// sits past a sequence gap, each cut at `--stop-datetime`. Every lineage is
+/// an in-order stream of the same group history and the server applies each
+/// GTID once, whichever stream delivers it first, so the full's lineage goes
+/// first only because it continues the dump exactly, and the post-gap runs
+/// go last so a stream that has the missing transactions (the next
+/// primary's, after a failover) delivers them before anything that came
+/// after them replays. A sequence gap inside one lineage is therefore not
+/// fatal here — it is logged and the verdict left to the completeness check
+/// at the end: the restored server's `gtid_executed` must have no hole in
+/// any UUID, and must contain everything the dump declared. Either failing
+/// is the loud, fail-closed refusal: the archive lost a transaction on every
+/// lineage that held it. The files past a gap MUST replay for that check to
+/// mean anything: a lineage cut at its hole leaves a contiguous, merely
+/// short set, and a target within the rotation bound of that short end was
+/// accepted with the rows past the hole silently gone (the shape a group's
+/// binlog expiry leaves behind a stuck archiver).
 async fn replay_shared_history(
     s3: &S3Client,
     location: &S3Location,
@@ -692,32 +737,42 @@ async fn replay_shared_history(
 
     let mut runs: Vec<LineageRun> = Vec::new();
     let own = by_lineage.remove(&full.server_uuid).unwrap_or_default();
-    let own_plan = pitr::binlogs_to_replay(own, &full.meta.binlog_file);
+    let own_plan = pitr::binlogs_to_replay(own.clone(), &full.meta.binlog_file);
     note_lineage_gap(&full.server_uuid, &own_plan);
     runs.push(LineageRun {
         server_uuid: full.server_uuid.clone(),
         files: own_plan.run,
         start_position: Some(full.meta.binlog_pos),
+        round: 0,
     });
+    push_runs_past_gap(&mut runs, &full.server_uuid, own, own_plan.gap.as_ref());
     for (uuid, mut names) in by_lineage {
         names.sort_by(|a, b| pitr::binlog_name_cmp(a, b));
         let Some(first) = names.first().cloned() else {
             continue;
         };
-        let plan = pitr::binlogs_to_replay(names, &first);
+        let plan = pitr::binlogs_to_replay(names.clone(), &first);
         note_lineage_gap(&uuid, &plan);
-        if plan.run.is_empty() {
-            continue;
+        if !plan.run.is_empty() {
+            runs.push(LineageRun {
+                server_uuid: uuid.clone(),
+                files: plan.run,
+                start_position: None,
+                round: 0,
+            });
         }
-        runs.push(LineageRun {
-            server_uuid: uuid,
-            files: plan.run,
-            start_position: None,
-        });
+        push_runs_past_gap(&mut runs, &uuid, names, plan.gap.as_ref());
     }
+    // Stable: within a round the full's own lineage stays first.
+    runs.sort_by_key(|r| r.round);
     info!(
-        lineages = runs.len(),
+        lineages = runs
+            .iter()
+            .map(|r| r.server_uuid.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
         files = runs.iter().map(|r| r.files.len()).sum::<usize>(),
+        runs_past_gaps = runs.iter().filter(|r| r.round > 0).count(),
         "replaying the shared history across lineages"
     );
 
@@ -746,11 +801,22 @@ async fn replay_shared_history(
                 lineage = %run.server_uuid,
                 files = ?run.files,
                 start_position = ?run.start_position,
+                round = run.round,
                 "replaying lineage"
             );
             let reached = replay_downloaded(&local_paths, run.start_position, target, config)
                 .await
-                .with_context(|| format!("replaying lineage {}", run.server_uuid))?;
+                .with_context(|| {
+                    if run.round > 0 {
+                        format!(
+                            "replaying lineage {} past its sequence gap (round {}) — a \
+                             transaction there may depend on one the archive lost",
+                            run.server_uuid, run.round
+                        )
+                    } else {
+                        format!("replaying lineage {}", run.server_uuid)
+                    }
+                })?;
             achieved = achieved.max(reached);
             let _ = std::fs::remove_dir_all(&dir);
         }

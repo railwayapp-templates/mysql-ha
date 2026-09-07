@@ -649,6 +649,20 @@ impl Sql {
         .await
     }
 
+    /// Hand binlog expiry to the archiver (`0`) or back to mysqld (the group
+    /// default) at runtime. Dynamic, not persisted: a restart boots with the
+    /// config file's value until the archiver's role supervisor decides again
+    /// — which it does on every start.
+    pub async fn set_global_binlog_expire_logs_seconds(&self, seconds: u64) -> Result<()> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            conn.query_drop(format!("SET GLOBAL binlog_expire_logs_seconds = {seconds}"))
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Attempt to toggle the TCP listener at runtime — the restore path's
     /// defense-in-depth attempt to keep the restore-phase server off the
     /// network while it loads the dump and replays binlogs. Verified

@@ -148,7 +148,11 @@ max_connections = {max_connections}
 # keeps reporting ONLINE while it silently stalls the whole group. Three
 # days is plenty for recovery: a rejoining member whose gap outruns the
 # retained binlogs falls back to a clone (the plugin is loaded below).
-binlog_expire_logs_seconds = 259200
+# This is the boot value and every SECONDARY's value. While a member is the
+# archiving primary the wrapper sets it to 0 at runtime and reclaims binlogs
+# itself, once uploaded and past the same window (archiver.rs) — mysqld's
+# expiry cannot know what has shipped.
+binlog_expire_logs_seconds = {gr_binlog_expire}
 
 # Repeated aborted connections from one host (a crashing client in a tight
 # loop, an aggressive prober) would otherwise trip max_connect_errors and
@@ -218,6 +222,7 @@ loose-group_replication_recovery_get_public_key = ON
         max_connections = input.max_connections,
         group_name = input.group_name,
         gr_seeds = input.gr_seeds,
+        gr_binlog_expire = crate::pitr::GR_BINLOG_EXPIRE_SECONDS,
     )
 }
 
