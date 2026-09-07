@@ -2560,6 +2560,19 @@ t_pitr_ha_archives_from_the_primary_and_follows_switchover() {
     || { bad "the primary never completed an initial full backup"; docker logs "$primary" 2>&1 | tail -40; return; }
   ok "primary $primary archives and completed the initial full backup"
 
+  # Expiry ownership: mysqld's own binlog expiry is off on the archiving
+  # primary (the archiver reclaims only what it has uploaded, and only past
+  # the recovery window) and stays at the group default on every secondary.
+  local m exp
+  for m in mysql-1 mysql-2 mysql-3; do
+    exp="$(sql "$m" "SELECT @@binlog_expire_logs_seconds")"
+    if [ "$m" = "$primary" ]; then
+      [ "$exp" = "0" ] && ok "binlog expiry handed to the archiver on the primary" || bad "primary $m still has mysqld expiry $exp while archiving"
+    else
+      [ "$exp" = "259200" ] && ok "secondary $m keeps mysqld's 3-day expiry" || bad "secondary $m has expiry $exp"
+    fi
+  done
+
   local n
   for n in mysql-1 mysql-2 mysql-3; do
     local archiving
@@ -2599,6 +2612,13 @@ t_pitr_ha_archives_from_the_primary_and_follows_switchover() {
     || { bad "incoming primary $target never started an archiver"; docker logs "$target" 2>&1 | tail -40; return; }
   [ "$(pitr_field mysql-2 "$primary" archiving)" = "false" ] && ok "/pitr on the demoted node reports not archiving" || bad "/pitr on the demoted node still reports archiving"
   [ "$(pitr_field mysql-2 "$target" archiving)" = "true" ] && ok "/pitr on the promoted node reports archiving" || bad "/pitr on the promoted node does not report archiving"
+  # Expiry ownership follows the role: the demoted node hands it back to
+  # mysqld, the promoted one takes it over (polled every ROLE_POLL).
+  wait_until 30 "demoted node handed binlog expiry back to mysqld" \
+    bash -c '[ "$(docker exec '"$primary"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT @@binlog_expire_logs_seconds" 2>/dev/null)" = "259200" ]' \
+    && ok "demoted node handed binlog expiry back to mysqld" || bad "demoted node $primary kept expiry $(sql "$primary" "SELECT @@binlog_expire_logs_seconds")"
+  [ "$(sql "$target" "SELECT @@binlog_expire_logs_seconds")" = "0" ] \
+    && ok "promoted node took over binlog expiry" || bad "promoted node $target has expiry $(sql "$target" "SELECT @@binlog_expire_logs_seconds")"
 
   # The demoted node must have actually STOPPED, not just said so: its
   # lineage in the bucket may not grow after the demotion. Give an in-flight

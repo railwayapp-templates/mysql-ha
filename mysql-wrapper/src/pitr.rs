@@ -553,6 +553,49 @@ pub fn purge_cut(
     Some(boundary.clone())
 }
 
+/// mysqld's own binlog expiry on a Group Replication member (the GR config
+/// in mysql_conf.rs): how long a departed member has to rejoin out of its
+/// peers' retained binlogs before recovery falls back to a clone. The
+/// archiving primary takes this window over from mysqld (archiver.rs's role
+/// supervisor): mysqld's expiry is switched off while it archives, and the
+/// archiver reclaims a file only once it is BOTH uploaded and older than
+/// this — the same recovery window, without the silent hole mysqld's blind
+/// expiry can punch into the archive during a long upload outage.
+pub const GR_BINLOG_EXPIRE_SECONDS: u64 = 259_200;
+
+/// `purge_cut` for a group primary. Same two rules — never the active file,
+/// never across a file that hasn't been uploaded — plus a third: an uploaded
+/// file younger than `min_age` also stops the cut, because peers recover
+/// from retained binlogs and need the recovery window mysqld's expiry gave
+/// them. `age_of` reads a file's age from disk; a file whose age cannot be
+/// read is treated as recent (kept), never as old.
+pub fn purge_cut_retaining_recent(
+    files_oldest_first: &[String],
+    active: &str,
+    uploaded: &BTreeSet<String>,
+    lost: &BTreeSet<String>,
+    age_of: &dyn Fn(&str) -> Option<std::time::Duration>,
+    min_age: std::time::Duration,
+) -> Option<String> {
+    let boundary = files_oldest_first.iter().find(|f| {
+        let name = f.as_str();
+        if name == active {
+            return true;
+        }
+        if lost.contains(name) {
+            return false;
+        }
+        if !uploaded.contains(name) {
+            return true;
+        }
+        age_of(name).is_none_or(|age| age < min_age)
+    })?;
+    if files_oldest_first.first() == Some(boundary) {
+        return None;
+    }
+    Some(boundary.clone())
+}
+
 /// A sequence hole in the archived lineage, with shipped binlogs still
 /// present on the far side: replaying past it is impossible, and replaying
 /// UP TO it while the caller asked for a later target would silently lose
@@ -1744,6 +1787,86 @@ mod tests {
         assert_eq!(
             purge_cut(&disk, "binlog.000004", &uploaded, &set(&[])),
             Some("binlog.000002".to_string())
+        );
+    }
+
+    #[test]
+    fn purge_cut_retaining_recent_keeps_uploaded_files_inside_the_recovery_window() {
+        let day = std::time::Duration::from_secs(86_400);
+        let disk = files(&[
+            "binlog.000001",
+            "binlog.000002",
+            "binlog.000003",
+            "binlog.000004",
+        ]);
+        let uploaded = set(&["binlog.000001", "binlog.000002", "binlog.000003"]);
+        // 000001 is four days old, 000002 two days, 000003 one hour: with a
+        // three-day window only the first may go — the cut stops at the
+        // first uploaded file a rejoining peer might still need.
+        let age = |name: &str| -> Option<std::time::Duration> {
+            match name {
+                "binlog.000001" => Some(4 * day),
+                "binlog.000002" => Some(2 * day),
+                "binlog.000003" => Some(std::time::Duration::from_secs(3_600)),
+                _ => Some(std::time::Duration::ZERO),
+            }
+        };
+        assert_eq!(
+            purge_cut_retaining_recent(&disk, "binlog.000004", &uploaded, &set(&[]), &age, 3 * day),
+            Some("binlog.000002".to_string())
+        );
+        // Everything old enough: the cut advances to the active file, exactly
+        // like the standalone rule.
+        let all_old = |_: &str| Some(10 * day);
+        assert_eq!(
+            purge_cut_retaining_recent(
+                &disk,
+                "binlog.000004",
+                &uploaded,
+                &set(&[]),
+                &all_old,
+                3 * day
+            ),
+            Some("binlog.000004".to_string())
+        );
+    }
+
+    #[test]
+    fn purge_cut_retaining_recent_never_crosses_an_unuploaded_file_however_old() {
+        let disk = files(&["binlog.000001", "binlog.000002", "binlog.000003"]);
+        // 000002 never shipped — age is irrelevant, it pins the cut. This is
+        // the rule mysqld's own expiry cannot honor, and the reason the
+        // primary takes expiry over.
+        let uploaded = set(&["binlog.000001"]);
+        let ancient = |_: &str| Some(std::time::Duration::from_secs(30 * 86_400));
+        assert_eq!(
+            purge_cut_retaining_recent(
+                &disk,
+                "binlog.000003",
+                &uploaded,
+                &set(&[]),
+                &ancient,
+                std::time::Duration::from_secs(86_400)
+            ),
+            Some("binlog.000002".to_string())
+        );
+    }
+
+    #[test]
+    fn purge_cut_retaining_recent_treats_an_unreadable_age_as_recent() {
+        let disk = files(&["binlog.000001", "binlog.000002"]);
+        let uploaded = set(&["binlog.000001"]);
+        let unknown = |_: &str| None;
+        assert_eq!(
+            purge_cut_retaining_recent(
+                &disk,
+                "binlog.000002",
+                &uploaded,
+                &set(&[]),
+                &unknown,
+                std::time::Duration::from_secs(1)
+            ),
+            None
         );
     }
 
