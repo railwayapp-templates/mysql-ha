@@ -45,6 +45,16 @@ pub struct GrState {
     /// from here before START GROUP_REPLICATION. Absent on older builds.
     #[serde(default)]
     pub group_name: Option<String>,
+    /// The group's `group_replication_gtid_assignment_block_size`. Group
+    /// Replication requires every member to carry the group's value and
+    /// expels the ones that do not ("MY-011527: the member is configured
+    /// with a group_replication_gtid_assignment_block_size option value '1'
+    /// different from the group '1000000'. The member will now exit the
+    /// group."), so a joiner adopts this the same way it adopts
+    /// `group_name`. Absent on older builds — a peer that cannot say leaves
+    /// the joiner on its own configured value, which is what it did before.
+    #[serde(default)]
+    pub gtid_assignment_block_size: Option<u64>,
     /// How many waiver bootstraps this node's history has been through — the
     /// divergence tie-break. When two nodes hold histories that BOTH contain
     /// transactions the other lacks and no group is live, the higher
