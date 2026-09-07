@@ -2790,6 +2790,97 @@ t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole() {
   pitr_ha_teardown "$restore" "$hole"
 }
 
+# In Group Replication mode the wrapper never purges binlogs itself (a purge
+# would force a clone on every rejoin); mysqld's own expiry does —
+# binlog_expire_logs_seconds = 3 days in mysql_conf.rs — and mysqld cannot
+# know what has shipped. An archiver stuck for longer than that on the primary
+# loses a closed file before upload: exactly the hole the STANDALONE config
+# rules out by disabling expiry outright. This scenario forces that outcome
+# deterministically (the file is removed off the primary's datadir right
+# after the FLUSH that closes it, inside the archiver's ship poll — the same
+# stand-in for expiry t_binlog_expiry_silently_loses_unshipped_data uses) and
+# pins both halves of the contract on a group: the loss is REPORTED by name on
+# the primary, and a restore past it REFUSES on the GTID hole instead of
+# serving a history silently missing the row every member still holds.
+t_pitr_ha_group_expiry_hole_is_reported_and_refused() {
+  log "t_pitr_ha_group_expiry_hole_is_reported_and_refused"
+  local hole=mysql-pitr-ha-expiry-restore
+  pitr_ha_teardown "$hole"
+  start_minio || { bad "minio never became healthy"; return; }
+  local -a env
+  mapfile -t env < <(pitr_ha_archive_env /e2e-pitr-ha-expiry)
+  start_node 1 "${env[@]}"; start_node 2 "${env[@]}"; start_node 3 "${env[@]}"
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; return; }
+  wait_until 180 "initial full backup on $primary" \
+    bash -c 'docker logs '"$primary"' 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "no initial full backup"; docker logs "$primary" 2>&1 | tail -40; return; }
+  ok "primary $primary completed the initial full backup"
+
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'shipped');"
+  local f1
+  f1="$(active_binlog "$primary")"
+  sql "$primary" "FLUSH BINARY LOGS;"
+  wait_uploaded "$primary" "$f1" || { bad "row-1 binlog never shipped"; return; }
+  ok "row 1 shipped ($f1)"
+
+  # The row whose file expires before the archiver reaches it.
+  sql "$primary" "INSERT INTO t.kv VALUES (2,'expired-before-upload');"
+  local victim
+  victim="$(active_binlog "$primary")"
+  [ -n "$victim" ] || { bad "could not read the primary's active binlog"; return; }
+  sql "$primary" "FLUSH BINARY LOGS;"
+  docker exec "$primary" rm -f "/var/lib/mysql/$victim" \
+    || { bad "could not remove $victim from the primary's datadir"; return; }
+  ok "$victim closed and removed from disk before the archiver could ship it — what the group's 3-day expiry does to a stuck archiver"
+
+  # Past the hole: another row, shipped normally, so the loss sits in the
+  # middle of the lineage rather than at its end.
+  sql "$primary" "INSERT INTO t.kv VALUES (3,'after-the-hole');"
+  local f3
+  f3="$(active_binlog "$primary")"
+  sql "$primary" "FLUSH BINARY LOGS;"
+  wait_uploaded "$primary" "$f3" || { bad "$f3 never shipped"; docker logs "$primary" 2>&1 | tail -40; return; }
+  sleep 2
+  local t
+  t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  sleep 2
+
+  local logs
+  logs="$(docker logs "$primary" 2>&1)"
+  if printf '%s' "$logs" | grep '"message":"binlog uploaded"' | grep -q "\"file\":\"$victim\""; then
+    bad "the archiver claims it shipped $victim after it was removed from disk — false success logged"
+  else
+    ok "the archiver never falsely claims to have shipped $victim"
+  fi
+  if printf '%s' "$logs" | grep '"message":' | grep -iE '(lost|missing|gap)' | grep -q "$victim"; then
+    ok "the loss was reported by name on the group primary"
+  else
+    bad "$victim was lost before upload and the group primary logged nothing"
+  fi
+
+  # Every member still holds row 2 — no lineage in the bucket does. A restore
+  # past it must refuse on the GTID hole, never serve a history without it.
+  local -a renv
+  mapfile -t renv < <(pitr_recover_env /e2e-pitr-ha-expiry "$t")
+  start_standalone "$hole" "${renv[@]}"
+  wait_until 240 "restore refused on the hole" \
+    bash -c 'docker logs '"$hole"' 2>&1 | grep "\"message\":" | grep -qiE "restored GTID history has holes|binlog lineage has a gap"' \
+    || { bad "the restore never reported the hole"; dump_node_log "$hole"; return; }
+  ok "restore detected and named the hole"
+  node_logged "$hole" "point-in-time restore completed" \
+    && bad "restore claimed completion despite the hole" || ok "restore never claimed completion"
+  if docker exec "$hole" wget -q -O /dev/null http://localhost:8080/health 2>/dev/null; then
+    bad "health endpoint serving over a refused restore"
+  else
+    ok "refused restore stays fail-closed (health not serving)"
+  fi
+
+  pitr_ha_teardown "$hole"
+}
+
 # A standalone server that was already archiving (anonymous transactions,
 # gtid_mode=OFF) is converted to HA: it keeps its server_uuid, so its ONE
 # lineage now carries anonymous binlogs followed by GTID binlogs, and the only
@@ -2883,7 +2974,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
 
 main() {
   ensure_image
