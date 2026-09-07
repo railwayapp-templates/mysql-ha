@@ -475,7 +475,12 @@ async fn full_backup_loop(
         match take_full_backup(&config, &sql, &s3, &location, &server_uuid).await {
             Ok(taken_at) => {
                 status.update(|s| {
-                    s.last_full_backup_at = Some(pitr::format_rfc3339_millis(taken_at))
+                    s.last_full_backup_at = Some(pitr::format_rfc3339_millis(taken_at));
+                    // A full that landed proves the bucket, the credentials
+                    // and mysqldump all work again: whatever the last loop
+                    // failure was, it is over. Left in place it would read as
+                    // a live fault forever (nothing else clears it).
+                    s.last_error = None;
                 });
                 // Both spellings are load-bearing for the e2e harness, which
                 // waits on them by name.
@@ -1042,6 +1047,10 @@ async fn ship_once(
         status.update(|s| {
             s.last_shipped_binlog = Some(name.clone());
             s.last_shipped_at = Some(pitr::format_rfc3339_millis(Utc::now()));
+            // An upload that landed is the recovery the platform monitor
+            // (and an operator reading /pitr) needs to see: a failure that
+            // stays on the status after shipping resumed is a false alarm.
+            s.last_error = None;
         });
     }
 
