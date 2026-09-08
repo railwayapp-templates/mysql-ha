@@ -1720,6 +1720,86 @@ t_switchover_promotes_requested_node() {
     || bad "second switchover back to $old_primary failed"
 }
 
+# Password the health-API auth scenario stamps on every data node.
+API_PW="e2e-health-api-pw"
+
+# http_code <from-node> <url> [wget args...] — the exact HTTP status the
+# server answered. wget -S prints the response headers, which is the only
+# place the status is visible: the exit code folds every 4xx/5xx together.
+http_code() {
+  local from="$1" url="$2"; shift 2
+  docker exec "$from" wget -S -O /dev/null --tries=1 -T 60 "$@" "$url" 2>&1 \
+    | sed -n 's/^ *HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' | tail -1
+}
+
+# basic_auth_header <user> <password> — the header value wget --header takes.
+basic_auth_header() {
+  printf 'Authorization: Basic %s' "$(printf '%s:%s' "$1" "$2" | base64 | tr -d '\n')"
+}
+
+t_health_api_auth_gates_switchover() {
+  log "t_health_api_auth_gates_switchover (HEALTH_API_PASSWORD must gate the one route that can move the primary, and nothing else)"
+  teardown_trio
+  start_node 1 -e HEALTH_API_PASSWORD="$API_PW"
+  start_node 2 -e HEALTH_API_PASSWORD="$API_PW"
+  start_node 3 -e HEALTH_API_PASSWORD="$API_PW"
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local old_primary
+  old_primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; return; }
+  local target
+  for target in mysql-1 mysql-2 mysql-3; do
+    [ "$target" != "$old_primary" ] && break
+  done
+  local url="http://$target:8080/switchover"
+
+  # Reads stay open: HAProxy routes writes on /role and peers' bootstrap
+  # guards read /gr/state, neither carrying a credential.
+  local codes
+  codes="$(http_code mysql-2 "http://$target:8080/health")/$(http_code mysql-2 "http://$target:8080/role")/$(http_code mysql-2 "http://$target:8080/gr/state")/$(http_code mysql-2 "http://$target:8080/pitr")"
+  [ "$codes" = "200/503/200/200" ] \
+    && ok "reads answer without a credential (health/role/gr-state/pitr = $codes)" \
+    || bad "reads changed under HEALTH_API_PASSWORD (health/role/gr-state/pitr = $codes, expected 200/503/200/200)"
+
+  [ "$(http_code mysql-2 "$url" --post-data="")" = "401" ] \
+    && ok "POST /switchover without a credential answers 401" \
+    || bad "POST /switchover without a credential was not refused with 401"
+  [ "$(http_code mysql-2 "$url" --post-data="" --header="$(basic_auth_header railway wrong-password)")" = "401" ] \
+    && ok "POST /switchover with the wrong password answers 401" \
+    || bad "POST /switchover with the wrong password was not refused with 401"
+  [ "$(http_code mysql-2 "$url" --post-data="" --header="$(basic_auth_header root "$API_PW")")" = "401" ] \
+    && ok "POST /switchover with the wrong username answers 401" \
+    || bad "POST /switchover with the wrong username was not refused with 401"
+  [ "$(role_code mysql-2 "$target")" = "503" ] \
+    && ok "the refused requests moved nothing ($target still a secondary)" \
+    || bad "$target became primary after refused switchover requests"
+
+  # The credential reaches the real handler, whose verdict is the group's:
+  # the requested node becomes the primary.
+  [ "$(http_code mysql-2 "$url" --post-data="" --header="$(basic_auth_header railway "$API_PW")")" = "200" ] \
+    && ok "POST /switchover with the credential answers 200" \
+    || { bad "POST /switchover with the credential was not accepted"; return; }
+  [ "$(role_code mysql-2 "$target")" = "200" ] \
+    && ok "requested node $target is the writable primary" \
+    || bad "requested node $target did not become primary"
+  [ "$(role_code mysql-2 "$old_primary")" = "503" ] \
+    && ok "outgoing primary $old_primary demoted" \
+    || bad "outgoing primary $old_primary still answers as primary"
+
+  # Compat: a node booted WITHOUT the variable keeps the route open, exactly
+  # as before — a standalone node is enough to prove the gate is absent.
+  teardown_trio
+  start_standalone mysql-open
+  wait_until 180 "open standalone node answers /health" \
+    docker exec mysql-open wget -q -O /dev/null http://127.0.0.1:8080/health \
+    || { bad "standalone node never came up"; docker rm -f mysql-open >/dev/null 2>&1; return; }
+  [ "$(http_code mysql-open http://127.0.0.1:8080/switchover --post-data="")" = "200" ] \
+    && ok "without HEALTH_API_PASSWORD, POST /switchover stays open (200, standalone no-op)" \
+    || bad "without HEALTH_API_PASSWORD, POST /switchover was not open"
+  docker rm -f mysql-open >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-open >/dev/null 2>&1
+}
+
 t_wiped_primary_volume_rejoins_fresh() {
   log "t_wiped_primary_volume_rejoins_fresh (losing the primary's volume must not lose the cluster)"
   teardown_trio
@@ -4179,7 +4259,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump t_health_api_auth_gates_switchover)
 
 main() {
   ensure_image

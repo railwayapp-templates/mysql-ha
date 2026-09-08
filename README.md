@@ -68,6 +68,36 @@ it's the primary — exactly the pattern redis-ha's `/role` uses Sentinel
 confirmation for. Fail-closed is the contract: an uncertain answer is a
 non-primary answer.
 
+### Mutating routes and `HEALTH_API_PASSWORD`
+
+The same server carries one route that changes the group rather than
+describing it: `POST /switchover`, which asks THIS node to become the primary
+(Group Replication's `group_replication_set_as_primary`, run through the
+group's consensus). Anything on the private network that can reach port 8080
+can call it, so it is gated by HTTP Basic auth with the cluster's own secret:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `HEALTH_API_PASSWORD` | unset | Set → `POST /switchover` requires `Authorization: Basic base64(username:password)`; a missing, malformed or wrong credential answers `401` with `WWW-Authenticate: Basic realm="railway-ha"` and the body `unauthorized`. Unset or blank → the route stays open, exactly as before. |
+| `HEALTH_API_USERNAME` | `railway` | The username half of that credential. |
+
+Reads never require a credential: `GET /health`, `/role`, `/gr/state` and
+`/pitr` keep answering as documented above, because HAProxy's routing probe
+and every peer's bootstrap guard depend on them and nothing they return can
+change the group. Both halves of the credential are compared in constant
+time, and a refusal is logged by method and path only.
+
+Rollout: the platform callers (the HA rolling-enable switchover, the dashboard
+and the CLI) send the credential whenever the node's variables carry it, and
+a node without the variable ignores the header, so callers and images can roll
+out in either order. The Railway template stamps `HEALTH_API_PASSWORD` as the
+cluster's shared `MYSQL_ROOT_PASSWORD` on every data node once that stamp
+lands (mono #38506), so a new cluster enforces from its first boot. An
+existing cluster enforces once the variable is set on its data nodes and they
+redeploy — each node gates its own route the moment
+it boots with the variable, and nodes never call each other's `/switchover`,
+so a cluster may adopt it one node at a time.
+
 ## The HAProxy stats page
 
 Each edge serves HAProxy's stats page on `8404/stats`. From inside the edge
