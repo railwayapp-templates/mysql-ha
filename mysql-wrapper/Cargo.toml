@@ -23,3 +23,7 @@ aws-config.workspace = true
 aws-sdk-s3.workspace = true
 aws-smithy-types.workspace = true
 chrono.workspace = true
+base64 = "0.22"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -21,6 +21,9 @@
 //!                 uuid — synchronous through the group's consensus, so 200
 //!                 means the switch completed (which /role then reflects);
 //!                 503 carries the group's own refusal as the reason.
+//!                 Requires HTTP Basic auth once HEALTH_API_PASSWORD is set
+//!                 (401 otherwise) — the one route here that can change the
+//!                 group; see health_auth.rs.
 //!   GET /pitr   — point-in-time-recovery archiver status (JSON, see
 //!                 archiver::PitrStatusSnapshot): whether the archive
 //!                 contract is configured on this node and whether THIS node
@@ -30,11 +33,13 @@
 
 use crate::archiver::PitrStatus;
 use crate::gr::local_gr_state;
+use crate::health_auth::{self, Guard};
 use crate::sql::{role_is_writable_primary, Sql};
 use anyhow::Context;
 use axum::{
     extract::State,
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -195,14 +200,31 @@ async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-async fn run_health_server(health_port: u16, state: Arc<AppState>) -> anyhow::Result<()> {
-    let app = Router::new()
+/// The app: open reads merged with the mutating sub-router, which alone
+/// carries the credential layer. `route_layer` (not `layer`) keeps the guard
+/// off unmatched paths too, so a 404 stays a 404 rather than a 401.
+fn app(state: Arc<AppState>, guard: Guard) -> Router {
+    let mutating = Router::new()
+        .route("/switchover", post(switchover))
+        .route_layer(middleware::from_fn_with_state(
+            guard,
+            health_auth::require_credential,
+        ));
+    Router::new()
         .route("/health", get(health))
         .route("/role", get(role))
         .route("/gr/state", get(gr_state))
         .route("/pitr", get(pitr))
-        .route("/switchover", post(switchover))
-        .with_state(state);
+        .merge(mutating)
+        .with_state(state)
+}
+
+async fn run_health_server(
+    health_port: u16,
+    guard: Guard,
+    state: Arc<AppState>,
+) -> anyhow::Result<()> {
+    let app = app(state, guard);
 
     // Bind the IPv6 unspecified address rather than 0.0.0.0: Railway's private
     // network is IPv6 (fd12::... hostnames), and an IPv4-only listener refuses
@@ -244,6 +266,7 @@ const RESPAWN_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 /// loop emits one ComponentError, not one every respawn.
 pub async fn run_health_server_supervised(
     health_port: u16,
+    guard: Guard,
     state: Arc<AppState>,
     telemetry: Arc<Telemetry>,
 ) {
@@ -251,9 +274,11 @@ pub async fn run_health_server_supervised(
 
     loop {
         let attempt_state = state.clone();
+        let attempt_guard = guard.clone();
         let started_at = std::time::Instant::now();
-        let handle =
-            tokio::task::spawn(async move { run_health_server(health_port, attempt_state).await });
+        let handle = tokio::task::spawn(async move {
+            run_health_server(health_port, attempt_guard, attempt_state).await
+        });
         let outcome = handle.await;
         let ran_for = started_at.elapsed();
 
@@ -291,5 +316,98 @@ pub async fn run_health_server_supervised(
         }
 
         tokio::time::sleep(RESPAWN_DELAY).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::health_auth::Credential;
+    use axum::{
+        body::Body,
+        http::{header, HeaderValue, Method, Request},
+    };
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use tower::ServiceExt;
+
+    /// A real AppState against a socket path nothing listens on: the pool is
+    /// lazy, so building it costs nothing, and every SQL-backed handler
+    /// answers its own fail-closed 503 the moment it tries to connect.
+    fn state() -> Arc<AppState> {
+        Arc::new(AppState {
+            sql: Sql::connect_root_over_socket("/nonexistent/mysql-ha-test.sock", "pw"),
+            standalone: true,
+            data_dir: "/nonexistent".to_string(),
+            adoption_checked: Arc::new(AtomicBool::new(true)),
+            membership_fenced: Arc::new(AtomicBool::new(false)),
+            pitr: PitrStatus::new(false),
+        })
+    }
+
+    fn guard() -> Guard {
+        Some(Arc::new(Credential {
+            username: "railway".into(),
+            password: "pw".into(),
+        }))
+    }
+
+    fn req(method: Method, path: &str, auth: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(path);
+        if let Some(a) = auth {
+            b = b.header(header::AUTHORIZATION, HeaderValue::from_str(a).unwrap());
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_real_router_gates_only_the_switchover() {
+        // Without a credential the mutating route is refused by the guard —
+        // never reaching the handler, which would have answered 503.
+        let resp = app(state(), guard())
+            .oneshot(req(Method::POST, "/switchover", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
+
+        // With it, the handler speaks: standalone + mysqld unreachable = 503
+        // from the handler's own ping, proving the request got through.
+        let basic = format!("Basic {}", BASE64.encode("railway:pw"));
+        let resp = app(state(), guard())
+            .oneshot(req(Method::POST, "/switchover", Some(&basic)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!resp.headers().contains_key(header::WWW_AUTHENTICATE));
+
+        // Every read stays open and answers its own verdict.
+        for path in ["/health", "/role", "/gr/state", "/pitr"] {
+            let resp = app(state(), guard())
+                .oneshot(req(Method::GET, path, None))
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert!(
+                !resp.headers().contains_key(header::WWW_AUTHENTICATE),
+                "{path}"
+            );
+        }
+
+        // route_layer keeps the guard off unmatched paths: a 404 is a 404.
+        let resp = app(state(), guard())
+            .oneshot(req(Method::POST, "/nope", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn no_guard_leaves_the_switchover_open() {
+        let resp = app(state(), None)
+            .oneshot(req(Method::POST, "/switchover", None))
+            .await
+            .unwrap();
+        // The handler's own answer (mysqld unreachable), not a refusal.
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
