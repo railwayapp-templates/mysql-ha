@@ -2238,6 +2238,12 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
   )
   start_standalone mysql-pitr-window-restore "${recover_env[@]}"
 
+  # `--entrypoint mysql`: the image's ENTRYPOINT is mysql-wrapper, so a bare
+  # `docker run $IMAGE mysql …` runs the WRAPPER, which logs a line and exits
+  # non-zero for want of its environment. Without the override the probe below
+  # read that exit as "refused" on every attempt — a pass that proved nothing —
+  # and the post-completion read returned the wrapper's log line instead of a
+  # row. Both happened on the first CI run of this scenario.
   # Dial 3306 from ANOTHER container, over the network, exactly as a customer
   # would through the platform's TCP proxy — never over the restoring node's
   # own unix socket, which the restore legitimately uses throughout.
@@ -2252,8 +2258,8 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
       break
     fi
     probes=$(( probes + 1 ))
-    if docker run --rm --network "$NET" "$IMAGE" \
-        mysql -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
+    if docker run --rm --network "$NET" --entrypoint mysql "$IMAGE" \
+        -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
         --connect-timeout=3 --batch --skip-column-names \
         -e "SELECT 1" >/dev/null 2>&1; then
       connected=$(( connected + 1 ))
@@ -2261,8 +2267,8 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
       # Capture WHAT it served, so the failure names the shape of the bug
       # rather than just its existence.
       local rows
-      rows="$(docker run --rm --network "$NET" "$IMAGE" \
-        mysql -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
+      rows="$(docker run --rm --network "$NET" --entrypoint mysql "$IMAGE" \
+        -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
         --connect-timeout=3 --batch --skip-column-names \
         -e "SELECT COUNT(*) FROM t.kv" 2>&1 | tail -1)"
       log "  mid-restore connection SUCCEEDED; t.kv reported: $rows"
@@ -2286,8 +2292,8 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
   # opens and serves the restored data. A fix that simply never opened the
   # port would pass the check above and break the product.
   local v
-  v="$(docker run --rm --network "$NET" "$IMAGE" \
-    mysql -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
+  v="$(docker run --rm --network "$NET" --entrypoint mysql "$IMAGE" \
+    -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
     --connect-timeout=10 --batch --skip-column-names \
     -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null)"
   [ "$v" = "restored-row" ] \
