@@ -2125,6 +2125,9 @@ t_pitr_archive_and_restore_to_point_in_time() {
   docker logs mysql-pitr-restore 2>&1 | grep -q "point-in-time restore completed" \
     && ok "restore log confirms completion" \
     || bad "no restore-completed log line found"
+  docker logs mysql-pitr-restore 2>&1 | grep '"message":"point-in-time restore verdict"' | grep '"verdict":"completed"' | grep -q '"elapsed_seconds"' \
+    && ok "verdict line says completed, with the elapsed time" \
+    || bad "no completed verdict line — the platform has nothing to surface"
 
   local v1
   v1="$(sql mysql-pitr-restore "SELECT v FROM t.kv WHERE k=1")"
@@ -2637,6 +2640,10 @@ t_pitr_restore_silently_stops_short_of_target() {
     bash -c 'docker logs mysql-pitr-gap-restore 2>&1 | grep "\"message\":" | grep -qi "binlog lineage has a gap"' \
     || { bad "the restore never logged the lineage gap — did it silently replay short of the target again?"; docker logs mysql-pitr-gap-restore 2>&1 | tail -60; return; }
   ok "restore detected and named the lineage gap"
+  # The one line the platform reads: the verdict record, with a stable kind.
+  docker logs mysql-pitr-gap-restore 2>&1 | grep '"message":"point-in-time restore verdict"' | grep '"verdict":"refused"' | grep -q '"kind":"binlog-gap"' \
+    && ok "verdict line says refused/binlog-gap" \
+    || { bad "no refused/binlog-gap verdict line — the platform has nothing to surface"; docker logs mysql-pitr-gap-restore 2>&1 | grep "verdict" | tail -5; }
 
   if docker logs mysql-pitr-gap-restore 2>&1 | grep -q "point-in-time restore completed"; then
     bad "restore claimed completion despite the lineage gap"

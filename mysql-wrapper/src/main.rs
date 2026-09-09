@@ -122,6 +122,13 @@ async fn main() -> Result<()> {
     // on the volume stays the source of truth even if the env vars changed
     // after the crash. See restore.rs.
     if restore::crashed_mid_restore(&config.data_dir) {
+        if let Some((status, reason)) = restore::previous_attempt(&config.data_dir) {
+            warn!(
+                previous_status = ?status,
+                previous_reason = reason.as_deref().unwrap_or("-"),
+                "the previous point-in-time restore attempt on this volume did not complete"
+            );
+        }
         if config.restore_enabled() && config.gr_seeds.is_none() {
             warn!(
                 "a previous point-in-time restore did not complete; wiping the \
@@ -292,7 +299,7 @@ async fn main() -> Result<()> {
                      (idempotent restart)"
                 );
             } else {
-                restore::run(&config).await?;
+                restore::run_reporting(&config).await?;
             }
         }
 
