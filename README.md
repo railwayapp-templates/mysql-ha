@@ -68,6 +68,22 @@ it's the primary — exactly the pattern redis-ha's `/role` uses Sentinel
 confirmation for. Fail-closed is the contract: an uncertain answer is a
 non-primary answer.
 
+## The HAProxy stats page
+
+Each edge serves HAProxy's stats page on `8404/stats`. From inside the edge
+container it is open on loopback (the in-container monitor and the image's
+HEALTHCHECK read it there). Any other client authenticates with HTTP Basic
+auth using `HAPROXY_STATS_USER` / `HAPROXY_STATS_PASSWORD`, defaulting to the
+`MYSQLUSER` / `MYSQLPASSWORD` account the template stamps on the edge:
+
+```bash
+curl -u "$MYSQLUSER:$MYSQLPASSWORD" http://mysql-ha.railway.internal:8404/stats
+```
+
+With no password available, remote access to the page is denied. The
+credential reaches haproxy through its environment and is expanded at config
+parse time, so the rendered configuration logged at startup never contains it.
+
 ## Wrapper responsibilities
 
 The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's

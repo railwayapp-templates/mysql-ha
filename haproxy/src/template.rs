@@ -4,7 +4,11 @@
 //!   - Port 3306 (writes): HTTP health check on each node's /role endpoint.
 //!     Only the node that returns 200 (the current Group Replication
 //!     single-primary) is marked UP.
-//!   - Port 8404: stats page for observability.
+//!   - Port 8404: stats page for observability. Open on loopback (the
+//!     in-container monitor and the healthcheck); any other client presents
+//!     HTTP Basic auth (HAPROXY_STATS_USER / HAPROXY_STATS_PASSWORD, default
+//!     the MYSQLUSER / MYSQLPASSWORD account the edge carries). Without a
+//!     credential, remote access is denied.
 //!
 //! The health check hits the Rust health server running on each mysql-wrapper
 //! container (HEALTH_CHECK_PORT, default 8080), not MySQL directly. This
@@ -63,21 +67,7 @@ resolvers railway
     hold valid      10s
     hold obsolete   10s
 
-# Stats page for monitoring
-listen stats
-    bind :::8404 v4v6
-    mode http
-    stats enable
-    stats uri /stats
-    stats refresh 10s
-    # This proxy's own traffic is not worth logging: the in-container
-    # monitoring loop scrapes /stats every few seconds and each scrape opens
-    # two connections. Carried over from redis-ha, where inheriting `log
-    # global` here made self-traffic ~99% of the service's entire log volume,
-    # burying the lines an operator actually needs (backend UP/DOWN, DNS
-    # re-resolution, client connects).
-    no log
-
+{stats}
 # Write traffic — routed exclusively to the current Group Replication
 # primary. The /role health check returns 200 only on the primary node.
 frontend mysql_writes
@@ -107,7 +97,46 @@ backend mysql_primary_backend
         timeout_server = config.timeout_server,
         timeout_check = config.timeout_check,
         mysql_port = config.mysql_port,
+        stats = generate_stats_listener(config),
         servers = servers,
+    )
+}
+
+/// The stats listener. Loopback clients (the in-container monitor and the
+/// healthcheck) are always allowed. Anyone else must present the stats
+/// credential; without a credential configured, remote access is denied.
+///
+/// The credential is read by haproxy from the environment at parse time
+/// (`"${HAPROXY_STATS_USER}"` / `"${HAPROXY_STATS_PASSWORD}"`) so the
+/// rendered config — which is logged at startup — never contains it.
+fn generate_stats_listener(config: &Config) -> String {
+    let (userlist, remote_rule) = if config.stats_auth.is_some() {
+        (
+            "userlist stats_users\n    user \"${HAPROXY_STATS_USER}\" insecure-password \"${HAPROXY_STATS_PASSWORD}\"\n\n",
+            "http-request auth unless { http_auth(stats_users) }",
+        )
+    } else {
+        ("", "http-request deny")
+    };
+    format!(
+        r#"{userlist}# Stats page for monitoring
+listen stats
+    bind :::8404 v4v6
+    mode http
+    # This proxy's own traffic is not worth logging: the in-container
+    # monitoring loop scrapes /stats every few seconds and each scrape opens
+    # two connections. Carried over from redis-ha, where inheriting `log
+    # global` here made self-traffic ~99% of the service's entire log volume,
+    # burying the lines an operator actually needs (backend UP/DOWN, DNS
+    # re-resolution, client connects).
+    no log
+    acl LOCALHOST src 127.0.0.1 ::1 ::ffff:127.0.0.1
+    http-request allow if LOCALHOST
+    {remote_rule}
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+"#
     )
 }
 
@@ -117,8 +146,7 @@ mod tests {
 
     fn config_for_tests() -> Config {
         Config {
-            mysql_nodes: "mysql-1.railway.internal:3306,mysql-2.railway.internal:3306"
-                .to_string(),
+            mysql_nodes: "mysql-1.railway.internal:3306,mysql-2.railway.internal:3306".to_string(),
             health_port: 8080,
             mysql_port: 3306,
             max_conn: "1000".to_string(),
@@ -129,6 +157,7 @@ mod tests {
             check_interval: "3s".to_string(),
             check_fastinter: "500ms".to_string(),
             check_downinter: "500ms".to_string(),
+            stats_auth: None,
         }
     }
 
@@ -168,6 +197,57 @@ mod tests {
 
         assert!(conf.contains("defaults\n    log global"));
         assert!(!section(&conf, "frontend mysql_writes").contains("no log"));
+    }
+
+    #[test]
+    fn stats_page_requires_auth_for_remote_clients_when_a_credential_is_set() {
+        let mut config = config_for_tests();
+        config.stats_auth = Some(crate::config::StatsAuth {
+            user: "root".to_string(),
+            password: "s3cret".to_string(),
+        });
+        let nodes = crate::nodes::parse_nodes(&config.mysql_nodes).unwrap();
+        let conf = generate_config(&config, &nodes);
+
+        assert!(conf.contains("userlist stats_users\n    user \"${HAPROXY_STATS_USER}\" insecure-password \"${HAPROXY_STATS_PASSWORD}\""));
+        let stats = section(&conf, "listen stats");
+        assert!(stats.contains("acl LOCALHOST src 127.0.0.1 ::1 ::ffff:127.0.0.1"));
+        assert!(stats.contains(
+            "http-request allow if LOCALHOST\n    http-request auth unless { http_auth(stats_users) }\n    stats enable"
+        ));
+        assert!(!stats.contains("http-request deny"));
+        // The secret itself never lands in the rendered file (it is logged at
+        // boot): haproxy expands it from its environment at parse time.
+        assert!(!conf.contains("s3cret"));
+    }
+
+    #[test]
+    fn stats_page_denies_remote_clients_without_a_credential() {
+        let config = config_for_tests();
+        let nodes = crate::nodes::parse_nodes(&config.mysql_nodes).unwrap();
+        let conf = generate_config(&config, &nodes);
+
+        assert!(!conf.contains("userlist"));
+        let stats = section(&conf, "listen stats");
+        assert!(stats
+            .contains("http-request allow if LOCALHOST\n    http-request deny\n    stats enable"));
+    }
+
+    /// The loopback allow rule must come BEFORE the auth/deny rule: the
+    /// in-container monitor (`localhost:8404/stats;csv`) and the Dockerfile
+    /// HEALTHCHECK (`127.0.0.1:8404/stats`) carry no credential.
+    #[test]
+    fn stats_listener_keeps_its_bind_uri_and_loopback_exemption_first() {
+        let config = config_for_tests();
+        let nodes = crate::nodes::parse_nodes(&config.mysql_nodes).unwrap();
+        let conf = generate_config(&config, &nodes);
+        let stats = section(&conf, "listen stats");
+
+        assert!(stats.starts_with("listen stats\n    bind :::8404 v4v6\n    mode http\n"));
+        assert!(stats.contains("stats uri /stats\n    stats refresh 10s"));
+        let allow = stats.find("http-request allow if LOCALHOST").unwrap();
+        let gate = stats.find("http-request deny").unwrap();
+        assert!(allow < gate);
     }
 
     /// v1 has no read port — the read frontend/backend must not exist at all.
