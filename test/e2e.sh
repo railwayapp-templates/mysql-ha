@@ -1350,7 +1350,11 @@ t_coupled_password_edit_keeps_the_member_in_the_group() {
   # Edit the variable on ONE secondary and redeploy it, the way the platform
   # does: same volume, new MYSQL_ROOT_PASSWORD, GR_REPLICATION_PASSWORD moving
   # with it because it is a reference.
+  # The member must catch up through the recovery channel, so a write lands
+  # while it is down: that row can only arrive via distributed recovery, which
+  # authenticates with the credential this change decides.
   docker rm -f "$member" >/dev/null 2>&1
+  sql "$primary" "INSERT INTO t.kv VALUES (22,'while-away') ON DUPLICATE KEY UPDATE v='while-away';"
   ROOT_PW="rotated-by-variable-edit"; REPL_PW="$ROOT_PW"
   start_node "$n"
   ROOT_PW="$real_root"; REPL_PW="$real_root"
@@ -1358,16 +1362,26 @@ t_coupled_password_edit_keeps_the_member_in_the_group() {
   wait_until 300 "edited member rejoins (3 ONLINE)" group_is_fully_online "$other" \
     || { REPL_PW="$real_repl"; bad "edited member never rejoined the group — the recovery credential did not follow the pin"; docker logs "$member" 2>&1 | tail -30; return; }
   ok "edited member rejoined ONLINE without anyone reverting the variable"
+  wait_until 60 "while-away write recovered onto the rejoined member" \
+    bash -c '[ "$(docker exec '"$member"' mysql -uroot -p'"$real_root"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=22" 2>/dev/null)" = "while-away" ]' \
+    && ok "the write made while the member was away arrived through distributed recovery" \
+    || bad "the write made while the member was away never arrived — recovery did not run with a credential the donors accept"
   node_logged "$member" "the recovery credential follows the pinned active password" \
     && ok "wrapper logged that the recovery credential followed the pin" \
-    || bad "no log line explaining the coupled drift"
-  docker exec "$member" mysql -ugr_recovery -p"$real_root" -e "SELECT 1" >/dev/null 2>&1 \
+    || { bad "no log line explaining the coupled drift"; log "wrapper lines on $member about the credential:"; docker logs "$member" 2>&1 | grep -iE "recovery|root password|pin|drift" | tail -12; }
+  # Probe the member's local gr_recovery the way a peer does — over TCP from
+  # another member, encrypted as the group channel is — and keep the client's
+  # own words when it refuses, so a failure names its reason.
+  local peer_probe
+  peer_probe="$(docker exec "$other" mysql -h "$member" --ssl-mode=REQUIRED --connect-timeout=5 -ugr_recovery -p"$real_root" --batch --skip-column-names -e "SELECT 1" 2>&1 | tail -1)"
+  [ "$peer_probe" = "1" ] \
     && ok "edited member's gr_recovery still authenticates the password the group enforces" \
-    || bad "edited member rewrote gr_recovery to the edited value"
-  if docker exec "$member" mysql -ugr_recovery -p"rotated-by-variable-edit" -e "SELECT 1" >/dev/null 2>&1; then
+    || { bad "edited member's gr_recovery does not take the password the group enforces: ${peer_probe}"; sql "$member" "SELECT User, Host, plugin, account_locked, password_expired FROM mysql.user WHERE User='gr_recovery'" 2>&1 | head -5; }
+  peer_probe="$(docker exec "$other" mysql -h "$member" --ssl-mode=REQUIRED --connect-timeout=5 -ugr_recovery -p"rotated-by-variable-edit" --batch --skip-column-names -e "SELECT 1" 2>&1 | tail -1)"
+  if [ "$peer_probe" = "1" ]; then
     bad "the edited (never-live) password authenticates gr_recovery on the rejoined member"
   else
-    ok "the edited value never became a credential"
+    ok "the edited value never became a credential (${peer_probe})"
   fi
 
   sql "$primary" "INSERT INTO t.kv VALUES (21,'after-edit') ON DUPLICATE KEY UPDATE v='after-edit';"
