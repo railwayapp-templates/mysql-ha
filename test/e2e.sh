@@ -13,6 +13,7 @@ cd "$(dirname "$0")/.."
 
 MYSQL_VERSION="${MYSQL_VERSION:-8.4}"
 IMAGE="mysql-ha-e2e:${MYSQL_VERSION}"
+HAPROXY_IMAGE="mysql-ha-e2e-haproxy:3.2"
 NET="mysql-ha-e2e-net"
 LABEL="mysql-ha-e2e=1"
 ROOT_PW="e2e-root-pw"
@@ -47,6 +48,16 @@ ensure_image() {
     log "building $IMAGE"
     docker build -t "$IMAGE" -f mysql-wrapper/Dockerfile \
       --build-arg MYSQL_VERSION="$MYSQL_VERSION" . || { echo "image build failed"; exit 1; }
+  fi
+}
+
+# ensure_haproxy_image — the edge image, built on demand. CI pre-builds it
+# with its own cache (see .github/workflows/e2e.yml); locally the first edge
+# scenario pays the Rust build once.
+ensure_haproxy_image() {
+  if ! docker image inspect "$HAPROXY_IMAGE" >/dev/null 2>&1; then
+    log "building $HAPROXY_IMAGE"
+    docker build -t "$HAPROXY_IMAGE" -f haproxy/Dockerfile . || return 1
   fi
 }
 
@@ -119,6 +130,32 @@ start_standalone() {
     -e RAILWAY_VOLUME_MOUNT_PATH="/var/lib/mysql" \
     "$@" \
     "$IMAGE" >/dev/null
+}
+
+# start_edge <name> [extra docker args...] — an HAProxy edge pointed at the
+# trio's hostnames, with the wiring the template stamps on it. Whether the
+# data nodes are up does not matter to the stats page.
+start_edge() {
+  local name="$1"; shift
+  docker run -d --label "$LABEL" --name "$name" --hostname "$name" \
+    --network "$NET" --network-alias "$name" \
+    -e MYSQL_NODES="$SEEDS" -e HEALTH_CHECK_PORT=8080 \
+    "$@" \
+    "$HAPROXY_IMAGE" >/dev/null
+}
+
+# edge_http_code <url> [wget args...] — the HTTP status a throwaway client on
+# the e2e network gets for a URL, or 000 when nothing answered. busybox wget
+# prints the status line with -S and repeats it in its "server returned
+# error" line on a non-2xx answer; either form carries the code. Extra args
+# are spliced into the wget command line as written, so quote a header value
+# inside them.
+edge_http_code() {
+  local url="$1"; shift
+  local code
+  code="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$HAPROXY_IMAGE" -c \
+    "wget -S -T 5 -O /dev/null $* '$url' 2>&1 | sed -nE 's#.*HTTP/[0-9.]+ ([0-9]{3}).*#\1#p' | tail -1")"
+  echo "${code:-000}"
 }
 
 # start_minio — a minio container standing in for the S3-compatible bucket
@@ -1081,6 +1118,58 @@ t_password_variable_edit_does_not_rotate() {
   docker logs mysql-1 2>&1 | grep -q "MYSQL_ROOT_PASSWORD differs from the active root password" \
     && ok "wrapper warned about the drifted variable" \
     || bad "no drift warning in the wrapper log"
+}
+
+# The edge's stats page (8404) is read-only but it maps the whole cluster.
+# It must stay open on loopback (the in-container monitor and the Dockerfile
+# HEALTHCHECK carry no credential), ask every other client for the account the
+# template stamps on the edge (MYSQLUSER / MYSQLPASSWORD), and deny remote
+# access outright when no credential exists. Without the gate both remote
+# requests below answer 200.
+t_haproxy_stats_page_authenticates_remote_clients() {
+  log "t_haproxy_stats_page_authenticates_remote_clients (8404: loopback open, Basic auth elsewhere, denied without a credential)"
+  ensure_haproxy_image || { bad "haproxy image build failed"; return; }
+  docker rm -f mysql-ha-e2e-edge mysql-ha-e2e-edge-nocred >/dev/null 2>&1
+
+  # Template shape: the edge carries the Data UI account.
+  start_edge mysql-ha-e2e-edge -e MYSQLUSER=root -e MYSQLPASSWORD="$ROOT_PW"
+  wait_until 60 "edge serves its stats page on loopback" \
+    bash -c 'docker exec mysql-ha-e2e-edge wget -q -O /dev/null http://127.0.0.1:8404/stats 2>/dev/null' \
+    || { bad "edge never served /stats on loopback"; return; }
+  ok "loopback reaches /stats without a credential (monitor and healthcheck path)"
+
+  local token bad_token code
+  token="$(printf 'root:%s' "$ROOT_PW" | base64 | tr -d '\n')"
+  bad_token="$(printf 'root:not-the-password' | base64 | tr -d '\n')"
+  code="$(edge_http_code http://mysql-ha-e2e-edge:8404/stats)"
+  [ "$code" = "401" ] && ok "bare remote request is refused (401)" || bad "bare remote request got $code, want 401"
+  code="$(edge_http_code http://mysql-ha-e2e-edge:8404/stats "--header=\"Authorization: Basic $bad_token\"")"
+  [ "$code" = "401" ] && ok "wrong password is refused (401)" || bad "wrong password got $code, want 401"
+  code="$(edge_http_code http://mysql-ha-e2e-edge:8404/stats "--header=\"Authorization: Basic $token\"")"
+  [ "$code" = "200" ] && ok "root + MYSQLPASSWORD is accepted (200)" || bad "authenticated request got $code, want 200"
+
+  wait_until 90 "edge HEALTHCHECK healthy" \
+    bash -c '[ "$(docker inspect -f "{{.State.Health.Status}}" mysql-ha-e2e-edge)" = "healthy" ]' \
+    && ok "container HEALTHCHECK (loopback wget) reports healthy" \
+    || bad "container HEALTHCHECK did not reach healthy ($(docker inspect -f '{{.State.Health.Status}}' mysql-ha-e2e-edge))"
+
+  if docker logs mysql-ha-e2e-edge 2>&1 | grep -qF "$ROOT_PW"; then
+    bad "the stats password appears in the edge's log (rendered config)"
+  else
+    ok "the stats password never reaches the logged config"
+  fi
+
+  # No credential at all: remote access is denied outright, loopback stays open.
+  start_edge mysql-ha-e2e-edge-nocred
+  wait_until 60 "credential-less edge serves loopback stats" \
+    bash -c 'docker exec mysql-ha-e2e-edge-nocred wget -q -O /dev/null http://127.0.0.1:8404/stats 2>/dev/null' \
+    || { bad "credential-less edge never served /stats on loopback"; return; }
+  code="$(edge_http_code http://mysql-ha-e2e-edge-nocred:8404/stats)"
+  [ "$code" = "403" ] && ok "without a credential remote access is denied (403)" || bad "credential-less remote request got $code, want 403"
+  code="$(edge_http_code http://mysql-ha-e2e-edge-nocred:8404/stats "--header=\"Authorization: Basic $token\"")"
+  [ "$code" = "403" ] && ok "a credential-less edge accepts no password either (403)" || bad "credential-less edge answered $code to a Basic header, want 403"
+
+  docker rm -f mysql-ha-e2e-edge mysql-ha-e2e-edge-nocred >/dev/null 2>&1
 }
 
 t_sigterm_primary_demotes_before_exit() {
@@ -3126,7 +3215,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_never_serves_the_half_loaded_database t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_never_serves_the_half_loaded_database t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
 
 main() {
   ensure_image

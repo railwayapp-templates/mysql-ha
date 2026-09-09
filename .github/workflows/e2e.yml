@@ -57,6 +57,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The edge image, for the HAProxy scenarios. Its own cache scope: the
+      # wrapper build above keys the default scope, and the two Dockerfiles
+      # share no layers past the workspace copy.
+      - name: Build haproxy test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: haproxy/Dockerfile
+          platforms: linux/amd64
+          tags: mysql-ha-e2e-haproxy:3.2
+          load: true
+          cache-from: type=gha,scope=e2e-haproxy
+          cache-to: type=gha,mode=max,scope=e2e-haproxy
+
       - name: Run e2e harness
         # GitHub's default `run:` shell has no pipefail, so without it the
         # pipe to tee swallows the harness's failure-count exit code and the

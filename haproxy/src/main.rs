@@ -46,11 +46,19 @@ fn main() -> Result<()> {
 
     info!("starting HAProxy");
 
-    let child = Command::new("haproxy")
-        .arg("-f")
-        .arg(CONFIG_FILE)
-        .spawn()
-        .context("failed to spawn haproxy")?;
+    let mut haproxy = Command::new("haproxy");
+    haproxy.arg("-f").arg(CONFIG_FILE);
+    // The stats credential reaches haproxy through its environment, expanded
+    // at config parse time — never through the rendered (and logged) file.
+    if let Some(auth) = &config.stats_auth {
+        haproxy
+            .env("HAPROXY_STATS_USER", &auth.user)
+            .env("HAPROXY_STATS_PASSWORD", &auth.password);
+        info!(user = %auth.user, "stats page: loopback open, remote clients authenticate");
+    } else {
+        info!("stats page: loopback only (no HAPROXY_STATS_PASSWORD / MYSQLPASSWORD)");
+    }
+    let child = haproxy.spawn().context("failed to spawn haproxy")?;
 
     run_monitoring_loop(child, &telemetry)
 }
