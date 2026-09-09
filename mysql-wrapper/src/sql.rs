@@ -342,6 +342,47 @@ impl Sql {
         Ok(())
     }
 
+    /// Whether an account exists in the grant tables.
+    pub async fn user_exists(&self, user: &str, host: &str) -> Result<bool> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            let n: Option<i64> = conn
+                .exec_first(
+                    "SELECT COUNT(*) FROM mysql.user WHERE User = ? AND Host = ?",
+                    (user, host),
+                )
+                .await?;
+            Ok(n.unwrap_or(0) > 0)
+        })
+        .await
+    }
+
+    /// Whether the write fence is raised right now.
+    pub async fn super_read_only(&self) -> Result<bool> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            let v: Option<i64> = conn.query_first("SELECT @@GLOBAL.super_read_only").await?;
+            Ok(v == Some(1))
+        })
+        .await
+    }
+
+    /// Drop an account WITHOUT binlogging — the mirror image of
+    /// `ensure_recovery_user`: the account was created unlogged as node-local
+    /// state, so removing it is node-local too and never reaches an archive or
+    /// a group. Idempotent (`IF EXISTS`).
+    pub async fn drop_user_unlogged(&self, user: &str, host: &str) -> Result<()> {
+        let user_lit = sql_string_literal(user);
+        let host_lit = sql_string_literal(host);
+        // Both statements on ONE connection: sql_log_bin is session-scoped.
+        let mut conn = self.conn().await?;
+        conn.query_drop("SET SESSION sql_log_bin = 0").await?;
+        conn.query_drop(format!("DROP USER IF EXISTS {user_lit}@{host_lit}"))
+            .await?;
+        conn.query_drop("SET SESSION sql_log_bin = 1").await?;
+        Ok(())
+    }
+
     /// Point the NEXT START GROUP_REPLICATION at a different group name.
     /// Only valid while the plugin is stopped — the orchestrator owns that
     /// ordering (it never calls this once the node is group-active).

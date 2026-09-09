@@ -337,6 +337,11 @@ async fn main() -> Result<()> {
             role: "standalone".to_string(),
         });
 
+        // A volume reverted from HA to standalone still carries the group's
+        // recovery account; retire it (see gr::retire_recovery_user). A plain
+        // standalone volume has none and this is a no-op.
+        tokio::spawn(gr::retire_recovery_user(sql.clone(), telemetry.clone()));
+
         if archiving {
             tokio::spawn(archiver::run(
                 config.clone(),

@@ -264,6 +264,12 @@ The datadir is the volume root in both the standalone template and this
 image — `/var/lib/mysql` — so no data migration step is needed on adoption,
 only the config change above.
 
+Reverting (HA back to standalone, `GR_ENABLED`/`GR_SEEDS` stripped) keeps this
+image on the volume. The first standalone boot drops the `gr_recovery@'%'`
+account the group life created — unlogged, like its creation — so a
+standalone server does not keep a second root-password account with
+replication and admin grants; converting again recreates it.
+
 ## Images
 
 | Image | GHCR path | Base |
