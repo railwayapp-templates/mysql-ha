@@ -171,6 +171,16 @@ pub struct FullBackupMeta {
     /// `archive_shares_history` on it.
     #[serde(default)]
     pub gtid_purged: Option<String>,
+    /// Bytes of SQL mysqldump produced for this full, before gzip — what the
+    /// restore streams into the restore-phase server. With `datadir_bytes` it
+    /// turns the platform's disk pre-flight from a floor into an estimate.
+    /// `None` on metas written before the field existed.
+    #[serde(default)]
+    pub dump_bytes: Option<u64>,
+    /// Size of the source's data directory when the dump started: the closest
+    /// predictor of what the restored data directory will occupy.
+    #[serde(default)]
+    pub datadir_bytes: Option<u64>,
 }
 
 /// One full backup discovered in the bucket, with enough to select it and
@@ -1316,6 +1326,8 @@ mod tests {
             server_uuid: server_uuid.to_string(),
             mysql_version: "8.4.3".to_string(),
             gtid_purged: None,
+            dump_bytes: None,
+            datadir_bytes: None,
         }
     }
 

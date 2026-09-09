@@ -36,9 +36,12 @@
 //!   5. Replay binlogs up to the target time.
 //!      - Independent history (anonymous transactions): the full's own
 //!        lineage from its recorded coordinate. A sequence gap with binlogs
-//!        still present past it FAILS the restore loudly (see
-//!        replay_binlogs) — replaying short of the target and reporting
-//!        success would silently lose everything after the hole.
+//!        still present past it FAILS the restore loudly for any target the
+//!        replayed run does not provably cover (see replay_binlogs and
+//!        gap_blocks_target): the last replayed event must be at or past the
+//!        target, with no rotation tolerance — the missing file, unlike a
+//!        not-yet-shipped active binlog, is never coming. A target at or
+//!        before that event is served exactly; the hole is irrelevant to it.
 //!      - Shared history (GTIDs): the full's lineage from its coordinate,
 //!        then EVERY other lineage from its first archived file (see
 //!        replay_shared_history); a lineage's files past a sequence gap
@@ -70,7 +73,7 @@ use crate::pitr::{self, FullBackupMeta, FullBackupRef, S3Location};
 use crate::process_manager;
 use crate::s3::S3Client;
 use crate::sql::Sql;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,6 +121,13 @@ fn shared_history_restore_args(full: &FullBackupRef) -> [String; 2] {
 pub enum RestoreStatus {
     InProgress,
     Completed,
+    /// The archive cannot serve the target (a gap, a target past what was
+    /// shipped, no qualifying full, an unsafe bind). Deterministic for the
+    /// archive as it was; the next boot retries against the archive as it is.
+    Refused,
+    /// The attempt broke for a reason that is not the archive's (transport,
+    /// a tool exiting non-zero). Retried the same way.
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,7 +139,52 @@ pub struct RestoreMarker {
     /// verified before the marker is written (see `verify_achieved_point`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub achieved_time: Option<String>,
+    /// Why the last attempt ended `Refused`/`Failed`, verbatim from the error
+    /// chain — so a later boot can say what happened before it retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub updated_at: String,
+}
+
+/// A restore the archive cannot serve, as opposed to one that broke.
+///
+/// Every deterministic refusal in this module is one of these, keyed by a
+/// stable `kind` the platform can act on without parsing prose: the verdict
+/// line carries it, the marker keeps it, and backboard's pre-flight names the
+/// same kinds when it refuses a target up front.
+#[derive(Debug)]
+pub struct RestoreRefusal {
+    pub kind: &'static str,
+    pub reason: String,
+}
+
+impl std::fmt::Display for RestoreRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for RestoreRefusal {}
+
+fn refusal(kind: &'static str, reason: String) -> anyhow::Error {
+    anyhow::Error::new(RestoreRefusal { kind, reason })
+}
+
+/// (verdict, kind) for the terminal log line and the marker. A refusal keeps
+/// its kind through any `.context(..)` layers on the way out.
+pub fn classify_restore_error(e: &anyhow::Error) -> (&'static str, &'static str) {
+    match e.downcast_ref::<RestoreRefusal>() {
+        Some(r) => ("refused", r.kind),
+        None => ("failed", "error"),
+    }
+}
+
+/// What the previous attempt on this volume ended as, for the boot log.
+pub fn previous_attempt(data_dir: &str) -> Option<(RestoreStatus, Option<String>)> {
+    match read_marker_file(data_dir) {
+        MarkerFile::Present(m) => Some((m.status, m.reason)),
+        _ => None,
+    }
 }
 
 fn restore_marker_path(data_dir: &str) -> PathBuf {
@@ -179,7 +234,10 @@ fn read_restore_marker(data_dir: &str) -> Option<RestoreMarker> {
 pub fn crashed_mid_restore(data_dir: &str) -> bool {
     match read_marker_file(data_dir) {
         MarkerFile::Absent => false,
-        MarkerFile::Present(marker) => marker.status == RestoreStatus::InProgress,
+        MarkerFile::Present(marker) => matches!(
+            marker.status,
+            RestoreStatus::InProgress | RestoreStatus::Refused | RestoreStatus::Failed
+        ),
         // A marker that EXISTS but cannot be parsed is a torn write or disk
         // decay on the very file that records whether a restore completed —
         // never a fresh volume (nothing else writes this path). Defaulting
@@ -232,6 +290,7 @@ fn write_restore_marker(
     status: RestoreStatus,
     target: DateTime<Utc>,
     achieved: Option<DateTime<Utc>>,
+    reason: Option<&str>,
 ) -> Result<()> {
     use std::io::Write;
 
@@ -239,6 +298,7 @@ fn write_restore_marker(
         status,
         target_time: pitr::format_rfc3339_millis(target),
         achieved_time: achieved.map(pitr::format_rfc3339_millis),
+        reason: reason.map(str::to_string),
         updated_at: pitr::format_rfc3339_millis(Utc::now()),
     };
     let json = serde_json::to_string(&marker).context("serializing the PITR restore marker")?;
@@ -261,7 +321,46 @@ fn write_restore_marker(
 
 /// Run the whole restore end-to-end. Only ever called by main.rs when
 /// `Config::restore_enabled()` and the datadir is still uninitialized.
-pub async fn run(config: &Config) -> Result<()> {
+/// `run`, plus the one line the platform reads. Every attempt ends with a
+/// `point-in-time restore verdict` record — `verdict` completed/refused/failed,
+/// `kind` for refusals, `reason`, `elapsed_seconds` — and a refused or failed
+/// attempt leaves its reason in the marker for the next boot to repeat. The
+/// fork's deployment turns healthy the moment its container is up, so this
+/// line is what tells anyone outside the container how the restore went.
+pub async fn run_reporting(config: &Config) -> Result<()> {
+    let started = std::time::Instant::now();
+    match run(config, started).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let (verdict, kind) = classify_restore_error(&e);
+            let reason = format!("{e:#}");
+            let target = config.recovery_target_time();
+            error!(
+                verdict,
+                kind,
+                reason = %reason,
+                target = ?target.map(pitr::format_rfc3339_millis),
+                elapsed_seconds = started.elapsed().as_secs(),
+                "point-in-time restore verdict"
+            );
+            if let Some(target) = target {
+                let status = if verdict == "refused" {
+                    RestoreStatus::Refused
+                } else {
+                    RestoreStatus::Failed
+                };
+                if let Err(m) =
+                    write_restore_marker(&config.data_dir, status, target, None, Some(&reason))
+                {
+                    warn!(error = %m, "could not record the restore verdict in the marker");
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
     let data_dir = config.data_dir.clone();
     let target = config
         .recovery_target_time()
@@ -281,9 +380,12 @@ pub async fn run(config: &Config) -> Result<()> {
     let full = pitr::newest_qualifying_full(&fulls, target)
         .cloned()
         .ok_or_else(|| {
-            anyhow!(
-                "no full backup found at or before target time {} under the configured bucket/path",
-                pitr::format_rfc3339_millis(target)
+            refusal(
+                "no-full",
+                format!(
+                    "no full backup found at or before target time {} under the configured bucket/path",
+                    pitr::format_rfc3339_millis(target)
+                ),
             )
         })?;
     info!(
@@ -344,6 +446,16 @@ pub async fn run(config: &Config) -> Result<()> {
     // address, not its loopback.
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     args.push("--bind-address=127.0.0.1".to_string());
+    // The restore-phase server is disposable: a crash mid-load is wiped and
+    // retried from scratch (see crashed_mid_restore), so the durability knobs
+    // that make a serving server safe only make this one slow. No redo fsync
+    // per commit, no doublewrite, and no binlog of a load whose history the
+    // archive already holds — the serving mysqld that boots on the finished
+    // datadir runs with the image's normal settings.
+    args.push("--innodb-flush-log-at-trx-commit=0".to_string());
+    args.push("--sync-binlog=0".to_string());
+    args.push("--innodb-doublewrite=OFF".to_string());
+    args.push("--skip-log-bin".to_string());
     if shared_history {
         let gtid_args = shared_history_restore_args(&full);
         info!(
@@ -396,10 +508,24 @@ pub async fn run(config: &Config) -> Result<()> {
         Err(e) => warn!(error = %e, "error waiting for the restore-phase mysqld to exit"),
     }
 
-    write_restore_marker(&data_dir, RestoreStatus::Completed, target, Some(achieved))?;
+    write_restore_marker(
+        &data_dir,
+        RestoreStatus::Completed,
+        target,
+        Some(achieved),
+        None,
+    )?;
     info!(
         achieved = %pitr::format_rfc3339_millis(achieved),
         "point-in-time restore completed; the normal boot flow starts mysqld in serving mode next"
+    );
+    info!(
+        verdict = "completed",
+        kind = "ok",
+        target = %pitr::format_rfc3339_millis(target),
+        achieved = %pitr::format_rfc3339_millis(achieved),
+        elapsed_seconds = started.elapsed().as_secs(),
+        "point-in-time restore verdict"
     );
     Ok(())
 }
@@ -428,12 +554,15 @@ async fn ensure_bound_to_loopback(sql: &Sql) -> Result<()> {
                  served a database missing some or all of its data and could not tell that \
                  apart from a completed restore"
             );
-            anyhow::bail!(
-                "restore-phase mysqld is bound to {:?}, not loopback \
+            return Err(refusal(
+                "unsafe-bind",
+                format!(
+                    "restore-phase mysqld is bound to {:?}, not loopback \
                  (--bind-address did not take effect); refusing to load a partial \
                  database that clients could read",
-                addr
-            )
+                    addr
+                ),
+            ));
         }
         Err(e) => {
             // Reading the variable is not the guarantee — the argv flag is.
@@ -490,7 +619,7 @@ async fn write_marker_once_datadir_exists(
                     .map(|mut d| d.next().is_some())
                     .unwrap_or(false);
                 if non_empty {
-                    write_restore_marker(data_dir, RestoreStatus::InProgress, target, None)?;
+                    write_restore_marker(data_dir, RestoreStatus::InProgress, target, None, None)?;
                     return Ok(());
                 }
             }
@@ -662,35 +791,7 @@ async fn replay_binlogs(
         .collect();
 
     let plan = pitr::binlogs_to_replay(names, &full.meta.binlog_file);
-    if let Some(gap) = &plan.gap {
-        // Binlogs exist PAST a hole in the lineage: replaying up to the hole
-        // and stopping would serve a database silently missing everything
-        // after it while reporting success — worse than failing. Refuse, name
-        // the gap, and leave the datadir marked mid-restore (fail-closed, the
-        // same posture as every other unrecoverable restore state).
-        error!(
-            after = %gap.after,
-            next_present = %gap.next_present,
-            start_file = %full.meta.binlog_file,
-            "binlog lineage has a gap: a binlog is missing from the archive while later \
-             binlogs exist past it — the requested point-in-time target cannot be reached, \
-             and replaying short of it would silently lose the data after the gap"
-        );
-        anyhow::bail!(
-            "binlog lineage gap: no binlog follows {:?} but {:?} exists past the hole — \
-             the archive is missing at least one binlog (expired, deleted, or lost before \
-             upload), so a restore to the requested target is impossible; pick a target \
-             at or before the gap, or restore from another full backup \
-             (other discovered full backups: {})",
-            if gap.after.is_empty() {
-                full.meta.binlog_file.as_str()
-            } else {
-                gap.after.as_str()
-            },
-            gap.next_present,
-            pitr::describe_fallback_fulls(fulls, full),
-        );
-    }
+    let gap = plan.gap.clone();
     let to_replay = plan.run;
     if to_replay.is_empty() {
         info!(
@@ -703,6 +804,13 @@ async fn replay_binlogs(
         // within the rotation bound of the target: an old full with no
         // shipped binlogs behind it can be hours short of the request.
         let achieved = full.meta.taken_at;
+        if let Some(gap) = &gap {
+            // A hole right after the coordinate file: the dump alone reaches
+            // its own instant, and nothing later is reachable.
+            if gap_blocks_target(achieved, target) {
+                return Err(gap_refusal(gap, fulls, full));
+            }
+        }
         verify_achieved_point(achieved, target, config, fulls, full)?;
         return Ok(achieved);
     }
@@ -725,9 +833,68 @@ async fn replay_binlogs(
     // the failure paths too, hence the inner-result shape.
     let result = replay_downloaded(&local_paths, Some(full.meta.binlog_pos), target, config).await;
     let _ = std::fs::remove_dir_all(&scratch);
-    let achieved = result?;
-    verify_achieved_point(achieved, target, config, fulls, full)?;
-    Ok(achieved)
+    let replayed = result?;
+    if let Some(gap) = &gap {
+        // A hole with files past it is fatal ONLY for a target past the hole.
+        // Everything up to the last replayed event is present, so a target at
+        // or before it is served exactly; past it, the missing file may hold
+        // events before the target, and the rotation tolerance that forgives
+        // a not-yet-shipped active binlog must not forgive a lost one.
+        if gap_blocks_target(replayed.last_event, target) {
+            return Err(gap_refusal(gap, fulls, full));
+        }
+        info!(
+            after = %gap.after,
+            next_present = %gap.next_present,
+            last_event = %pitr::format_rfc3339_millis(replayed.last_event),
+            target = %pitr::format_rfc3339_millis(target),
+            "the lineage has a sequence gap past this target: every event up to the target \
+             replayed from the files before the hole, so the hole is irrelevant here"
+        );
+    }
+    verify_achieved_point(replayed.achieved, target, config, fulls, full)?;
+    Ok(replayed.achieved)
+}
+
+/// With a hole in the lineage, only a target the replayed run provably covers
+/// is served: the last replayed event must be at or past the target. Anything
+/// later might have lived in the missing file — and the missing file, unlike
+/// a not-yet-shipped active binlog, is never coming.
+fn gap_blocks_target(last_event: DateTime<Utc>, target: DateTime<Utc>) -> bool {
+    last_event < target
+}
+
+fn gap_refusal(
+    gap: &pitr::BinlogGap,
+    fulls: &[FullBackupRef],
+    full: &FullBackupRef,
+) -> anyhow::Error {
+    let after = if gap.after.is_empty() {
+        full.meta.binlog_file.as_str()
+    } else {
+        gap.after.as_str()
+    };
+    error!(
+        after = %gap.after,
+        next_present = %gap.next_present,
+        start_file = %full.meta.binlog_file,
+        "binlog lineage has a gap: a binlog is missing from the archive while later \
+         binlogs exist past it — the requested point-in-time target lies past the hole \
+         and cannot be reached; replaying short of it would silently lose the data after \
+         the gap"
+    );
+    refusal(
+        "binlog-gap",
+        format!(
+            "binlog lineage gap: no binlog follows {after:?} but {:?} exists past the hole — \
+             the archive is missing at least one binlog (expired, deleted, or lost before \
+             upload), so a restore to the requested target is impossible; pick a target \
+             at or before the last event of {after:?}, or restore from another full backup \
+             (other discovered full backups: {})",
+            gap.next_present,
+            pitr::describe_fallback_fulls(fulls, full),
+        ),
+    )
 }
 
 /// One gap-free run of one lineage's binlogs in a shared-history replay.
@@ -904,6 +1071,7 @@ async fn replay_shared_history(
             );
             let reached = replay_downloaded(&local_paths, run.start_position, target, config)
                 .await
+                .map(|r| r.achieved)
                 .with_context(|| {
                     if run.round > 0 {
                         format!(
@@ -947,13 +1115,16 @@ async fn replay_shared_history(
              these transactions on every lineage that held them — the requested point-in-time \
              target cannot be reached, and serving the result would silently lose them"
         );
-        anyhow::bail!(
-            "gtid history has holes: {listed} — the archive is missing at least one binlog \
+        return Err(refusal(
+            "gtid-hole",
+            format!(
+                "gtid history has holes: {listed} — the archive is missing at least one binlog \
              (expired, deleted, or lost before upload) on every lineage that carried these \
              transactions, so a restore to the requested target is impossible; pick an earlier \
              target, or restore from another full backup (other discovered full backups: {})",
-            pitr::describe_fallback_fulls(fulls, full),
-        );
+                pitr::describe_fallback_fulls(fulls, full),
+            ),
+        ));
     }
     if let Some(purged) = full.meta.gtid_purged.as_deref().filter(|p| !p.is_empty()) {
         // gtid_compare(mine, peer) -> (peer ⊆ mine, mine ⊆ peer).
@@ -962,11 +1133,14 @@ async fn replay_shared_history(
             .await
             .context("checking the dump's GTID set against the restored server")?;
         if !dump_within_result {
-            anyhow::bail!(
-                "the restored server lacks transactions the full backup declared it contains \
+            return Err(refusal(
+                "dump-incomplete",
+                format!(
+                    "the restored server lacks transactions the full backup declared it contains \
                  (dump GTID set {purged}, restored gtid_executed {executed}) — the dump did not \
                  load completely"
-            );
+                ),
+            ));
         }
     }
     info!(
@@ -982,12 +1156,21 @@ async fn replay_shared_history(
 /// by the local achieved-point pass over the last of them. Split out of
 /// `replay_binlogs` so the caller can clean the scratch directory up on
 /// every path.
+/// What a replay reached: `achieved` is the recovery point (the last event,
+/// capped at the target — events past `--stop-datetime` were deliberately not
+/// applied); `last_event` is the raw timestamp of the last event in the last
+/// file, uncapped, which is what the gap rule compares against the target.
+struct Replayed {
+    achieved: DateTime<Utc>,
+    last_event: DateTime<Utc>,
+}
+
 async fn replay_downloaded(
     local_paths: &[PathBuf],
     start_position: Option<u64>,
     target: DateTime<Utc>,
     config: &Config,
-) -> Result<DateTime<Utc>> {
+) -> Result<Replayed> {
     use tokio::io::AsyncWriteExt;
 
     let stop_dt = target.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -1063,7 +1246,10 @@ async fn replay_downloaded(
             last_local.display()
         )
     })?;
-    Ok(last_event.min(target))
+    Ok(Replayed {
+        achieved: last_event.min(target),
+        last_event,
+    })
 }
 
 /// The timestamp of the LAST event in a staged binlog file, via a local
@@ -1148,23 +1334,83 @@ fn verify_achieved_point(
          binlogs well before the target instant — reporting success would silently serve a \
          database missing everything in between"
     );
-    anyhow::bail!(
-        "recovery target not reached: requested {} but the selected full backup's archive \
+    return Err(refusal(
+        "target-unreachable",
+        format!(
+            "recovery target not reached: requested {} but the selected full backup's archive \
          only reaches {} (more than the allowed {}s rotation-bounded lag behind the target) \
          — the binlogs covering the rest were never shipped (archiver stopped, or the target \
          lies inside/beyond the never-uploaded active binlog); pick a target at or before \
          the achieved point, or restore from another full backup \
          (other discovered full backups: {})",
-        pitr::format_rfc3339_millis(target),
-        pitr::format_rfc3339_millis(achieved),
-        bound,
-        pitr::describe_fallback_fulls(fulls, full),
-    )
+            pitr::format_rfc3339_millis(target),
+            pitr::format_rfc3339_millis(achieved),
+            bound,
+            pitr::describe_fallback_fulls(fulls, full),
+        ),
+    ));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gap_blocks_only_targets_past_the_last_replayed_event() {
+        let last = t();
+        // Target at the last event: every event up to it replayed → served.
+        assert!(!gap_blocks_target(last, last));
+        // Target before the last event: covered.
+        assert!(!gap_blocks_target(
+            last,
+            last - chrono::Duration::seconds(30)
+        ));
+        // Target one second past: the missing file may hold it → refused,
+        // however small the distance (no rotation tolerance across a hole).
+        assert!(gap_blocks_target(last, last + chrono::Duration::seconds(1)));
+    }
+
+    #[test]
+    fn refusals_carry_a_stable_kind_and_anything_else_is_a_failure() {
+        let e = refusal("binlog-gap", "no binlog follows binlog.000006".to_string());
+        assert_eq!(classify_restore_error(&e), ("refused", "binlog-gap"));
+        assert_eq!(e.to_string(), "no binlog follows binlog.000006");
+        // The `.context("replaying binlogs")?` on the way out must not hide
+        // the refusal from the classifier.
+        let wrapped = e.context("replaying binlogs");
+        assert_eq!(classify_restore_error(&wrapped), ("refused", "binlog-gap"));
+        let plain = anyhow::anyhow!("mysqlbinlog exited with signal 9");
+        assert_eq!(classify_restore_error(&plain), ("failed", "error"));
+    }
+
+    #[test]
+    fn a_refused_or_failed_attempt_reads_as_crashed_mid_restore_and_keeps_its_reason() {
+        let dir = temp_dir("refused-marker");
+        write_restore_marker(
+            &dir,
+            RestoreStatus::Refused,
+            t(),
+            None,
+            Some("binlog lineage gap"),
+        )
+        .unwrap();
+        assert!(crashed_mid_restore(&dir));
+        let (status, reason) = previous_attempt(&dir).unwrap();
+        assert_eq!(status, RestoreStatus::Refused);
+        assert_eq!(reason.as_deref(), Some("binlog lineage gap"));
+        write_restore_marker(
+            &dir,
+            RestoreStatus::Failed,
+            t(),
+            None,
+            Some("gunzip exited with 1"),
+        )
+        .unwrap();
+        assert!(crashed_mid_restore(&dir));
+        write_restore_marker(&dir, RestoreStatus::Completed, t(), Some(t()), None).unwrap();
+        assert!(!crashed_mid_restore(&dir));
+        assert_eq!(previous_attempt(&dir).unwrap().1, None);
+    }
 
     #[test]
     fn only_an_all_loopback_bind_keeps_the_restore_unreachable() {
@@ -1212,7 +1458,7 @@ mod tests {
     #[test]
     fn in_progress_marker_reads_as_crashed() {
         let dir = temp_dir("in-progress");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
         assert!(crashed_mid_restore(&dir));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1220,9 +1466,9 @@ mod tests {
     #[test]
     fn completed_marker_is_not_a_crash_and_records_the_achieved_point() {
         let dir = temp_dir("completed");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
         let achieved = pitr::parse_target_time("2026-08-13T13:59:10.000Z").unwrap();
-        write_restore_marker(&dir, RestoreStatus::Completed, t(), Some(achieved)).unwrap();
+        write_restore_marker(&dir, RestoreStatus::Completed, t(), Some(achieved), None).unwrap();
         assert!(!crashed_mid_restore(&dir));
         let marker = read_restore_marker(&dir).unwrap();
         assert_eq!(marker.status, RestoreStatus::Completed);
@@ -1237,7 +1483,7 @@ mod tests {
     #[test]
     fn marker_write_publishes_atomically() {
         let dir = temp_dir("atomic");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
         // The tmp staging file must never survive a successful publish — a
         // stray one would mean the rename pattern regressed to two files.
         assert!(!Path::new(&dir)
@@ -1259,7 +1505,7 @@ mod tests {
     #[test]
     fn reset_partial_restore_wipes_everything_but_the_runtime_lock() {
         let dir = temp_dir("reset");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
         std::fs::create_dir_all(Path::new(&dir).join("mysql")).unwrap();
         std::fs::write(Path::new(&dir).join("mysql").join("ibdata1"), "junk").unwrap();
         std::fs::write(Path::new(&dir).join("binlog.000001"), "junk").unwrap();
