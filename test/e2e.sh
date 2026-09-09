@@ -1248,9 +1248,23 @@ t_revert_to_standalone_drops_recovery_user() {
   [ "$(sql mysql-1 "$count_sql")" = "1" ] \
     && ok "remaining group members keep their recovery account" \
     || bad "a group member lost gr_recovery"
-  has_n_online mysql-1 2 \
+  # Expulsion is not instantaneous: the group has to suspect the departed
+  # member, wait out group_replication_member_expel_timeout and install the
+  # new view. The reverted node also comes back on the SAME hostname, so
+  # mysql-3:3306 answers again — as a standalone server with no group plugin —
+  # which is the shape where suspicion takes longest to settle. An instant
+  # count read "3 ONLINE" on the first CI run of this scenario while the
+  # reverted node was already standalone and taking writes.
+  wait_until 180 "departed member expelled from the group view (2 ONLINE)" has_n_online mysql-1 2 \
     && ok "remaining members still form a group (2 ONLINE)" \
-    || bad "expected 2 ONLINE members, got $(online_members mysql-1 | tr -d '[:space:]')"
+    || {
+      bad "expected 2 ONLINE members, got $(online_members mysql-1 | tr -d '[:space:]')"
+      log "  group view on mysql-1:"
+      sql mysql-1 "SELECT MEMBER_HOST, MEMBER_PORT, MEMBER_STATE, MEMBER_ROLE FROM performance_schema.replication_group_members" | sed 's/^/    /'
+      log "  reverted node's own view (empty = plugin not running) and write fence:"
+      sql mysql-3 "SELECT COUNT(*) FROM performance_schema.replication_group_members" | sed 's/^/    members: /'
+      sql mysql-3 "SELECT @@super_read_only" | sed 's/^/    super_read_only: /'
+    }
 
   # Idempotent: a second standalone boot finds nothing to do and stays healthy.
   docker restart mysql-3 >/dev/null
@@ -2238,6 +2252,12 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
   )
   start_standalone mysql-pitr-window-restore "${recover_env[@]}"
 
+  # `--entrypoint mysql`: the image's ENTRYPOINT is mysql-wrapper, so a bare
+  # `docker run $IMAGE mysql …` runs the WRAPPER, which logs a line and exits
+  # non-zero for want of its environment. Without the override the probe below
+  # read that exit as "refused" on every attempt — a pass that proved nothing —
+  # and the post-completion read returned the wrapper's log line instead of a
+  # row. Both happened on the first CI run of this scenario.
   # Dial 3306 from ANOTHER container, over the network, exactly as a customer
   # would through the platform's TCP proxy — never over the restoring node's
   # own unix socket, which the restore legitimately uses throughout.
@@ -2252,8 +2272,8 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
       break
     fi
     probes=$(( probes + 1 ))
-    if docker run --rm --network "$NET" "$IMAGE" \
-        mysql -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
+    if docker run --rm --network "$NET" --entrypoint mysql "$IMAGE" \
+        -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
         --connect-timeout=3 --batch --skip-column-names \
         -e "SELECT 1" >/dev/null 2>&1; then
       connected=$(( connected + 1 ))
@@ -2261,8 +2281,8 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
       # Capture WHAT it served, so the failure names the shape of the bug
       # rather than just its existence.
       local rows
-      rows="$(docker run --rm --network "$NET" "$IMAGE" \
-        mysql -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
+      rows="$(docker run --rm --network "$NET" --entrypoint mysql "$IMAGE" \
+        -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
         --connect-timeout=3 --batch --skip-column-names \
         -e "SELECT COUNT(*) FROM t.kv" 2>&1 | tail -1)"
       log "  mid-restore connection SUCCEEDED; t.kv reported: $rows"
@@ -2286,8 +2306,8 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
   # opens and serves the restored data. A fix that simply never opened the
   # port would pass the check above and break the product.
   local v
-  v="$(docker run --rm --network "$NET" "$IMAGE" \
-    mysql -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
+  v="$(docker run --rm --network "$NET" --entrypoint mysql "$IMAGE" \
+    -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
     --connect-timeout=10 --batch --skip-column-names \
     -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null)"
   [ "$v" = "restored-row" ] \
