@@ -85,6 +85,11 @@ const GROUP_NAME_MARKER: &str = ".railway_gr_group_name";
 const PRE_GTID_DATA_MARKER: &str = ".railway_pre_gtid_data";
 const WAIVER_GENERATION_MARKER: &str = ".railway_gr_waiver_generation";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// Bounded retries for the standalone recovery-account cleanup
+/// (`retire_recovery_user`): 5 s apart, so a pool the password resolver is
+/// still swapping (a drifted variable at boot) gets ample time, and a server
+/// that keeps refusing is reported instead of polled forever.
+const RETIRE_RECOVERY_USER_ATTEMPTS: u32 = 60;
 
 /// Bounds for the boot-time write-fence retry (step 2c): the SET is
 /// idempotent and legitimately slow under load (it waits out in-flight
@@ -2028,6 +2033,83 @@ pub async fn orchestrate(
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Standalone boots only (main.rs): retire the Group Replication recovery
+/// account a previous HA life left on this volume. `gr_recovery@'%'` exists
+/// to authenticate group connections and distributed recovery; on a service
+/// reverted to standalone it is a second account holding the root password
+/// with REPLICATION SLAVE / CONNECTION_ADMIN / BACKUP_ADMIN /
+/// GROUP_REPLICATION_STREAM grants that nothing uses. Dropped unlogged, the
+/// way it was created (node-local state either way), only when it exists, and
+/// never through a raised write fence — a standalone server has no fence of
+/// ours, so a raised `super_read_only` is somebody else's decision to respect.
+/// A later conversion back to HA recreates the account (step 2b of
+/// `orchestrate`). A plain standalone server that never ran as a member finds
+/// nothing and changes nothing.
+pub async fn retire_recovery_user(sql: Sql, telemetry: Arc<Telemetry>) {
+    // The FINAL mysqld, not docker-entrypoint's init temp server — the same
+    // readiness test orchestrate uses. Reached through the shared pool, so it
+    // also waits out the password resolver's swap on a drifted variable.
+    loop {
+        if let Ok(false) = sql.is_init_temp_server().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    let mut attempts = 0u32;
+    loop {
+        let outcome = async {
+            if !sql.user_exists(RECOVERY_USER, "%").await? {
+                return anyhow::Ok(None);
+            }
+            if sql.super_read_only().await? {
+                return Ok(Some("super_read_only is raised"));
+            }
+            sql.drop_user_unlogged(RECOVERY_USER, "%").await?;
+            Ok(Some("dropped"))
+        }
+        .await;
+        match outcome {
+            Ok(None) => return,
+            Ok(Some("dropped")) => {
+                info!(
+                    user = RECOVERY_USER,
+                    "standalone boot: dropped the Group Replication recovery account left by this volume's HA life"
+                );
+                return;
+            }
+            Ok(Some(reason)) => {
+                warn!(
+                    user = RECOVERY_USER,
+                    reason,
+                    "standalone boot: leaving the Group Replication recovery account in place"
+                );
+                return;
+            }
+            Err(e) => {
+                attempts += 1;
+                if attempts >= RETIRE_RECOVERY_USER_ATTEMPTS {
+                    error!(
+                        error = %e,
+                        attempts,
+                        "could not retire the Group Replication recovery account; leaving it in place"
+                    );
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "mysql-wrapper".to_string(),
+                        error: e.to_string(),
+                        context: "retire_recovery_user".to_string(),
+                    });
+                    return;
+                }
+                if attempts % 6 == 1 {
+                    warn!(error = %e, attempts, "retiring the recovery account failed; retrying");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
     }
 }
 

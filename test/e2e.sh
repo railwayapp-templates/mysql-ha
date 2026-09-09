@@ -158,6 +158,26 @@ edge_http_code() {
   echo "${code:-000}"
 }
 
+# start_reverted_node <n> [extra docker args...] — boots mysql-N on its
+# EXISTING volume the way the platform's HA -> standalone revert leaves it:
+# same image, GR_ENABLED and GR_SEEDS stripped (GR_REPLICATION_PASSWORD goes
+# with them), so the wrapper takes its standalone passthrough path over a
+# datadir that was a group member.
+start_reverted_node() {
+  local n="$1"; shift
+  local host="mysql-$n"
+  docker run -d --label "$LABEL" --restart unless-stopped \
+    --name "$host" --hostname "$host" \
+    --network "$NET" --network-alias "$host" \
+    -v "mysql-ha-e2e-vol-$n:/var/lib/mysql" \
+    -e MYSQL_ROOT_PASSWORD="$ROOT_PW" \
+    -e RAILWAY_PRIVATE_DOMAIN="$host" \
+    -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+    -e RAILWAY_VOLUME_MOUNT_PATH="/var/lib/mysql" \
+    "$@" \
+    "$IMAGE" >/dev/null
+}
+
 # start_minio — a minio container standing in for the S3-compatible bucket
 # the PITR env contract points at, on the shared e2e network, with
 # PITR_BUCKET pre-created via the mc client. The wrapper containers reach it
@@ -1170,6 +1190,77 @@ t_haproxy_stats_page_authenticates_remote_clients() {
   [ "$code" = "403" ] && ok "a credential-less edge accepts no password either (403)" || bad "credential-less edge answered $code to a Basic header, want 403"
 
   docker rm -f mysql-ha-e2e-edge mysql-ha-e2e-edge-nocred >/dev/null 2>&1
+}
+
+# A volume reverted from HA to standalone still carries gr_recovery@'%' — a
+# second account holding the root password with replication/admin grants
+# that nothing uses once the node is alone. The first standalone boot must
+# retire it (unlogged, like its creation), leave the data and the members
+# that were NOT reverted untouched, and do nothing on a second boot. Without
+# the cleanup the account count stays 1 and the log line never appears.
+t_revert_to_standalone_drops_recovery_user() {
+  log "t_revert_to_standalone_drops_recovery_user (HA -> standalone revert must not leave gr_recovery behind)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (30,'before-revert') ON DUPLICATE KEY UPDATE v='before-revert';"
+  wait_until 60 "seed write replicated" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=30" 2>/dev/null)" = "before-revert" ]' \
+    || { bad "seed write never replicated"; return; }
+
+  local count_sql="SELECT COUNT(*) FROM mysql.user WHERE User='gr_recovery' AND Host='%'"
+  [ "$(sql mysql-3 "$count_sql")" = "1" ] \
+    && ok "member carries gr_recovery while it is in the group" \
+    || { bad "expected gr_recovery on a group member"; return; }
+
+  # Revert ONE member: same volume, HA variables stripped. The platform strips
+  # them on every member of a reverted cluster; one is enough to prove the
+  # cleanup and keeps the other two as a control.
+  docker rm -f mysql-3 >/dev/null 2>&1
+  start_reverted_node 3
+  wait_until 240 "reverted node up standalone" \
+    bash -c 'docker exec mysql-3 wget -q -O /dev/null http://mysql-3:8080/role 2>/dev/null' \
+    || { bad "reverted node never came up standalone"; return; }
+  ok "reverted node boots standalone on the ex-member datadir"
+
+  wait_until 90 "recovery account retired" \
+    bash -c '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "'"$count_sql"'" 2>/dev/null)" = "0" ]' \
+    && ok "gr_recovery dropped on the standalone boot" \
+    || bad "gr_recovery survived the revert"
+  node_logged mysql-3 "dropped the Group Replication recovery account" \
+    && ok "wrapper logged the cleanup" \
+    || bad "no cleanup line in the wrapper log"
+  if docker exec mysql-3 mysql -ugr_recovery -p"$REPL_PW" -e "SELECT 1" >/dev/null 2>&1; then
+    bad "the recovery password still authenticates on the reverted node"
+  else
+    ok "the recovery password no longer authenticates on the reverted node"
+  fi
+
+  [ "$(sql mysql-3 "SELECT v FROM t.kv WHERE k=30")" = "before-revert" ] \
+    && ok "data intact on the reverted node" \
+    || bad "data missing on the reverted node"
+  sql mysql-3 "INSERT INTO t.kv VALUES (31,'standalone-write') ON DUPLICATE KEY UPDATE v='standalone-write';" \
+    && ok "reverted node takes writes standalone" \
+    || bad "reverted node refused a write"
+
+  # The members that were not reverted are untouched.
+  [ "$(sql mysql-1 "$count_sql")" = "1" ] \
+    && ok "remaining group members keep their recovery account" \
+    || bad "a group member lost gr_recovery"
+  has_n_online mysql-1 2 \
+    && ok "remaining members still form a group (2 ONLINE)" \
+    || bad "expected 2 ONLINE members, got $(online_members mysql-1 | tr -d '[:space:]')"
+
+  # Idempotent: a second standalone boot finds nothing to do and stays healthy.
+  docker restart mysql-3 >/dev/null
+  wait_until 240 "reverted node back up" \
+    bash -c 'docker exec mysql-3 wget -q -O /dev/null http://mysql-3:8080/role 2>/dev/null' \
+    || { bad "reverted node did not come back after a restart"; return; }
+  [ "$(sql mysql-3 "$count_sql")" = "0" ] \
+    && [ "$(docker logs mysql-3 2>&1 | grep -c "dropped the Group Replication recovery account")" = "1" ] \
+    && ok "second standalone boot is a no-op" \
+    || bad "second standalone boot changed or re-logged the cleanup"
 }
 
 t_sigterm_primary_demotes_before_exit() {
@@ -3215,7 +3306,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_never_serves_the_half_loaded_database t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_never_serves_the_half_loaded_database t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
 
 main() {
   ensure_image
