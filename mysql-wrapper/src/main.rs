@@ -290,6 +290,10 @@ async fn main() -> Result<()> {
             config.clone(),
             sql.clone(),
             telemetry.clone(),
+            // The active root password as the pin resolved it at boot — what
+            // the recovery credential must follow when the template couples
+            // it to the root variable (see gr::recovery_credential).
+            boot_password.clone(),
             group_name,
             fresh_datadir,
             healing,
