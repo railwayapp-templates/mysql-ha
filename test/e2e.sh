@@ -1521,6 +1521,64 @@ t_revert_to_standalone_drops_recovery_user() {
     || bad "second standalone boot changed or re-logged the cleanup"
 }
 
+# The template stamps GR_REPLICATION_PASSWORD as a reference to
+# MYSQL_ROOT_PASSWORD, so editing the root variable changes both — while the
+# live root password stays pinned. ensure_recovery_user used to rewrite each
+# restarted member's local gr_recovery with the NEW value; no peer held it, the
+# member could never join, and self-heal recloned with the same credential
+# until the attempt cap parked it. The recovery credential now follows the
+# root pin: an edited member rejoins ONLINE on the password the group still
+# enforces, its gr_recovery is left on that password, and the wrapper says so.
+t_coupled_password_edit_keeps_the_member_in_the_group() {
+  log "t_coupled_password_edit_keeps_the_member_in_the_group (template shape: GR_REPLICATION_PASSWORD follows MYSQL_ROOT_PASSWORD)"
+  teardown_trio
+  local real_root="$ROOT_PW" real_repl="$REPL_PW"
+  REPL_PW="$ROOT_PW"
+  start_trio
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 \
+    || { REPL_PW="$real_repl"; bad "coupled group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (20,'before-edit') ON DUPLICATE KEY UPDATE v='before-edit';"
+
+  local primary member other
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { REPL_PW="$real_repl"; bad "no primary"; return; }
+  for member in mysql-1 mysql-2 mysql-3; do [ "$member" != "$primary" ] && break; done
+  for other in mysql-1 mysql-2 mysql-3; do [ "$other" != "$primary" ] && [ "$other" != "$member" ] && break; done
+  local n="${member#mysql-}"
+
+  # Edit the variable on ONE secondary and redeploy it, the way the platform
+  # does: same volume, new MYSQL_ROOT_PASSWORD, GR_REPLICATION_PASSWORD moving
+  # with it because it is a reference.
+  docker rm -f "$member" >/dev/null 2>&1
+  ROOT_PW="rotated-by-variable-edit"; REPL_PW="$ROOT_PW"
+  start_node "$n"
+  ROOT_PW="$real_root"; REPL_PW="$real_root"
+
+  wait_until 300 "edited member rejoins (3 ONLINE)" group_is_fully_online "$other" \
+    || { REPL_PW="$real_repl"; bad "edited member never rejoined the group — the recovery credential did not follow the pin"; docker logs "$member" 2>&1 | tail -30; return; }
+  ok "edited member rejoined ONLINE without anyone reverting the variable"
+  node_logged "$member" "the recovery credential follows the pinned active password" \
+    && ok "wrapper logged that the recovery credential followed the pin" \
+    || bad "no log line explaining the coupled drift"
+  docker exec "$member" mysql -ugr_recovery -p"$real_root" -e "SELECT 1" >/dev/null 2>&1 \
+    && ok "edited member's gr_recovery still authenticates the password the group enforces" \
+    || bad "edited member rewrote gr_recovery to the edited value"
+  if docker exec "$member" mysql -ugr_recovery -p"rotated-by-variable-edit" -e "SELECT 1" >/dev/null 2>&1; then
+    bad "the edited (never-live) password authenticates gr_recovery on the rejoined member"
+  else
+    ok "the edited value never became a credential"
+  fi
+
+  sql "$primary" "INSERT INTO t.kv VALUES (21,'after-edit') ON DUPLICATE KEY UPDATE v='after-edit';"
+  wait_until 60 "write replicated to the rejoined member" \
+    bash -c '[ "$(docker exec '"$member"' mysql -uroot -p'"$real_root"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=21" 2>/dev/null)" = "after-edit" ]' \
+    && ok "rejoined member replicates writes" \
+    || bad "rejoined member is not receiving writes"
+  [ "$(sql "$other" "SELECT COUNT(*) FROM mysql.user WHERE User='gr_recovery' AND Host='%'")" = "1" ] \
+    && ok "untouched members are exactly as they were" \
+    || bad "an untouched member's recovery account changed"
+  REPL_PW="$real_repl"
+}
+
 t_sigterm_primary_demotes_before_exit() {
   log "t_sigterm_primary_demotes_before_exit (planned shutdown = switchover, not timeout failover)"
   teardown_trio
@@ -5030,6 +5088,7 @@ ALL_TESTS=(
   t_total_outage_after_failover
   t_first_seed_permanent_loss
   t_password_variable_edit_does_not_rotate
+  t_coupled_password_edit_keeps_the_member_in_the_group
   t_haproxy_stats_page_authenticates_remote_clients
   t_revert_to_standalone_drops_recovery_user
   t_sigterm_primary_demotes_before_exit

@@ -98,6 +98,16 @@ redeploy — each node gates its own route the moment
 it boots with the variable, and nodes never call each other's `/switchover`,
 so a cluster may adopt it one node at a time.
 
+### Editing `MYSQL_ROOT_PASSWORD` on a running cluster
+
+The live root password is pinned on each member's volume (`password_pin`), so
+editing the variable does not rotate it; the wrapper logs the drift and keeps
+the cluster on the active password. `GR_REPLICATION_PASSWORD` is stamped as a
+reference to `MYSQL_ROOT_PASSWORD`, so the recovery credential follows that same
+pin: a member redeployed after the edit rejoins the group on the password the
+group enforces, and its `gr_recovery` account is left on it. A distinct
+`GR_REPLICATION_PASSWORD` literal is used as written.
+
 ## The HAProxy stats page
 
 Each edge serves HAProxy's stats page on `8404/stats`. From inside the edge
