@@ -663,21 +663,19 @@ impl Sql {
         .await
     }
 
-    /// Whether the server is accepting TCP connections right now.
+    /// The address the server is listening on, as it reports it.
     ///
-    /// `skip_networking` is the server's own account of it, which is exactly
-    /// what a caller that passed `--skip-networking` on argv wants to
-    /// confirm: the flag was understood and not overridden by a my.cnf.
-    pub async fn skip_networking_enabled(&self) -> Result<bool> {
+    /// Read rather than assumed by the restore path, which passes
+    /// `--bind-address=127.0.0.1` and needs to know the flag was understood
+    /// and not overridden by a my.cnf. Deliberately NOT `skip_networking`:
+    /// that variable is this wrapper's marker for docker-entrypoint's
+    /// init-phase temp server (see `is_init_temp_server`), so a real server
+    /// must never carry it.
+    pub async fn bind_address(&self) -> Result<Option<String>> {
         self.short(async {
             let mut conn = self.conn().await?;
-            let value: Option<String> = conn.query_first("SELECT @@GLOBAL.skip_networking").await?;
-            // MySQL renders the boolean as 1/0; accept ON/OFF too so a future
-            // rendering change cannot silently turn this check into a pass.
-            Ok(matches!(
-                value.as_deref(),
-                Some("1") | Some("ON") | Some("on")
-            ))
+            let value: Option<String> = conn.query_first("SELECT @@GLOBAL.bind_address").await?;
+            Ok(value)
         })
         .await
     }

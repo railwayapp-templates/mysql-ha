@@ -2005,9 +2005,15 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
   # "starting point-in-time restore" at 02:10:34 — three minutes of an empty
   # database answering queries before the restore even began.
   #
-  # The fix is `--skip-networking` on the restore-phase spawn argv, which
-  # cannot lose the race and cannot fail open. This proves it: the port must
-  # REFUSE while the restore runs, and must serve the restored data after.
+  # The fix is `--bind-address=127.0.0.1` on the restore-phase spawn argv.
+  # NOT `--skip-networking`: that variable is the wrapper's identity marker
+  # for docker-entrypoint's init-phase temp server (`is_init_temp_server`),
+  # and a real server carrying it is indistinguishable from the temp instance
+  # forever — the restore then deadlocks in `wait_for_ready_or_exit`. Binding
+  # to loopback leaves the marker alone and still leaves nothing to dial.
+  #
+  # This proves both halves: the port must REFUSE while the restore runs, and
+  # must serve the restored data after.
   docker rm -f mysql-pitr-window-src mysql-pitr-window-restore mysql-ha-e2e-minio >/dev/null 2>&1
   docker volume rm mysql-ha-e2e-vol-mysql-pitr-window-src mysql-ha-e2e-vol-mysql-pitr-window-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
 

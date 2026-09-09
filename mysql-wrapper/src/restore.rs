@@ -312,26 +312,38 @@ pub async fn run(config: &Config) -> Result<()> {
     // empty datadir and runs its normal first-boot init — plus, for a
     // shared history, the GTID flags the replay depends on.
     //
-    // `--skip-networking` is not an optimisation: it is what makes the
+    // `--bind-address=127.0.0.1` is not an optimisation: it is what makes the
     // restore phase unobservable. Everything this phase talks to mysqld with
     // goes over the unix socket — the control connection below, the `mysql`
     // client that loads the dump, and the one that replays the binlogs — so
-    // the restore never needs a listening port, while a port that IS open
+    // the restore never needs a reachable port, while a port that IS reachable
     // serves a freshly-initialised, EMPTY database to anyone who dials it.
     // On a PITR fork that window is reachable: the platform marks the
     // deployment healthy as soon as the container is up, and a client
     // connecting then gets an empty database that looks like a completed
     // restore.
     //
-    // This used to be a `SET GLOBAL skip_networking = ON` issued after the
-    // server was already accepting connections. That never worked:
-    // `skip_networking` is READ-ONLY at runtime on the 8.4 series this image
-    // bundles, so the statement errored on every restore, the caller only
-    // warned, and the port stayed open from the moment the restore-phase
-    // server came up until it was shut down. An argv flag cannot lose that
-    // race and cannot fail open.
+    // Two earlier attempts at this are worth not repeating.
+    //
+    // It began as `SET GLOBAL skip_networking = ON`, issued after the server
+    // was already accepting connections. That never worked: `skip_networking`
+    // is READ-ONLY at runtime on the 8.4 series this image bundles, so the
+    // statement errored on every restore, the caller only warned, and the port
+    // stayed open for the whole restore.
+    //
+    // Passing `--skip-networking` on argv instead does close the port — and
+    // deadlocks the restore. `skip_networking` is this wrapper's IDENTITY
+    // MARKER for docker-entrypoint's init-phase temp server: `is_init_temp_server`
+    // reads exactly that variable, and restore, archiver, gr and self_heal all
+    // wait for it to turn false before touching the server. A restore-phase
+    // server carrying the flag is indistinguishable from the temp instance
+    // forever, so `wait_for_ready_or_exit` never returns.
+    //
+    // Binding to loopback keeps that marker untouched and still leaves nothing
+    // for an outside client to reach: the platform dials the container's
+    // address, not its loopback.
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    args.push("--skip-networking".to_string());
+    args.push("--bind-address=127.0.0.1".to_string());
     if shared_history {
         let gtid_args = shared_history_restore_args(&full);
         info!(
@@ -352,11 +364,11 @@ pub async fn run(config: &Config) -> Result<()> {
     info!("restore-phase mysqld is ready");
 
     // Belt and braces behind the argv flag above: an older docker-entrypoint
-    // that drops unknown server options, or a my.cnf that re-enables
-    // networking, would otherwise leave the port open silently. Verified, not
-    // assumed — if the server is still listening at this point the restore
+    // that drops unknown server options, or a my.cnf that binds a wider
+    // address, would otherwise leave the port reachable silently. Verified,
+    // not assumed — if the server is reachable at this point the restore
     // refuses rather than serving an empty database to whoever dials it.
-    ensure_not_listening(&sql).await?;
+    ensure_bound_to_loopback(&sql).await?;
 
     load_full_backup(&s3, &full, config)
         .await
@@ -392,7 +404,8 @@ pub async fn run(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Refuse to continue a restore on a server that is still listening.
+/// Refuse to continue a restore on a server anything outside the container
+/// could reach.
 ///
 /// The restore phase loads a full backup into a database that, until replay
 /// finishes, holds only part of the customer's data — and starts out holding
@@ -400,24 +413,26 @@ pub async fn run(config: &Config) -> Result<()> {
 /// must never produce, because it is indistinguishable from a completed
 /// restore of an empty database.
 ///
-/// `--skip-networking` on the spawn argv is what prevents it; this verifies
-/// the server agrees. Failing the restore here is safe and recoverable: the
-/// in-progress marker is already on the volume, so the next boot wipes the
-/// partial datadir and retries (see `crashed_mid_restore`).
-async fn ensure_not_listening(sql: &Sql) -> Result<()> {
-    match sql.skip_networking_enabled().await {
-        Ok(true) => Ok(()),
-        Ok(false) => {
+/// `--bind-address=127.0.0.1` on the spawn argv is what prevents it; this
+/// verifies the server agrees. Failing the restore here is safe and
+/// recoverable: the in-progress marker is already on the volume, so the next
+/// boot wipes the partial datadir and retries (see `crashed_mid_restore`).
+async fn ensure_bound_to_loopback(sql: &Sql) -> Result<()> {
+    match sql.bind_address().await {
+        Ok(Some(addr)) if is_loopback_bind(&addr) => Ok(()),
+        Ok(addr) => {
             error!(
-                "the restore-phase mysqld is accepting network connections; refusing to \
-                 continue, because a client reaching it before replay finishes would be \
+                bind_address = ?addr,
+                "the restore-phase mysqld is reachable from outside the container; refusing \
+                 to continue, because a client reaching it before replay finishes would be \
                  served a database missing some or all of its data and could not tell that \
                  apart from a completed restore"
             );
             anyhow::bail!(
-                "restore-phase mysqld is still listening on the network \
-                 (--skip-networking did not take effect); refusing to load a partial \
-                 database that clients could read"
+                "restore-phase mysqld is bound to {:?}, not loopback \
+                 (--bind-address did not take effect); refusing to load a partial \
+                 database that clients could read",
+                addr
             )
         }
         Err(e) => {
@@ -426,12 +441,30 @@ async fn ensure_not_listening(sql: &Sql) -> Result<()> {
             // healthy restore, so it degrades to a warning.
             warn!(
                 error = %e,
-                "could not confirm the restore-phase mysqld is not listening; continuing on \
-                 the strength of the --skip-networking spawn flag"
+                "could not confirm the restore-phase mysqld's bind address; continuing on \
+                 the strength of the --bind-address spawn flag"
             );
             Ok(())
         }
     }
+}
+
+/// Whether a `bind_address` value keeps the server inside the container.
+///
+/// MySQL renders the variable back as it was given, so the comparison is on
+/// the literal forms the flag can take rather than a parsed address — and a
+/// value listing several addresses (8.0.13+ accepts a comma-separated list)
+/// only counts when EVERY one of them is loopback.
+pub(crate) fn is_loopback_bind(value: &str) -> bool {
+    let entries: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    !entries.is_empty()
+        && entries
+            .iter()
+            .all(|e| matches!(*e, "127.0.0.1" | "::1" | "localhost"))
 }
 
 /// Poll until the datadir takes its first write (docker-entrypoint's
@@ -1132,6 +1165,27 @@ fn verify_achieved_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_all_loopback_bind_keeps_the_restore_unreachable() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(is_loopback_bind(" 127.0.0.1 , ::1 "));
+
+        // The dangerous values, which are also the DEFAULTS a my.cnf or an
+        // older entrypoint would leave in place: a wildcard bind is exactly
+        // the state this check exists to catch.
+        assert!(!is_loopback_bind("*"));
+        assert!(!is_loopback_bind("::"));
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind(""));
+
+        // One reachable address in a list is enough to serve a half-loaded
+        // database to someone.
+        assert!(!is_loopback_bind("127.0.0.1,0.0.0.0"));
+        assert!(!is_loopback_bind("::1, 10.0.0.5"));
+    }
 
     fn temp_dir(tag: &str) -> String {
         let dir = std::env::temp_dir().join(format!(
