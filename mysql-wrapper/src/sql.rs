@@ -663,22 +663,21 @@ impl Sql {
         .await
     }
 
-    /// Attempt to toggle the TCP listener at runtime — the restore path's
-    /// defense-in-depth attempt to keep the restore-phase server off the
-    /// network while it loads the dump and replays binlogs. Verified
-    /// read-only at runtime on the bundled 8.4 series, so this routinely
-    /// errors; the caller logs and continues rather than treating it as
-    /// fatal (see restore.rs for why nothing external can reach this boot
-    /// anyway).
-    pub async fn set_global_skip_networking(&self, on: bool) -> Result<()> {
+    /// Whether the server is accepting TCP connections right now.
+    ///
+    /// `skip_networking` is the server's own account of it, which is exactly
+    /// what a caller that passed `--skip-networking` on argv wants to
+    /// confirm: the flag was understood and not overridden by a my.cnf.
+    pub async fn skip_networking_enabled(&self) -> Result<bool> {
         self.short(async {
             let mut conn = self.conn().await?;
-            conn.query_drop(format!(
-                "SET GLOBAL skip_networking = {}",
-                if on { "ON" } else { "OFF" }
+            let value: Option<String> = conn.query_first("SELECT @@GLOBAL.skip_networking").await?;
+            // MySQL renders the boolean as 1/0; accept ON/OFF too so a future
+            // rendering change cannot silently turn this check into a pass.
+            Ok(matches!(
+                value.as_deref(),
+                Some("1") | Some("ON") | Some("on")
             ))
-            .await?;
-            Ok(())
         })
         .await
     }

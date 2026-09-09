@@ -1983,6 +1983,132 @@ t_pitr_archive_and_restore_to_point_in_time() {
 # same reason on the other axis: S3 stamps LastModified on write, so every
 # forged object looks brand new and production's hour-long age floor would
 # spare all of them.
+t_pitr_restore_never_serves_the_half_loaded_database() {
+  log "t_pitr_restore_never_serves_the_half_loaded_database (the restore-phase server must refuse TCP until replay is done)"
+  # Regression for a silent, customer-visible data-loss LOOK-ALIKE.
+  #
+  # The restore phase boots a mysqld so docker-entrypoint can initialise the
+  # datadir, then loads the dump and replays binlogs into it over the unix
+  # socket. Until that finishes the database holds NONE of the customer's
+  # data — it is a fresh, empty `railway` schema. If that server is reachable
+  # on 3306, a client that connects during the restore is served an empty
+  # database and cannot tell it apart from a completed restore of an empty
+  # source.
+  #
+  # It was reachable, on every restore. The wrapper tried to close the port
+  # with `SET GLOBAL skip_networking = ON` AFTER the server was already
+  # accepting connections, but that variable is READ-ONLY at runtime on the
+  # 8.4 series this image bundles: the statement errored every time, the
+  # caller only warned, and the port stayed open for the whole restore.
+  # Measured in production 2026-09-09: the fork logged
+  # "ready for connections ... Bind-address: '::'" at 02:07:39 and
+  # "starting point-in-time restore" at 02:10:34 — three minutes of an empty
+  # database answering queries before the restore even began.
+  #
+  # The fix is `--skip-networking` on the restore-phase spawn argv, which
+  # cannot lose the race and cannot fail open. This proves it: the port must
+  # REFUSE while the restore runs, and must serve the restored data after.
+  docker rm -f mysql-pitr-window-src mysql-pitr-window-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-window-src mysql-ha-e2e-vol-mysql-pitr-window-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-window"
+  )
+  start_standalone mysql-pitr-window-src "${archive_env[@]}"
+
+  wait_until 120 "PITR source node healthy" \
+    bash -c 'docker exec mysql-pitr-window-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "PITR source node never became healthy"; return; }
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-window-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; return; }
+
+  sql mysql-pitr-window-src "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'restored-row');"
+  sleep 2
+  local t1
+  t1="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  sleep 2
+  sql mysql-pitr-window-src "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog shipped" \
+    bash -c 'docker logs mysql-pitr-window-src 2>&1 | grep -q "binlog uploaded"' \
+    || { bad "binlog was never shipped"; return; }
+  ok "source archived with one row before T1"
+
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-window"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$t1"
+  )
+  start_standalone mysql-pitr-window-restore "${recover_env[@]}"
+
+  # Dial 3306 from ANOTHER container, over the network, exactly as a customer
+  # would through the platform's TCP proxy — never over the restoring node's
+  # own unix socket, which the restore legitimately uses throughout.
+  #
+  # Poll from the moment the container exists until the restore reports
+  # completion. Every probe that CONNECTS before completion is the bug: at
+  # that point the datadir holds an empty database.
+  local served_early=0 probes=0 connected=0
+  local deadline=$(( $(date +%s) + 240 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs mysql-pitr-window-restore 2>&1 | grep -q "point-in-time restore completed"; then
+      break
+    fi
+    probes=$(( probes + 1 ))
+    if docker run --rm --network "$NET" "$IMAGE" \
+        mysql -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
+        --connect-timeout=3 --batch --skip-column-names \
+        -e "SELECT 1" >/dev/null 2>&1; then
+      connected=$(( connected + 1 ))
+      served_early=1
+      # Capture WHAT it served, so the failure names the shape of the bug
+      # rather than just its existence.
+      local rows
+      rows="$(docker run --rm --network "$NET" "$IMAGE" \
+        mysql -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
+        --connect-timeout=3 --batch --skip-column-names \
+        -e "SELECT COUNT(*) FROM t.kv" 2>&1 | tail -1)"
+      log "  mid-restore connection SUCCEEDED; t.kv reported: $rows"
+      break
+    fi
+    sleep 2
+  done
+
+  if [ "$served_early" -eq 1 ]; then
+    bad "the restore-phase mysqld accepted a TCP connection before the restore completed ($connected of $probes probes) — a client dialing a restoring fork is served a database that is empty or partially loaded, and cannot tell that apart from a finished restore"
+    docker logs mysql-pitr-window-restore 2>&1 | tail -40
+    return
+  fi
+  ok "port stayed closed for all $probes probes while the restore ran"
+
+  wait_until 240 "restore completed and serving" \
+    bash -c 'docker exec mysql-pitr-window-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "restored node never became healthy"; docker logs mysql-pitr-window-restore 2>&1 | tail -60; return; }
+
+  # And the other half of the contract: once the restore IS done, the port
+  # opens and serves the restored data. A fix that simply never opened the
+  # port would pass the check above and break the product.
+  local v
+  v="$(docker run --rm --network "$NET" "$IMAGE" \
+    mysql -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
+    --connect-timeout=10 --batch --skip-column-names \
+    -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null)"
+  [ "$v" = "restored-row" ] \
+    && ok "after completion the port serves the RESTORED data (t.kv k=1 = $v)" \
+    || bad "after completion the restored node did not serve the restored row over TCP (got: '$v')"
+}
+
 t_pitr_retention_expires_the_archive_without_breaking_restore() {
   log "t_pitr_retention_expires_the_archive_without_breaking_restore"
   docker rm -f mysql-pitr-retain mysql-pitr-retain-restore mysql-ha-e2e-minio >/dev/null 2>&1
@@ -2994,7 +3120,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_never_serves_the_half_loaded_database t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
 
 main() {
   ensure_image
