@@ -145,14 +145,16 @@ start_edge() {
 }
 
 # edge_http_code <url> [wget args...] — the HTTP status a throwaway client on
-# the e2e network gets for a URL (busybox wget prints the status line with
-# -S), or 000 when nothing answered. Extra args are spliced into the wget
-# command line as written, so quote a header value inside them.
+# the e2e network gets for a URL, or 000 when nothing answered. busybox wget
+# prints the status line with -S and repeats it in its "server returned
+# error" line on a non-2xx answer; either form carries the code. Extra args
+# are spliced into the wget command line as written, so quote a header value
+# inside them.
 edge_http_code() {
   local url="$1"; shift
   local code
   code="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$HAPROXY_IMAGE" -c \
-    "wget -S -T 5 -O /dev/null $* '$url' 2>&1 | sed -nE 's#^ *HTTP/[0-9.]+ ([0-9]{3}).*#\1#p' | tail -1")"
+    "wget -S -T 5 -O /dev/null $* '$url' 2>&1 | sed -nE 's#.*HTTP/[0-9.]+ ([0-9]{3}).*#\1#p' | tail -1")"
   echo "${code:-000}"
 }
 
