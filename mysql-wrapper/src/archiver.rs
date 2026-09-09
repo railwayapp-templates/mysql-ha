@@ -561,6 +561,9 @@ async fn take_full_backup(
 
     let data_flag = probe_dump_data_flag(sql).await;
     info!(data_flag, %dump_key, "starting full backup");
+    // Measured before the dump so it describes the data the dump captures,
+    // not the binlogs the dump itself generates while running.
+    let datadir_bytes = dir_size_bytes(&config.data_dir).await;
 
     // mysqldump is a separate process and cannot ride the pool's
     // resolved credential: a drifted MYSQL_ROOT_PASSWORD edit would keep
@@ -618,7 +621,7 @@ async fn take_full_backup(
     let tee_task = tokio::spawn(tee_and_scan(dump_stdout, gzip_stdin, COORD_SCAN_CAP));
     let upload_result = s3.upload_multipart(&dump_key, gzip_stdout).await;
 
-    let scanned = tee_task
+    let (scanned, dump_bytes) = tee_task
         .await
         .context("tee/scan task panicked")?
         .context("copying mysqldump output into gzip")?;
@@ -653,11 +656,18 @@ async fn take_full_backup(
         server_uuid: server_uuid.to_string(),
         mysql_version,
         gtid_purged,
+        dump_bytes: Some(dump_bytes),
+        datadir_bytes,
     };
     let meta_json = serde_json::to_vec_pretty(&meta).context("serializing full-backup meta")?;
     s3.put_object_bytes(&meta_key, meta_json)
         .await
         .context("uploading full-backup meta.json")?;
+    info!(
+        dump_bytes,
+        datadir_bytes = ?datadir_bytes,
+        "full backup sizes recorded in the meta (the platform's restore disk estimate reads them)"
+    );
 
     Ok(taken_at)
 }
@@ -689,9 +699,10 @@ async fn tee_and_scan(
     mut src: impl AsyncRead + Unpin,
     mut dst: impl AsyncWrite + Unpin,
     scan_cap: usize,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, u64)> {
     let mut scanned = Vec::with_capacity(scan_cap.min(64 * 1024));
     let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
     loop {
         let n = src
             .read(&mut buf)
@@ -700,6 +711,7 @@ async fn tee_and_scan(
         if n == 0 {
             break;
         }
+        total += n as u64;
         dst.write_all(&buf[..n])
             .await
             .context("writing into gzip's stdin")?;
@@ -709,7 +721,33 @@ async fn tee_and_scan(
         }
     }
     dst.shutdown().await.context("closing gzip's stdin")?;
-    Ok(scanned)
+    Ok((scanned, total))
+}
+
+/// Bytes under `dir`, recursively, as they are at this instant. `None` when
+/// the walk fails part-way: a wrong figure in the meta would be worse than
+/// none, since the platform sizes a restore's volume by it.
+async fn dir_size_bytes(dir: &str) -> Option<u64> {
+    let root = std::path::PathBuf::from(dir);
+    tokio::task::spawn_blocking(move || {
+        fn walk(path: &Path) -> std::io::Result<u64> {
+            let mut total = 0u64;
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                if meta.is_dir() {
+                    total += walk(&entry.path())?;
+                } else if meta.is_file() {
+                    total += meta.len();
+                }
+            }
+            Ok(total)
+        }
+        walk(&root).ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 // --- binlog shipping ---------------------------------------------------------
