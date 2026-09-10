@@ -532,6 +532,18 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
         target = %pitr::format_rfc3339_millis(target),
         "binlog replay complete"
     );
+    // The dump carried the source's accounts as of the target — root's
+    // password included. This service's wrapper, health server and connection
+    // URL hold MYSQL_ROOT_PASSWORD for THIS service; once the serving mysqld
+    // reloads the grant tables, the source's password as it was at the target
+    // would be the one enforced, and a password rotated after the target, or
+    // minted for the fork, would lock the wrapper out of its own server for
+    // good (/health 503, every candidate denied). Reconcile root to the
+    // environment while the restore-phase server is still ours.
+    sql.set_root_password_everywhere(&config.mysql_root_password)
+        .await
+        .context("reconciling root's password to MYSQL_ROOT_PASSWORD after the restore")?;
+    info!("root's password reconciled to MYSQL_ROOT_PASSWORD on every restored root account");
 
     let _ = sql.shutdown_server().await;
     match child.wait().await {

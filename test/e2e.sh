@@ -2167,8 +2167,34 @@ t_pitr_archive_and_restore_to_point_in_time() {
     && ok "self-healed restore serves the pre-T1 row" \
     || bad "self-healed restore missing the pre-T1 row (got: '$v3')"
 
-  docker rm -f mysql-pitr-src mysql-pitr-restore mysql-pitr-crash mysql-ha-e2e-minio >/dev/null 2>&1
-  docker volume rm mysql-ha-e2e-vol-mysql-pitr-src mysql-ha-e2e-vol-mysql-pitr-restore mysql-ha-e2e-vol-mysql-pitr-crash mysql-ha-e2e-minio-data >/dev/null 2>&1
+  # The fork's root password is ITS OWN. The dump carried the source's
+  # mysql.user as of T1, root included; a fork deployed with a different
+  # MYSQL_ROOT_PASSWORD — rotated after T1, or minted for the fork — must
+  # authenticate with that one, not the source's, or the wrapper is locked
+  # out of its own server the moment the grant tables go live.
+  local fork_pw="rotated-root-$RANDOM$RANDOM"
+  docker rm -f mysql-pitr-rotated >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-rotated >/dev/null 2>&1
+  ROOT_PW="$fork_pw" start_standalone mysql-pitr-rotated "${recover_env[@]}"
+  wait_until 180 "restore under the fork's own root password completed and serving" \
+    bash -c 'docker exec mysql-pitr-rotated wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a fork with its own root password never became healthy — the wrapper cannot authenticate against the restored grant tables"; docker logs mysql-pitr-rotated 2>&1 | tail -40; return; }
+  docker logs mysql-pitr-rotated 2>&1 | grep -q "root's password reconciled to MYSQL_ROOT_PASSWORD" \
+    && ok "restore reconciled root's password to the fork's MYSQL_ROOT_PASSWORD" \
+    || bad "restore never reported reconciling root's password"
+  local v4
+  v4="$(ROOT_PW="$fork_pw" sql mysql-pitr-rotated "SELECT v FROM t.kv WHERE k=1")"
+  [ "$v4" = "before-t1" ] \
+    && ok "the fork's own MYSQL_ROOT_PASSWORD authenticates and serves the restored row" \
+    || bad "the fork's own root password does not authenticate (got: '$v4')"
+  if sql mysql-pitr-rotated "SELECT 1" >/dev/null 2>&1; then
+    bad "the SOURCE's root password still authenticates on the fork — the dump's mysql.user won over MYSQL_ROOT_PASSWORD"
+  else
+    ok "the source's root password no longer authenticates on the fork"
+  fi
+
+  docker rm -f mysql-pitr-src mysql-pitr-restore mysql-pitr-crash mysql-pitr-rotated mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-src mysql-ha-e2e-vol-mysql-pitr-restore mysql-ha-e2e-vol-mysql-pitr-crash mysql-ha-e2e-vol-mysql-pitr-rotated mysql-ha-e2e-minio-data >/dev/null 2>&1
 }
 
 # Retention: the archive must be expired on its horizon WITHOUT ever becoming
