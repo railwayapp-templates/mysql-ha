@@ -90,6 +90,7 @@ start_node() {
     -e GR_SEEDS="$SEEDS" \
     -e RAILWAY_PRIVATE_DOMAIN="$host" \
     -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+    -e RAILWAY_SERVICE_ID="svc-$host" \
     -e RAILWAY_VOLUME_MOUNT_PATH="/var/lib/mysql" \
     -e BOOTSTRAP_DWELL_SECONDS=5 \
     "$@" \
@@ -127,6 +128,7 @@ start_standalone() {
     -e MYSQL_ROOT_PASSWORD="$ROOT_PW" \
     -e RAILWAY_PRIVATE_DOMAIN="$name" \
     -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+    -e RAILWAY_SERVICE_ID="svc-$name" \
     -e RAILWAY_VOLUME_MOUNT_PATH="/var/lib/mysql" \
     "$@" \
     "$IMAGE" >/dev/null
@@ -2053,6 +2055,85 @@ t_no_quorum_no_wipe() {
   teardown_trio
 }
 
+# One archive root, one owner. Two services archiving into the same bucket
+# path interleave two databases' histories in one archive, and a restore picks
+# the newest full across lineages — the other service's data, served as a
+# success. Nothing upstream prevents the configuration (a duplicated service
+# keeps its variables; a forked environment may keep its bucket), so the
+# archiver claims the root on first use (<path>/owner.json: environment,
+# history identity, services) and refuses a root claimed by another
+# environment, or by another standalone service of the same environment
+# whose history this server does not carry. The group scenarios above cover
+# the members' shared root and the converted server; this one pins the two
+# refusals and that the refused server is otherwise fine.
+t_pitr_archive_root_belongs_to_one_service() {
+  log "t_pitr_archive_root_belongs_to_one_service (a forked environment and a duplicated service are refused; the owner archives alone)"
+  local owner=mysql-pitr-own-src fork=mysql-pitr-own-fork-env dup=mysql-pitr-own-dup
+  docker rm -f "$owner" "$fork" "$dup" mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm "mysql-ha-e2e-vol-$owner" "mysql-ha-e2e-vol-$fork" "mysql-ha-e2e-vol-$dup" mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-own"
+  )
+  start_standalone "$owner" "${archive_env[@]}"
+  wait_until 120 "initial full backup on the owner" \
+    bash -c 'docker logs '"$owner"' 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "the owner never took its initial full backup"; docker logs "$owner" 2>&1 | tail -40; return; }
+  mc_exists e2e-pitr-own/owner.json \
+    && ok "the first archiver claimed the root (owner.json present)" \
+    || bad "no owner.json at the root after the first archiver started"
+  node_logged "$owner" "archive root recorded as this service's" \
+    && ok "the owner logged its claim" || bad "the owner never logged a claim"
+
+  # A forked environment that kept the bucket: the same variables, another
+  # environment id.
+  start_standalone "$fork" "${archive_env[@]}" -e RAILWAY_ENVIRONMENT_ID="e2e-env-fork"
+  wait_until 120 "the foreign-environment service refused to archive" \
+    bash -c 'docker logs '"$fork"' 2>&1 | grep -q "PITR archiving refused"' \
+    || { bad "a service from another environment was not refused"; docker logs "$fork" 2>&1 | tail -40; return; }
+  docker logs "$fork" 2>&1 | grep -q "belongs to environment e2e-env" \
+    && ok "the refusal names the owning environment" || bad "the refusal does not name the owning environment"
+  wait_until 60 "the refused service serves mysqld regardless" \
+    bash -c 'docker exec '"$fork"' wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "the refused service never became healthy — a refusal must not take the database down"; return; }
+  [ "$(pitr_field "$owner" "$fork" archiving)" = "false" ] \
+    && ok "/pitr on the refused service reports not archiving" \
+    || bad "/pitr on the refused service reports archiving=$(pitr_field "$owner" "$fork" archiving)"
+  [ -n "$(pitr_field "$owner" "$fork" last_error)" ] \
+    && ok "/pitr on the refused service carries the refusal as last_error" \
+    || bad "/pitr on the refused service has no last_error"
+
+  # A duplicated service in the same environment: fresh data, another
+  # service id (start_standalone derives it from the name).
+  start_standalone "$dup" "${archive_env[@]}"
+  wait_until 120 "the duplicated service refused to archive" \
+    bash -c 'docker logs '"$dup"' 2>&1 | grep -q "PITR archiving refused"' \
+    || { bad "a duplicated service in the same environment was not refused"; docker logs "$dup" 2>&1 | tail -40; return; }
+  docker logs "$dup" 2>&1 | grep -q "belongs to service svc-$owner" \
+    && ok "the refusal names the owning service" || bad "the refusal does not name the owning service"
+
+  # The owner keeps archiving, alone: its lineage is the only one in the root.
+  sql "$owner" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'owner');"
+  local f1
+  f1="$(active_binlog "$owner")"
+  sql "$owner" "FLUSH BINARY LOGS;"
+  wait_uploaded "$owner" "$f1" || { bad "the owner's binlog never shipped after the refusals"; return; }
+  local lineages
+  lineages="$(mc_lineage_count e2e-pitr-own)" || { bad "could not count lineages"; return; }
+  [ "$lineages" = "1" ] \
+    && ok "the root holds exactly the owner's lineage" \
+    || bad "the root holds $lineages lineages — a refused service wrote into it"
+
+  docker rm -f "$owner" "$fork" "$dup" mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm "mysql-ha-e2e-vol-$owner" "mysql-ha-e2e-vol-$fork" "mysql-ha-e2e-vol-$dup" mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
 # PITR: standalone-only in this version, so this scenario never touches the
 # GR trio at all — a fresh pair of standalone (non-GR) nodes plus a minio
 # container standing in for the S3-compatible bucket. Self-contained: no
@@ -3341,6 +3422,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
     -e MYSQL_ROOT_PASSWORD="$ROOT_PW" \
     -e RAILWAY_PRIVATE_DOMAIN="$solo" \
     -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+    -e RAILWAY_SERVICE_ID="svc-mysql-1" \
     -e RAILWAY_VOLUME_MOUNT_PATH="/var/lib/mysql" \
     "${env[@]}" \
     "$IMAGE" >/dev/null
@@ -3409,7 +3491,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
 
 main() {
   ensure_image

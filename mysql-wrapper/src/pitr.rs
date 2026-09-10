@@ -152,6 +152,130 @@ pub fn parse_target_time(s: &str) -> Result<DateTime<Utc>> {
         })
 }
 
+/// `<path>/owner.json` — which service instance(s) an archive root belongs
+/// to. One root, one database history: two services archiving into the same
+/// bucket path interleave two histories in one archive, and a restore picks
+/// the newest full across lineages — the other service's data, served as a
+/// success. Nothing upstream prevents the configuration (a duplicated
+/// service keeps its variables; a forked environment may keep its bucket),
+/// so the archiver claims the root on first use and refuses a root that is
+/// not its own (see `archive_ownership_verdict`).
+pub fn owner_key(loc: &S3Location) -> String {
+    let base = base_prefix(loc);
+    if base.is_empty() {
+        "owner.json".to_string()
+    } else {
+        format!("{base}/owner.json")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveOwner {
+    /// RAILWAY_ENVIRONMENT_ID of the service(s) archiving here.
+    pub environment_id: String,
+    /// The history's GTID identity: the group name — the UUID every group
+    /// transaction carries — which this image derives from the environment
+    /// for a standalone server too, so a server converted to a group, or a
+    /// member reverted to standalone, keeps it.
+    pub history: String,
+    /// Every service that has archived into this root: the one standalone
+    /// server, or each member of a group that has held the primary role.
+    pub service_ids: Vec<String>,
+    pub claimed_at: DateTime<Utc>,
+}
+
+/// The server about to archive, as the ownership rules see it.
+pub struct ArchiveClaimant<'a> {
+    pub environment_id: &'a str,
+    pub service_id: &'a str,
+    pub history: &'a str,
+    /// Archiving as a group's writable primary (any member may hold it).
+    pub group_primary: bool,
+    /// This server's `gtid_executed`: a standalone server that carries the
+    /// root's history is a former member of its group, not a stranger.
+    pub executed_gtid_set: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipVerdict {
+    /// Write this record (a first claim, or a group member recording itself).
+    Write(ArchiveOwner),
+    /// The root is this service's already; nothing to write.
+    Keep,
+    /// Not this service's root; the reason names the owner and the remedy.
+    Refuse(String),
+}
+
+/// The ownership rules for an archive root:
+///   - unclaimed → claimed by this service;
+///   - claimed by another environment → refused, whatever the mode (a forked
+///     environment that kept the bucket, another project on the same path);
+///   - same environment, archiving as a group primary → the group's members
+///     share the root by design; this member is recorded;
+///   - same environment, standalone, recorded → kept;
+///   - same environment, standalone, not recorded → refused unless this
+///     server carries the root's history in its `gtid_executed` (a member
+///     reverted to standalone), in which case it is recorded. A duplicated
+///     service — fresh data, another service id — is the case refused.
+pub fn archive_ownership_verdict(
+    root: &str,
+    existing: Option<&ArchiveOwner>,
+    me: &ArchiveClaimant<'_>,
+    now: DateTime<Utc>,
+) -> OwnershipVerdict {
+    let Some(owner) = existing else {
+        return OwnershipVerdict::Write(ArchiveOwner {
+            environment_id: me.environment_id.to_string(),
+            history: me.history.to_string(),
+            service_ids: vec![me.service_id.to_string()],
+            claimed_at: now,
+        });
+    };
+    let owners = if owner.service_ids.is_empty() {
+        "(unrecorded)".to_string()
+    } else {
+        owner.service_ids.join(", ")
+    };
+    if owner.environment_id != me.environment_id {
+        return OwnershipVerdict::Refuse(format!(
+            "archive root {root:?} belongs to environment {} (service {owners}); this service \
+             runs in environment {} — archiving here would interleave two databases' histories \
+             in one archive, and a restore could serve the wrong one. Point BINLOG_ARCHIVE_PATH \
+             at a path of this service's own, or delete {root}/owner.json if that archive is \
+             abandoned and this service is to take the root over",
+            owner.environment_id, me.environment_id
+        ));
+    }
+    let recorded = owner.service_ids.iter().any(|id| id == me.service_id);
+    let record_me = || {
+        let mut updated = owner.clone();
+        updated.service_ids.push(me.service_id.to_string());
+        OwnershipVerdict::Write(updated)
+    };
+    if recorded {
+        return OwnershipVerdict::Keep;
+    }
+    if me.group_primary {
+        return record_me();
+    }
+    let carries_history = !owner.history.is_empty()
+        && me
+            .executed_gtid_set
+            .split(',')
+            .any(|entry| entry.trim_start().starts_with(&owner.history));
+    if carries_history {
+        return record_me();
+    }
+    OwnershipVerdict::Refuse(format!(
+        "archive root {root:?} belongs to service {owners} in this environment; this standalone \
+         service ({}) carries none of that archive's history — archiving here would interleave \
+         two databases' histories in one archive, and a restore could serve the wrong one. \
+         Point BINLOG_ARCHIVE_PATH at a path of this service's own, or delete {root}/owner.json \
+         if that archive is abandoned and this service is to take the root over",
+        if me.service_id.is_empty() { "unknown service id" } else { me.service_id }
+    ))
+}
+
 /// A full backup's sidecar metadata (`<...>.meta.json`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FullBackupMeta {
@@ -2506,6 +2630,146 @@ mod tests {
         assert!(gtid_set_holes("").is_empty());
         // Unparseable ranges are ignored, not reported as holes.
         assert!(gtid_set_holes("aaaa:1-5:garbage").is_empty());
+    }
+
+    fn owner_now() -> DateTime<Utc> {
+        parse_target_time("2026-09-10T00:00:00.000Z").unwrap()
+    }
+
+    fn owner(env: &str, history: &str, ids: &[&str]) -> ArchiveOwner {
+        ArchiveOwner {
+            environment_id: env.to_string(),
+            history: history.to_string(),
+            service_ids: ids.iter().map(|s| s.to_string()).collect(),
+            claimed_at: owner_now(),
+        }
+    }
+
+    fn claimant<'a>(
+        env: &'a str,
+        service: &'a str,
+        group_primary: bool,
+        executed: &'a str,
+    ) -> ArchiveClaimant<'a> {
+        ArchiveClaimant {
+            environment_id: env,
+            service_id: service,
+            history: "11111111-2222-3333-4444-555555555555",
+            group_primary,
+            executed_gtid_set: executed,
+        }
+    }
+
+    #[test]
+    fn an_unclaimed_root_is_claimed_by_whoever_archives_first() {
+        let me = claimant("env-a", "svc-1", false, "");
+        assert_eq!(
+            archive_ownership_verdict("binlog", None, &me, owner_now()),
+            OwnershipVerdict::Write(owner(
+                "env-a",
+                "11111111-2222-3333-4444-555555555555",
+                &["svc-1"]
+            ))
+        );
+    }
+
+    #[test]
+    fn a_root_claimed_by_another_environment_is_refused_in_every_mode() {
+        let existing = owner("env-a", "11111111-2222-3333-4444-555555555555", &["svc-1"]);
+        for group_primary in [false, true] {
+            let me = claimant("env-fork", "svc-1", group_primary, "");
+            match archive_ownership_verdict("binlog", Some(&existing), &me, owner_now()) {
+                OwnershipVerdict::Refuse(reason) => {
+                    assert!(reason.contains("belongs to environment env-a"), "{reason}");
+                    assert!(reason.contains("binlog/owner.json"), "{reason}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_groups_members_share_the_root_and_each_primary_records_itself() {
+        let existing = owner("env-a", "11111111-2222-3333-4444-555555555555", &["svc-1"]);
+        let me = claimant("env-a", "svc-2", true, "");
+        let OwnershipVerdict::Write(updated) =
+            archive_ownership_verdict("binlog", Some(&existing), &me, owner_now())
+        else {
+            panic!("a same-environment group primary is recorded");
+        };
+        assert_eq!(updated.service_ids, vec!["svc-1", "svc-2"]);
+        let again = claimant("env-a", "svc-2", true, "");
+        assert_eq!(
+            archive_ownership_verdict("binlog", Some(&updated), &again, owner_now()),
+            OwnershipVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn a_recorded_standalone_service_keeps_its_root() {
+        let existing = owner("env-a", "11111111-2222-3333-4444-555555555555", &["svc-1"]);
+        let me = claimant("env-a", "svc-1", false, "");
+        assert_eq!(
+            archive_ownership_verdict("binlog", Some(&existing), &me, owner_now()),
+            OwnershipVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn a_duplicated_standalone_service_in_the_same_environment_is_refused() {
+        let existing = owner("env-a", "11111111-2222-3333-4444-555555555555", &["svc-1"]);
+        // Fresh data (no history), another service id.
+        let me = claimant("env-a", "svc-copy", false, "");
+        match archive_ownership_verdict("binlog", Some(&existing), &me, owner_now()) {
+            OwnershipVerdict::Refuse(reason) => {
+                assert!(reason.contains("belongs to service svc-1"), "{reason}");
+                assert!(reason.contains("svc-copy"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // Its own GTID history under another UUID is not the root's history.
+        let foreign = claimant(
+            "env-a",
+            "svc-copy",
+            false,
+            "99999999-2222-3333-4444-555555555555:1-40",
+        );
+        assert!(matches!(
+            archive_ownership_verdict("binlog", Some(&existing), &foreign, owner_now()),
+            OwnershipVerdict::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn a_member_reverted_to_standalone_carries_the_roots_history_and_is_recorded() {
+        let existing = owner("env-a", "11111111-2222-3333-4444-555555555555", &["svc-1"]);
+        let me = claimant(
+            "env-a",
+            "svc-3",
+            false,
+            "aaaaaaaa-0000-0000-0000-000000000000:1-3,\n11111111-2222-3333-4444-555555555555:1-900",
+        );
+        let OwnershipVerdict::Write(updated) =
+            archive_ownership_verdict("binlog", Some(&existing), &me, owner_now())
+        else {
+            panic!("a reverted member carries the group's UUID and is recorded");
+        };
+        assert_eq!(updated.service_ids, vec!["svc-1", "svc-3"]);
+    }
+
+    #[test]
+    fn owner_key_sits_at_the_archive_root() {
+        let mut loc = S3Location {
+            bucket: "b".to_string(),
+            access_key: "k".to_string(),
+            secret_key: "s".to_string(),
+            region: "r".to_string(),
+            endpoint: "http://minio:9000".to_string(),
+            path: "/binlog".to_string(),
+        };
+        assert_eq!(owner_key(&loc), "binlog/owner.json");
+        loc.path = String::new();
+        assert_eq!(owner_key(&loc), "owner.json");
     }
 
     #[test]
