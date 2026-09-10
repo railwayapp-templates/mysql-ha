@@ -322,6 +322,30 @@ role_code() {
   fi
 }
 
+# role_codes <via> <node>... — the /role answers of several nodes joined with
+# "/", for a message.
+role_codes() {
+  local via="$1"; shift
+  local out="" node
+  for node in "$@"; do out="${out:+$out/}$(role_code "$via" "$node")"; done
+  printf '%s' "$out"
+}
+
+# exactly_one_primary <via> <node>... — wait_until predicate: exactly one of
+# the nodes answers /role 200. The wrapper's role view trails Group
+# Replication's ONLINE by a poll, so right after a re-form every member can
+# still answer 503 for a moment — a one-shot read there is a coin flip
+# (2026-09-10: 503/503/503 the instant the fresh first seed had caught up, in
+# an otherwise green run).
+exactly_one_primary() {
+  local via="$1"; shift
+  local n200=0 node
+  for node in "$@"; do
+    [ "$(role_code "$via" "$node")" = "200" ] && n200=$((n200+1))
+  done
+  [ "$n200" = "1" ]
+}
+
 online_members() {
   sql "$1" "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE='ONLINE'" || echo 0
 }
@@ -1016,13 +1040,9 @@ t_total_outage_after_failover() {
     || { bad "first seed missing the post-failover write after recovery"; return; }
   ok "first seed caught up on the writes it missed"
 
-  local codes
-  codes="$(role_code mysql-2 mysql-1)/$(role_code mysql-2 mysql-2)/$(role_code mysql-2 mysql-3)"
-  local twohundreds
-  twohundreds="$(echo "$codes" | tr '/' '\n' | grep -c 200)"
-  [ "$twohundreds" = "1" ] \
-    && ok "exactly one primary after recovery ($codes)" \
-    || bad "expected exactly one primary after recovery, got $codes"
+  wait_until 60 "exactly one primary answers /role 200" exactly_one_primary mysql-2 mysql-1 mysql-2 mysql-3 \
+    && ok "exactly one primary after recovery ($(role_codes mysql-2 mysql-1 mysql-2 mysql-3))" \
+    || bad "expected exactly one primary after recovery, got $(role_codes mysql-2 mysql-1 mysql-2 mysql-3)"
 }
 
 t_first_seed_permanent_loss() {
@@ -1066,13 +1086,9 @@ t_first_seed_permanent_loss() {
     || { bad "fresh first seed did not recover the surviving data"; return; }
   ok "fresh first seed recovered the dataset"
 
-  local all_codes
-  all_codes="$(role_code mysql-2 mysql-1)/$(role_code mysql-2 mysql-2)/$(role_code mysql-2 mysql-3)"
-  local n200
-  n200="$(echo "$all_codes" | tr '/' '\n' | grep -c 200)"
-  [ "$n200" = "1" ] \
-    && ok "exactly one primary after the loss recovery ($all_codes)" \
-    || bad "expected exactly one primary, got $all_codes"
+  wait_until 60 "exactly one primary answers /role 200" exactly_one_primary mysql-2 mysql-1 mysql-2 mysql-3 \
+    && ok "exactly one primary after the loss recovery ($(role_codes mysql-2 mysql-1 mysql-2 mysql-3))" \
+    || bad "expected exactly one primary, got $(role_codes mysql-2 mysql-1 mysql-2 mysql-3)"
 }
 
 t_password_variable_edit_does_not_rotate() {
@@ -1543,12 +1559,9 @@ t_deleted_peer_unfences_bootstrap() {
     || { bad "survivors never re-formed (deleted-peer wedge)"; teardown_trio; NODE_SUFFIX="$old_suffix"; SEEDS="$old_seeds"; return; }
   ok "survivors re-formed the group without the deleted peer"
 
-  codes="$(role_code "$n1" "$n1")/$(role_code "$n1" "$n2")"
-  local n200
-  n200="$(echo "$codes" | tr '/' '\n' | grep -c 200)"
-  [ "$n200" = "1" ] \
-    && ok "exactly one primary after the waiver recovery ($codes)" \
-    || bad "expected exactly one primary, got $codes"
+  wait_until 60 "exactly one primary answers /role 200" exactly_one_primary "$n1" "$n1" "$n2" \
+    && ok "exactly one primary after the waiver recovery ($(role_codes "$n1" "$n1" "$n2"))" \
+    || bad "expected exactly one primary, got $(role_codes "$n1" "$n1" "$n2")"
 
   [ "$(sql "$n1" "SELECT v FROM t.kv WHERE k=20")" = "survives-scale-down" ] \
     && ok "dataset survived the scale-down outage recovery" \
@@ -1716,13 +1729,9 @@ t_wiped_primary_volume_rejoins_fresh() {
     || { bad "replacement did not recover the dataset"; return; }
   ok "replacement recovered the dataset"
 
-  local codes
-  codes="$(role_code "$probe" mysql-1)/$(role_code "$probe" mysql-2)/$(role_code "$probe" mysql-3)"
-  local n200
-  n200="$(echo "$codes" | tr '/' '\n' | grep -c 200)"
-  [ "$n200" = "1" ] \
-    && ok "exactly one primary after the replacement ($codes)" \
-    || bad "expected exactly one primary, got $codes"
+  wait_until 60 "exactly one primary answers /role 200" exactly_one_primary "$probe" mysql-1 mysql-2 mysql-3 \
+    && ok "exactly one primary after the replacement ($(role_codes "$probe" mysql-1 mysql-2 mysql-3))" \
+    || bad "expected exactly one primary, got $(role_codes "$probe" mysql-1 mysql-2 mysql-3)"
 }
 
 t_split_brain_fork_self_heals() {
