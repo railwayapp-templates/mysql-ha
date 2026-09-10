@@ -3218,7 +3218,7 @@ t_pitr_ha_archives_from_the_primary_and_follows_switchover() {
     && ok "restore recognized the shared history" || bad "restore did not take the shared-history path"
   docker logs "$restore" 2>&1 | grep "replaying the shared history" | grep -q '"lineages":2' \
     && ok "restore replayed both lineages" || bad "restore did not replay 2 lineages"
-  node_logged "$restore" "restored GTID history is contiguous" \
+  node_logged "$restore" "restored GTID history holds every transaction the replayed binlogs vouch for" \
     && ok "GTID completeness check passed" || bad "no GTID completeness verdict logged"
   local v1 v2 v3
   v1="$(sql "$restore" "SELECT v FROM t.kv WHERE k=1")"
