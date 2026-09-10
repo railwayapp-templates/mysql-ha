@@ -2721,6 +2721,18 @@ t_pitr_restore_silently_stops_short_of_target() {
     && ok "verdict line says refused/binlog-gap" \
     || { bad "no refused/binlog-gap verdict line — the platform has nothing to surface"; docker logs mysql-pitr-gap-restore 2>&1 | grep "verdict" | tail -5; }
 
+  # The refusal is deterministic, so retrying it is only a download bill: the
+  # wrapper wipes and retries MAX_RESTORE_ATTEMPTS (3) times, then stops with a
+  # line that names the count and the last verdict, and never downloads again.
+  wait_until 300 "restore gave up after 3 attempts" \
+    bash -c 'docker logs mysql-pitr-gap-restore 2>&1 | grep -q "gave up after 3 attempts"' \
+    || { bad "the refused restore never stopped retrying — every pass re-downloads the archive"; docker logs mysql-pitr-gap-restore 2>&1 | grep -c "point-in-time restore verdict"; return; }
+  local verdicts
+  verdicts="$(docker logs mysql-pitr-gap-restore 2>&1 | grep -c '"message":"point-in-time restore verdict"')"
+  [ "$verdicts" -eq 3 ] \
+    && ok "exactly 3 verdict lines before giving up (one per attempt)" \
+    || bad "expected exactly 3 verdict lines (one per bounded attempt), saw $verdicts"
+
   if docker logs mysql-pitr-gap-restore 2>&1 | grep -q "point-in-time restore completed"; then
     bad "restore claimed completion despite the lineage gap"
   else

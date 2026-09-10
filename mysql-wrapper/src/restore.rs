@@ -143,7 +143,32 @@ pub struct RestoreMarker {
     /// chain — so a later boot can say what happened before it retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// How many restore attempts this volume has seen, counting this one. The
+    /// marker survives `reset_partial_restore` precisely so this survives the
+    /// wipe: it is what bounds the wipe-and-retry loop (see
+    /// `MAX_RESTORE_ATTEMPTS`). Older markers carry none and read as 0.
+    #[serde(default)]
+    pub attempts: u32,
     pub updated_at: String,
+}
+
+/// How many times a volume's restore is attempted before the wrapper stops
+/// retrying. Every deterministic refusal or failure used to become an
+/// unbounded loop paced only by the restart policy — each pass streaming the
+/// dump and downloading the binlog run again — until someone deleted the
+/// fork. Three attempts cover a transient (a bucket blip, a client dropping
+/// mid-load) without turning a refused restore into a standing egress bill;
+/// the workflow that started the restore fails on the FIRST verdict anyway
+/// (mono #38619), so nothing waits on the later ones.
+pub const MAX_RESTORE_ATTEMPTS: u32 = 3;
+
+/// How many attempts the marker on this volume records so far (0 when there
+/// is no readable marker).
+pub fn recorded_attempts(data_dir: &str) -> u32 {
+    match read_marker_file(data_dir) {
+        MarkerFile::Present(m) => m.attempts,
+        _ => 0,
+    }
 }
 
 /// A restore the archive cannot serve, as opposed to one that broke.
@@ -263,12 +288,18 @@ pub fn crashed_mid_restore(data_dir: &str) -> bool {
 /// The one live file is the runtime volume lock, held by THIS boot — it
 /// survives the sweep.
 pub fn reset_partial_restore(data_dir: &str) -> Result<()> {
-    let keep = std::ffi::OsStr::new(crate::volume_lock::RUNTIME_LOCK_FILE);
+    let keep_lock = std::ffi::OsStr::new(crate::volume_lock::RUNTIME_LOCK_FILE);
+    // The marker stays too: it is the attempt counter that bounds this very
+    // retry (MAX_RESTORE_ATTEMPTS), and a retry that forgot how many times it
+    // had already run could never stop. The next attempt overwrites it with
+    // InProgress on its first write, so a kept Refused/Failed marker never
+    // outlives the wipe by more than the moment before that write.
+    let keep_marker = std::ffi::OsStr::new(RESTORE_STATE_FILE);
     for entry in std::fs::read_dir(data_dir)
         .with_context(|| format!("listing {data_dir} to reset a partial restore"))?
     {
         let entry = entry.with_context(|| format!("listing {data_dir}"))?;
-        if entry.file_name() == keep {
+        if entry.file_name() == keep_lock || entry.file_name() == keep_marker {
             continue;
         }
         let path = entry.path();
@@ -294,11 +325,24 @@ fn write_restore_marker(
 ) -> Result<()> {
     use std::io::Write;
 
+    // The attempt count carries over from whatever marker is already there:
+    // an InProgress write at the start of an attempt bumps it; the terminal
+    // write of the same attempt keeps it.
+    let previous = match read_marker_file(data_dir) {
+        MarkerFile::Present(m) => m.attempts,
+        _ => 0,
+    };
+    let attempts = if matches!(status, RestoreStatus::InProgress) {
+        previous + 1
+    } else {
+        previous.max(1)
+    };
     let marker = RestoreMarker {
         status,
         target_time: pitr::format_rfc3339_millis(target),
         achieved_time: achieved.map(pitr::format_rfc3339_millis),
         reason: reason.map(str::to_string),
+        attempts,
         updated_at: pitr::format_rfc3339_millis(Utc::now()),
     };
     let json = serde_json::to_string(&marker).context("serializing the PITR restore marker")?;
@@ -1566,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_partial_restore_wipes_everything_but_the_runtime_lock() {
+    fn reset_partial_restore_wipes_everything_but_the_runtime_lock_and_the_marker() {
         let dir = temp_dir("reset");
         write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
         std::fs::create_dir_all(Path::new(&dir).join("mysql")).unwrap();
@@ -1577,7 +1621,11 @@ mod tests {
 
         reset_partial_restore(&dir).unwrap();
 
-        assert!(!crashed_mid_restore(&dir), "marker must be gone");
+        // The marker survives the wipe: it is the attempt counter that bounds
+        // the retry (MAX_RESTORE_ATTEMPTS). The datadir itself is gone — the
+        // `mysql` schema directory is what datadir_is_initialized() reads.
+        assert!(crashed_mid_restore(&dir), "the marker must survive the wipe");
+        assert_eq!(recorded_attempts(&dir), 1);
         assert!(
             !Path::new(&dir).join("mysql").exists(),
             "partial datadir must be gone"
@@ -1588,6 +1636,35 @@ mod tests {
             "held-by-this-boot",
             "the held runtime lock must survive the sweep"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn attempts_count_each_start_and_survive_the_terminal_write() {
+        let dir = temp_dir("attempts");
+        assert_eq!(recorded_attempts(&dir), 0, "no marker, no attempts");
+        // Attempt 1: starts, then is refused.
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        assert_eq!(recorded_attempts(&dir), 1);
+        write_restore_marker(&dir, RestoreStatus::Refused, t(), None, Some("binlog lineage gap"))
+            .unwrap();
+        assert_eq!(recorded_attempts(&dir), 1, "a terminal write keeps the count");
+        // The wipe between attempts keeps the marker, so attempt 2 counts on.
+        reset_partial_restore(&dir).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        assert_eq!(recorded_attempts(&dir), 2);
+        write_restore_marker(&dir, RestoreStatus::Failed, t(), None, Some("gunzip exited with 1"))
+            .unwrap();
+        reset_partial_restore(&dir).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        assert_eq!(recorded_attempts(&dir), MAX_RESTORE_ATTEMPTS);
+        // A marker written before the field existed reads as 0 attempts.
+        std::fs::write(
+            restore_marker_path(&dir),
+            r#"{"status":"refused","target_time":"2026-08-13T14:00:00.000Z","updated_at":"2026-08-13T14:05:00.000Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(recorded_attempts(&dir), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
