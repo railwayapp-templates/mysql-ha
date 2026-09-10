@@ -327,6 +327,40 @@ impl Sql {
         Ok(())
     }
 
+    /// Make MYSQL_ROOT_PASSWORD the password of every `root@<host>` account
+    /// the grant tables carry. Called on the restore-phase server after a
+    /// point-in-time restore: the dump brought the SOURCE's `mysql.user` as
+    /// of the target time, root included, and those rows go live the moment
+    /// privileges are reloaded — while the wrapper, the health server and
+    /// the platform's connection URL all hold this service's own variable.
+    /// Loads the dumped grants first (our connection is already
+    /// authenticated, so it survives the reload), then rewrites root on each
+    /// host the tables name. Unlogged: the restore-phase server runs without
+    /// a binlog, and an account rewrite is never one of the archive's
+    /// transactions.
+    pub async fn set_root_password_everywhere(&self, password: &str) -> Result<()> {
+        let pass_lit = sql_string_literal(password);
+        let mut conn = self.conn().await?;
+        conn.query_drop("SET SESSION sql_log_bin = 0").await?;
+        conn.query_drop("FLUSH PRIVILEGES").await?;
+        let hosts: Vec<String> = conn
+            .query("SELECT host FROM mysql.user WHERE user = 'root'")
+            .await?;
+        // A dump with no root account at all is not one this image can serve
+        // from (its own wrapper connects as root); failing here names that
+        // instead of booting a server nothing can authenticate against.
+        anyhow::ensure!(
+            !hosts.is_empty(),
+            "the restored grant tables carry no root account to reconcile"
+        );
+        for host in &hosts {
+            let host_lit = sql_string_literal(host);
+            conn.query_drop(format!("ALTER USER 'root'@{host_lit} IDENTIFIED BY {pass_lit}"))
+                .await?;
+        }
+        conn.query_drop("SET SESSION sql_log_bin = 1").await?;
+        Ok(())
+    }
     /// Point the distributed-recovery channel at the shared credentials.
     /// Local metadata only — allowed under super_read_only, needed on every
     /// node before it can join or be rejoined.
