@@ -297,6 +297,34 @@ prefix_is_empty() {
   [ "$n" = "0" ]
 }
 
+# mc_find_keys <prefix> — print every object key under a prefix, relative to
+# the bucket (what the platform's own listing sees). Same fail-loud contract
+# as mc_count: a listing that could not be performed returns non-zero and
+# prints nothing, so a caller never reads "I could not look" as "nothing is
+# there".
+mc_find_keys() {
+  local out rc
+  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc find e2e/$PITR_BUCKET/$1" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$out" | grep "^e2e/" | sed "s#^e2e/$PITR_BUCKET/##"
+    return 0
+  fi
+  case "$out" in
+    *"does not exist"*) return 0 ;;
+  esac
+  log "mc listing FAILED for prefix '$1' (rc=$rc): $out"
+  return 1
+}
+
+# mc_cat_key <exact-key> — print an object's content; non-zero when it could
+# not be read.
+mc_cat_key() {
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc cat e2e/$PITR_BUCKET/$1" 2>/dev/null
+}
+
 # mc_put_key <key> <content> — write an object straight into the archive
 # bucket. Used by the retention scenario to forge archive objects with old
 # timestamps, which is the only way to exercise a horizon measured in days
@@ -2296,6 +2324,95 @@ t_pitr_archive_and_restore_to_point_in_time() {
 # same reason on the other axis: S3 stamps LastModified on write, so every
 # forged object looks brand new and production's hour-long age floor would
 # spare all of them.
+# The platform offers the oldest restorable point straight off the oldest
+# full's object NAME (`full/<RFC3339>.sql.gz`, millisecond precision) and pins
+# the fork's target there when the earliest point is asked for. Every meta
+# the archiver wrote before it floored `taken_at` carries the same instant at
+# nanosecond precision — microseconds AFTER the name — and restore's strict
+# `taken_at <= target` found no full "at or before" a target that IS the
+# full: the fork crash-looped on `no full backup found at or before target
+# time` (production, 2026-09-10). The scenario forges that pre-fix meta on a
+# real archive and restores to the instant the name carries.
+t_pitr_restore_reaches_the_fulls_named_instant() {
+  log "t_pitr_restore_reaches_the_fulls_named_instant"
+  docker rm -f mysql-pitr-named-src mysql-pitr-named-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-named-src mysql-ha-e2e-vol-mysql-pitr-named-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-named"
+  )
+  start_standalone mysql-pitr-named-src "${archive_env[@]}"
+  wait_until 120 "PITR source node healthy" \
+    bash -c 'docker exec mysql-pitr-named-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "PITR source node never became healthy"; return; }
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-named-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-named-src 2>&1 | tail -40; return; }
+
+  # What the platform reads: the full's name, and the instant it carries.
+  local dump_key named_at meta_key
+  dump_key="$(mc_find_keys e2e-pitr-named/ | grep '/full/.*\.sql\.gz$' | head -1)"
+  [ -n "$dump_key" ] || { bad "no full-backup dump object under the archive root"; return; }
+  named_at="${dump_key##*/}"; named_at="${named_at%.sql.gz}"
+  meta_key="${dump_key%.sql.gz}.meta.json"
+  log "the full's name carries $named_at"
+
+  # The meta every archiver wrote before this fix: the same instant, with its
+  # nanoseconds — 480 µs past the name here.
+  local meta legacy_meta
+  meta="$(mc_cat_key "$meta_key")" || { bad "could not read the full's meta.json"; return; }
+  printf '%s' "$meta" | grep -q "\"taken_at\": *\"$named_at\"" \
+    && ok "the meta records taken_at as exactly the instant the name carries" \
+    || bad "the meta's taken_at differs from the name (meta: $(printf '%s' "$meta" | grep taken_at | tr -d ' '); name: $named_at)"
+  legacy_meta="$(printf '%s' "$meta" \
+    | sed -E 's/("taken_at": *"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})Z"/\1.000Z"/' \
+    | sed -E 's/("taken_at": *"[^"]*\.[0-9]{3})Z"/\1480Z"/')"
+  printf '%s' "$legacy_meta" | grep -q '480Z"' \
+    || { bad "could not forge a sub-millisecond taken_at in the meta (had: $(printf '%s' "$meta" | grep taken_at | tr -d ' '))"; return; }
+  mc_put_key "$meta_key" "$legacy_meta" || { bad "could not write the pre-fix meta back into the archive"; return; }
+  ok "the full's meta now records taken_at with nanoseconds, past its own name (as every pre-fix meta does)"
+
+  # Written after the full: must not be served by a restore to the full's
+  # instant. Rotated and shipped so the fork has a binlog it must stop short of.
+  sql mysql-pitr-named-src "CREATE DATABASE after_full; CREATE TABLE after_full.kv (k INT PRIMARY KEY); INSERT INTO after_full.kv VALUES (1);"
+  sql mysql-pitr-named-src "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog shipped" \
+    bash -c 'docker logs mysql-pitr-named-src 2>&1 | grep -q "binlog uploaded"' \
+    || { bad "binlog was never shipped to the bucket"; docker logs mysql-pitr-named-src 2>&1 | tail -40; return; }
+
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-named"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$named_at"
+  )
+  start_standalone mysql-pitr-named-restore "${recover_env[@]}"
+  wait_until 180 "restore to the full's named instant completed and serving" \
+    bash -c 'docker exec mysql-pitr-named-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a target pinned on the full's own name was not restorable"; docker logs mysql-pitr-named-restore 2>&1 | tail -40; return; }
+  node_logged mysql-pitr-named-restore "selected full backup for restore" \
+    && ok "the full qualified for the instant its name carries" \
+    || bad "the restore never selected the full whose name it was pinned on"
+  docker logs mysql-pitr-named-restore 2>&1 | grep '"message":"point-in-time restore verdict"' | grep -q '"verdict":"completed"' \
+    && ok "verdict line says completed" \
+    || bad "no completed verdict line for a restore to the full's named instant"
+  local n
+  n="$(sql mysql-pitr-named-restore "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='after_full'")"
+  [ "$n" = "0" ] \
+    && ok "nothing written after the full is served: the restore stopped at the instant the name carries" \
+    || bad "the restore served data written after the full (after_full schemata count: '$n')"
+}
+
 t_pitr_restore_replays_a_large_single_statement() {
   log "t_pitr_restore_replays_a_large_single_statement (one 64 MiB INSERT must replay through mysqlbinlog | mysql)"
   # 2026-09-09, prod, 5 GB loaded in 64 MiB statements: the dump-path restore
@@ -3674,7 +3791,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
 
 main() {
   ensure_image

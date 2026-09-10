@@ -35,7 +35,7 @@
 //!     (`archive_shares_history`).
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -141,6 +141,17 @@ pub fn server_uuid_from_key(loc: &S3Location, key: &str) -> Option<String> {
 /// (`2026-08-13T14:00:00.000Z`).
 pub fn format_rfc3339_millis(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// The instant floored to the millisecond — the precision a full backup's
+/// object name carries (`format_rfc3339_millis`), and so the precision at
+/// which the archive advertises what it holds: the platform lists names, not
+/// metas, to offer the oldest restorable point.
+pub fn floor_to_millis(t: DateTime<Utc>) -> DateTime<Utc> {
+    let nanos = t.nanosecond();
+    // `with_nanosecond` refuses only values of two seconds or more; a
+    // floored in-range value (leap-second representation included) never is.
+    t.with_nanosecond(nanos - nanos % 1_000_000).unwrap_or(t)
 }
 
 /// Parse an operator-supplied ISO-8601 UTC timestamp (`MYSQL_RECOVERY_TARGET_TIME`).
@@ -316,17 +327,26 @@ pub struct FullBackupRef {
     pub meta: FullBackupMeta,
 }
 
-/// The newest full backup, across every lineage, whose `taken_at` does not
-/// exceed the recovery target — restore's core selection rule. Ties (same
-/// instant, different lineages — vanishingly unlikely but not impossible)
-/// break on `server_uuid` so the choice is deterministic.
+/// The newest full backup, across every lineage, taken at or before the
+/// recovery target — restore's core selection rule. Ties (same instant,
+/// different lineages — vanishingly unlikely but not impossible) break on
+/// `server_uuid` so the choice is deterministic.
+///
+/// "At or before" is judged at the precision of the full's NAME
+/// (`floor_to_millis`). The platform reads the oldest restorable point off
+/// that name and pins a fork's target exactly there when the earliest point
+/// is asked for. Every meta written before the archiver floored `taken_at`
+/// records the same instant with its nanoseconds — microseconds AFTER the
+/// name — and a strict comparison found no full "at or before" a target that
+/// IS the full: the fork crash-looped on `no-full` (production, 2026-09-10).
+/// A full is restorable from the instant its name carries.
 pub fn newest_qualifying_full(
     fulls: &[FullBackupRef],
     target: DateTime<Utc>,
 ) -> Option<&FullBackupRef> {
     fulls
         .iter()
-        .filter(|f| f.meta.taken_at <= target)
+        .filter(|f| floor_to_millis(f.meta.taken_at) <= target)
         .max_by(|a, b| {
             a.meta
                 .taken_at
@@ -530,9 +550,11 @@ pub fn parse_gtid_purged(dump_head: &str) -> Option<String> {
 }
 
 /// The `taken_at` instant a full backup's object NAME encodes
-/// (`.../full/<RFC3339>.sql.gz` or `.meta.json`) — the same value its
-/// sidecar meta records, readable from a listing alone without a GET.
-/// `None` for any key that is not a full-backup object.
+/// (`.../full/<RFC3339>.sql.gz` or `.meta.json`), readable from a listing
+/// alone without a GET. The sidecar meta records the same instant — floored
+/// to the millisecond since the archiver started doing so; with its
+/// nanoseconds in metas written before that. `None` for any key that is not
+/// a full-backup object.
 pub fn full_taken_at_from_key(key: &str) -> Option<DateTime<Utc>> {
     if !key.contains("/full/") {
         return None;
@@ -1563,6 +1585,42 @@ mod tests {
         let fulls = vec![full("a", "2026-08-13T14:00:00.000Z")];
         let target = parse_target_time("2026-08-13T14:00:00.000Z").unwrap();
         assert!(newest_qualifying_full(&fulls, target).is_some());
+    }
+
+    /// The production shape of 2026-09-10: the archiver named the full at
+    /// millisecond precision and recorded `taken_at` with its nanoseconds;
+    /// the platform read the name and pinned the fork's target on it. The
+    /// full IS that instant and must qualify — one millisecond earlier is
+    /// before the full.
+    #[test]
+    fn newest_qualifying_full_accepts_a_target_pinned_on_the_fulls_name() {
+        let mut f = full("a", "2026-09-10T22:35:47.717Z");
+        f.meta.taken_at = parse_target_time("2026-09-10T22:35:47.717480Z").unwrap();
+        let target = full_taken_at_from_key(&f.dump_key).unwrap();
+        assert_eq!(
+            target,
+            parse_target_time("2026-09-10T22:35:47.717Z").unwrap()
+        );
+        let fulls = [f.clone()];
+        let picked = newest_qualifying_full(&fulls, target)
+            .expect("a full is restorable from the instant its name carries");
+        assert_eq!(picked.dump_key, f.dump_key);
+        let before = parse_target_time("2026-09-10T22:35:47.716Z").unwrap();
+        assert!(newest_qualifying_full(&fulls, before).is_none());
+    }
+
+    #[test]
+    fn floor_to_millis_keeps_the_instant_the_name_carries() {
+        let t = parse_target_time("2026-09-10T22:35:47.717480123Z").unwrap();
+        let floored = floor_to_millis(t);
+        assert_eq!(format_rfc3339_millis(floored), "2026-09-10T22:35:47.717Z");
+        assert_eq!(
+            floored,
+            parse_target_time("2026-09-10T22:35:47.717Z").unwrap()
+        );
+        assert_eq!(floor_to_millis(floored), floored);
+        let whole = parse_target_time("2026-09-10T22:35:47Z").unwrap();
+        assert_eq!(floor_to_millis(whole), whole);
     }
 
     #[test]
