@@ -296,6 +296,27 @@ pub async fn run(
             return;
         }
     };
+    // One root, one database history: refuse a root another service claimed
+    // before writing a byte into it (see pitr::archive_ownership_verdict).
+    // Loud and re-tried on the next start: the record names the owner and
+    // the remedy, /pitr carries it as last_error, and mysqld itself is
+    // unaffected.
+    if let Err(e) = ensure_archive_ownership(&s3, &location, &config, &sql, mode).await {
+        error!(
+            error = %e,
+            bucket = %location.bucket,
+            path = %location.path,
+            "PITR archiving refused: this archive root is not this service's; archiving is \
+             disabled for this boot"
+        );
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "mysql-wrapper".to_string(),
+            error: e.to_string(),
+            context: "pitr_archive_ownership".to_string(),
+        });
+        status.note_error(&e);
+        return;
+    }
     if mode == ArchiveMode::GroupPrimary {
         // Declare the archive one shared history before the first byte of
         // GTID binlog lands in it (see pitr::shared_history_marker_key).
@@ -423,6 +444,80 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Read the root's owner record, judge it (pitr::archive_ownership_verdict)
+/// and write the claim or the updated record. A bucket read or write that
+/// fails is retried a few times, then fails this boot: an unreadable record
+/// is never taken for an absent one.
+async fn ensure_archive_ownership(
+    s3: &S3Client,
+    location: &S3Location,
+    config: &Config,
+    sql: &Sql,
+    mode: ArchiveMode,
+) -> Result<()> {
+    const ATTEMPTS: u32 = 5;
+    let key = pitr::owner_key(location);
+    let root = pitr::base_prefix(location);
+    let history = crate::gr::resolve_group_name(config);
+    let environment_id = common::RailwayEnv::environment_id();
+    let service_id = common::RailwayEnv::service_id();
+    // A standalone server's own history is what tells a reverted member
+    // from a stranger; unreadable reads as empty and the rules stay strict.
+    let executed = sql.executed_gtid_set().await.unwrap_or_default();
+    let me = pitr::ArchiveClaimant {
+        environment_id: &environment_id,
+        service_id: &service_id,
+        history: &history,
+        group_primary: mode == ArchiveMode::GroupPrimary,
+        executed_gtid_set: &executed,
+    };
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        let outcome: Result<()> = async {
+            let existing: Option<pitr::ArchiveOwner> = if s3.exists(&key).await? {
+                let bytes = s3.get_object_bytes(&key).await?;
+                Some(serde_json::from_slice(&bytes).with_context(|| {
+                    format!("{key} is not a readable owner record; delete it to let this service claim the root")
+                })?)
+            } else {
+                None
+            };
+            match pitr::archive_ownership_verdict(&root, existing.as_ref(), &me, Utc::now()) {
+                pitr::OwnershipVerdict::Keep => Ok(()),
+                pitr::OwnershipVerdict::Write(record) => {
+                    let json = serde_json::to_vec_pretty(&record)
+                        .context("serializing the archive owner record")?;
+                    s3.put_object_bytes(&key, json)
+                        .await
+                        .with_context(|| format!("writing {key}"))?;
+                    info!(
+                        %key,
+                        environment_id = %record.environment_id,
+                        services = ?record.service_ids,
+                        "archive root recorded as this service's"
+                    );
+                    Ok(())
+                }
+                pitr::OwnershipVerdict::Refuse(reason) => Err(anyhow::anyhow!(reason)),
+            }
+        }
+        .await;
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // A refusal is a verdict, not a transient: no retry.
+                if e.to_string().contains("owner.json") {
+                    return Err(e);
+                }
+                warn!(error = %e, attempt, "could not settle the archive root's ownership; retrying");
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("could not settle the archive root's ownership")))
 }
 
 async fn wait_for_mysqld(sql: &Sql) {
