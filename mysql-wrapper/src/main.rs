@@ -130,7 +130,25 @@ async fn main() -> Result<()> {
             );
         }
         if config.restore_enabled() && config.gr_seeds.is_none() {
+            let attempts = restore::recorded_attempts(&config.data_dir);
+            if attempts >= restore::MAX_RESTORE_ATTEMPTS {
+                // Bounded, not silent: the verdict of every attempt is already
+                // in the logs and in the workflow that started the restore;
+                // what stops here is the download bill. Exiting non-zero lets
+                // the platform's restart policy end the deployment as CRASHED
+                // instead of one more pass over the archive.
+                let (status, reason) = restore::previous_attempt(&config.data_dir)
+                    .map(|(s, r)| (format!("{s:?}"), r.unwrap_or_else(|| "-".to_string())))
+                    .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
+                bail!(
+                    "point-in-time restore gave up after {attempts} attempts (last: {status}: \
+                     {reason}); not wiping and retrying again — fix the cause (the archive, \
+                     the target, the recovery configuration) and restore onto a fresh volume"
+                );
+            }
             warn!(
+                attempt = attempts + 1,
+                max_attempts = restore::MAX_RESTORE_ATTEMPTS,
                 "a previous point-in-time restore did not complete; wiping the \
                  partially-restored data directory (derived state only) and retrying the \
                  restore from scratch"
