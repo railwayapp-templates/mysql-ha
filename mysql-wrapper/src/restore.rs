@@ -327,6 +327,32 @@ fn write_restore_marker(
 /// attempt leaves its reason in the marker for the next boot to repeat. The
 /// fork's deployment turns healthy the moment its container is up, so this
 /// line is what tells anyone outside the container how the restore went.
+/// MySQL's hard maximum for max_allowed_packet (1 GiB). See the restore-phase
+/// argv: a bulk statement's row events replay as one BINLOG literal.
+const MAX_ALLOWED_PACKET: u64 = 1024 * 1024 * 1024;
+
+/// The last few KiB a child wrote to stderr, for the error it died with — the
+/// `mysql` client says WHY it quit ("Got a packet bigger than
+/// 'max_allowed_packet' bytes") where the relay only sees a broken pipe.
+async fn stderr_tail(stderr: Option<tokio::process::ChildStderr>) -> String {
+    use tokio::io::AsyncReadExt;
+    let Some(mut stderr) = stderr else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    let _ = stderr.read_to_end(&mut buf).await;
+    let start = buf.len().saturating_sub(4096);
+    String::from_utf8_lossy(&buf[start..]).trim().to_string()
+}
+
+fn with_said(what: &str, said: &str) -> String {
+    if said.is_empty() {
+        what.to_string()
+    } else {
+        format!("{what}: {said}")
+    }
+}
+
 pub async fn run_reporting(config: &Config) -> Result<()> {
     let started = std::time::Instant::now();
     match run(config, started).await {
@@ -456,6 +482,14 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
     args.push("--sync-binlog=0".to_string());
     args.push("--innodb-doublewrite=OFF".to_string());
     args.push("--skip-log-bin".to_string());
+    // mysqlbinlog flushes a statement's row events as ONE `BINLOG '…'`
+    // literal (at STMT_END_F), so a bulk INSERT of N MiB arrives as a single
+    // ~1.33N MiB packet. The 64 MiB server default and the 16 MiB client
+    // default refused a 64 MiB load statement on 2026-09-09 (prod, 5 GB): the
+    // client quit, the relay saw a broken pipe, the restore looped forever.
+    // 1 GiB is MySQL's own cap and what its replica applier allows
+    // (replica_max_allowed_packet); the clients below ask for the same.
+    args.push(format!("--max-allowed-packet={MAX_ALLOWED_PACKET}"));
     if shared_history {
         let gtid_args = shared_history_restore_args(&full);
         info!(
@@ -713,6 +747,7 @@ async fn load_full_backup(s3: &S3Client, full: &FullBackupRef, config: &Config) 
     let mut mysql = Command::new("mysql")
         .arg(format!("--socket={}", config.socket_path))
         .arg("-uroot")
+        .arg(format!("--max-allowed-packet={MAX_ALLOWED_PACKET}"))
         .env("MYSQL_PWD", &config.mysql_root_password)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -720,6 +755,7 @@ async fn load_full_backup(s3: &S3Client, full: &FullBackupRef, config: &Config) 
         .kill_on_drop(true)
         .spawn()
         .context("spawning mysql")?;
+    let mysql_said = tokio::spawn(stderr_tail(mysql.stderr.take()));
 
     let mut gunzip_stdin = gunzip.stdin.take().context("gunzip stdin was not piped")?;
     let gunzip_stdout = gunzip
@@ -740,20 +776,28 @@ async fn load_full_backup(s3: &S3Client, full: &FullBackupRef, config: &Config) 
     });
 
     let (in_result, out_result) = tokio::join!(relay_in, relay_out);
+    let gunzip_status = gunzip.wait().await.context("waiting for gunzip")?;
+    let mysql_status = mysql.wait().await.context("waiting for mysql")?;
+    let mysql_said = mysql_said.await.unwrap_or_default();
+    // The client's own words first: a quit on error is the cause the relay's
+    // broken pipe only reflects.
+    if !mysql_status.success() {
+        anyhow::bail!(
+            "{}",
+            with_said(
+                &format!("mysql (loading the full backup) exited with {mysql_status}"),
+                &mysql_said
+            )
+        );
+    }
     in_result
         .context("relay task panicked")?
         .context("streaming the dump from S3 into gunzip")?;
     out_result
         .context("relay task panicked")?
-        .context("streaming gunzip's output into mysql")?;
-
-    let gunzip_status = gunzip.wait().await.context("waiting for gunzip")?;
-    let mysql_status = mysql.wait().await.context("waiting for mysql")?;
+        .with_context(|| with_said("streaming gunzip's output into mysql", &mysql_said))?;
     if !gunzip_status.success() {
         anyhow::bail!("gunzip exited with {gunzip_status}");
-    }
-    if !mysql_status.success() {
-        anyhow::bail!("mysql (loading the full backup) exited with {mysql_status}");
     }
     Ok(())
 }
@@ -1197,6 +1241,7 @@ async fn replay_downloaded(
     let mut mysql = Command::new("mysql")
         .arg(format!("--socket={}", config.socket_path))
         .arg("-uroot")
+        .arg(format!("--max-allowed-packet={MAX_ALLOWED_PACKET}"))
         .env("MYSQL_PWD", &config.mysql_root_password)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1210,6 +1255,8 @@ async fn replay_downloaded(
         .take()
         .context("mysqlbinlog stdout was not piped")?;
     let mut mysql_stdin = mysql.stdin.take().context("mysql stdin was not piped")?;
+    let mysql_said = tokio::spawn(stderr_tail(mysql.stderr.take()));
+    let binlog_said = tokio::spawn(stderr_tail(mysqlbinlog.stderr.take()));
     let relay = tokio::spawn(async move {
         let mut reader = binlog_stdout;
         tokio::io::copy(&mut reader, &mut mysql_stdin).await?;
@@ -1222,15 +1269,31 @@ async fn replay_downloaded(
         .await
         .context("waiting for mysqlbinlog")?;
     let mysql_status = mysql.wait().await.context("waiting for mysql")?;
+    let mysql_said = mysql_said.await.unwrap_or_default();
+    let binlog_said = binlog_said.await.unwrap_or_default();
 
+    // The client's own words first: when it quits on an error, the relay's
+    // broken pipe is the consequence, not the cause.
+    if !mysql_status.success() {
+        anyhow::bail!(
+            "{}",
+            with_said(
+                &format!("mysql (replaying binlogs) exited with {mysql_status}"),
+                &mysql_said
+            )
+        );
+    }
     relay_result
         .context("relay task panicked")?
-        .context("streaming mysqlbinlog's output into mysql")?;
+        .with_context(|| with_said("streaming mysqlbinlog's output into mysql", &mysql_said))?;
     if !binlog_status.success() {
-        anyhow::bail!("mysqlbinlog exited with {binlog_status}");
-    }
-    if !mysql_status.success() {
-        anyhow::bail!("mysql (replaying binlogs) exited with {mysql_status}");
+        anyhow::bail!(
+            "{}",
+            with_said(
+                &format!("mysqlbinlog exited with {binlog_status}"),
+                &binlog_said
+            )
+        );
     }
 
     // How far the archive's history actually extends: the last event of the

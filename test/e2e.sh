@@ -2180,6 +2180,82 @@ t_pitr_archive_and_restore_to_point_in_time() {
 # same reason on the other axis: S3 stamps LastModified on write, so every
 # forged object looks brand new and production's hour-long age floor would
 # spare all of them.
+t_pitr_restore_replays_a_large_single_statement() {
+  log "t_pitr_restore_replays_a_large_single_statement (one 64 MiB INSERT must replay through mysqlbinlog | mysql)"
+  # 2026-09-09, prod, 5 GB loaded in 64 MiB statements: the dump-path restore
+  # completed in 570 s; the replay-path restore died in a loop, ~100 s into
+  # each attempt, with nothing but "Error: replaying binlogs". Every restore
+  # whose target sits far from the newest full replays the day's binlog, so a
+  # customer's bulk insert is exactly what this must survive. One statement
+  # of the platform's size, replayed from an empty full.
+  docker rm -f mysql-pitr-big-src mysql-pitr-big-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-big-src mysql-ha-e2e-vol-mysql-pitr-big-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+  start_minio || { bad "minio never became healthy"; return; }
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-big"
+  )
+  start_standalone mysql-pitr-big-src "${archive_env[@]}"
+  wait_until 120 "PITR source node healthy" \
+    bash -c 'docker exec mysql-pitr-big-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "PITR source node never became healthy"; return; }
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-big-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-big-src 2>&1 | tail -40; return; }
+  ok "source archiving; the full backup is empty, so the restore below is all replay"
+
+  # 16384 rows x 4 KiB in ONE statement = 64 MiB, the platform load's shape.
+  sql mysql-pitr-big-src "SET SESSION cte_max_recursion_depth = 20000; CREATE DATABASE IF NOT EXISTS t; CREATE TABLE t.big (id INT AUTO_INCREMENT PRIMARY KEY, payload VARBINARY(4096) NOT NULL); INSERT INTO t.big (payload) WITH RECURSIVE n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 16384) SELECT CONCAT(RANDOM_BYTES(1024), RANDOM_BYTES(1024), RANDOM_BYTES(1024), RANDOM_BYTES(1024)) FROM n;" \
+    || { bad "the 64 MiB single-statement load failed on the source"; return; }
+  local src_count
+  src_count="$(sql mysql-pitr-big-src "SELECT COUNT(*) FROM t.big")"
+  [ "$src_count" = "16384" ] || { bad "source holds $src_count rows, expected 16384"; return; }
+  ok "source holds 16384 x 4 KiB rows written by one statement"
+  sleep 2
+  local t_big
+  t_big="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  sleep 2
+  sql mysql-pitr-big-src "FLUSH BINARY LOGS;"
+  wait_until 120 "the load's binlogs shipped" \
+    bash -c 'docker logs mysql-pitr-big-src 2>&1 | grep -c "\"message\":\"binlog uploaded\"" | awk "{exit !(\$1 >= 2)}"' \
+    || { bad "the load's binlogs were never shipped"; docker logs mysql-pitr-big-src 2>&1 | tail -30; return; }
+  ok "binlogs carrying the 64 MiB statement shipped"
+
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-big"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$t_big"
+  )
+  start_standalone mysql-pitr-big-restore "${recover_env[@]}"
+  wait_until 300 "restore of the 64 MiB statement completed and serving" \
+    bash -c 'docker exec mysql-pitr-big-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "restore never served — the large statement did not replay"; docker logs mysql-pitr-big-restore 2>&1 | grep -E "verdict|Caused by|exited with|packet|ERROR|Error" | tail -12; return; }
+  docker logs mysql-pitr-big-restore 2>&1 | grep '"message":"point-in-time restore verdict"' | grep -q '"verdict":"completed"' \
+    && ok "verdict: completed" \
+    || bad "no completed verdict line"
+  local got
+  got="$(sql mysql-pitr-big-restore "SELECT COUNT(*) FROM t.big")"
+  [ "$got" = "16384" ] \
+    && ok "all 16384 rows of the single 64 MiB statement replayed" \
+    || bad "restored table holds $got rows, expected 16384 — the large statement did not replay whole"
+  local src_fp restored_fp
+  src_fp="$(sql mysql-pitr-big-src "SELECT BIT_XOR(CRC32(payload)) FROM t.big")"
+  restored_fp="$(sql mysql-pitr-big-restore "SELECT BIT_XOR(CRC32(payload)) FROM t.big")"
+  [ -n "$src_fp" ] && [ "$src_fp" = "$restored_fp" ] \
+    && ok "payload fingerprint matches the source ($src_fp)" \
+    || bad "payload fingerprint differs: source $src_fp, restored $restored_fp"
+  docker rm -f mysql-pitr-big-src mysql-pitr-big-restore >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-big-src mysql-ha-e2e-vol-mysql-pitr-big-restore >/dev/null 2>&1
+}
+
 t_pitr_restore_never_serves_the_half_loaded_database() {
   log "t_pitr_restore_never_serves_the_half_loaded_database (the restore-phase server must refuse TCP until replay is done)"
   # Regression for a silent, customer-visible data-loss LOOK-ALIKE.
@@ -3333,7 +3409,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_never_serves_the_half_loaded_database t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
 
 main() {
   ensure_image
