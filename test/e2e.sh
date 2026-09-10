@@ -2351,6 +2351,17 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
       break
     fi
     probes=$(( probes + 1 ))
+    # The X Plugin's port is the same contract on a different socket: a
+    # restore-phase server that refuses 3306 but answers 33060 serves the
+    # half-loaded database to X protocol clients. A TCP connect is enough to
+    # tell — the port is either bound or it is not.
+    if docker run --rm --network "$NET" --entrypoint bash "$IMAGE" \
+        -c 'exec 3<>/dev/tcp/mysql-pitr-window-restore/33060' >/dev/null 2>&1; then
+      connected=$(( connected + 1 ))
+      served_early=1
+      log "  mid-restore TCP connect to 33060 (X Plugin) SUCCEEDED"
+      break
+    fi
     if docker run --rm --network "$NET" --entrypoint mysql "$IMAGE" \
         -h mysql-pitr-window-restore -P 3306 -uroot -p"$ROOT_PW" \
         --connect-timeout=3 --batch --skip-column-names \
@@ -2375,7 +2386,7 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
     docker logs mysql-pitr-window-restore 2>&1 | tail -40
     return
   fi
-  ok "port stayed closed for all $probes probes while the restore ran"
+  ok "ports 3306 and 33060 stayed closed for all $probes probes while the restore ran"
 
   wait_until 240 "restore completed and serving" \
     bash -c 'docker exec mysql-pitr-window-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \

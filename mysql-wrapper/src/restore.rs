@@ -472,6 +472,13 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
     // address, not its loopback.
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     args.push("--bind-address=127.0.0.1".to_string());
+    // `bind_address` governs the classic port only. The X Plugin listens on
+    // its own port (33060) under `mysqlx_bind_address`, which stays `*`, so
+    // without this the half-loaded database the loopback bind hides on 3306
+    // is served to anyone dialing 33060 during the restore. The serving
+    // mysqld that boots on the finished datadir runs with the image's normal
+    // settings, X Plugin included.
+    args.push("--mysqlx=OFF".to_string());
     // The restore-phase server is disposable: a crash mid-load is wiped and
     // retried from scratch (see crashed_mid_restore), so the durability knobs
     // that make a serving server safe only make this one slow. No redo fsync
