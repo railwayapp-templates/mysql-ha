@@ -3355,6 +3355,131 @@ t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole() {
   pitr_ha_teardown "$restore" "$hole"
 }
 
+# Every group formed before this image pinned
+# group_replication_gtid_assignment_block_size to 1 (52f0241) runs on the
+# default of 1,000,000: each member reserves a block of a million numbers
+# under the group's UUID, so the first write on a newly promoted primary
+# jumps the group's sequence by a block. That jump is not a lost transaction,
+# and a restore that judged completeness on the sequence's intervals refused
+# every such history. The completeness check reads what each replayed binlog
+# vouches for instead (its Previous_gtids), and this scenario pins both
+# halves on a block-size-1,000,000 group: the jump restores, and a binlog
+# deleted from the archive is still refused.
+t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump() {
+  log "t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump (block size 1,000,000: a failover's block jump is not a hole; a deleted binlog still is)"
+  local restore=mysql-pitr-ha-blk-restore hole=mysql-pitr-ha-blk-hole
+  pitr_ha_teardown "$restore" "$hole"
+  start_minio || { bad "minio never became healthy"; return; }
+  # The block size is a my.cnf option: a file sorting after the wrapper's
+  # zz-railway-gr.cnf in conf.d wins, the way a group formed on the pre-pin
+  # image carries the default. The fixture is proven below, never assumed.
+  local cnf
+  cnf="$(mktemp "${TMPDIR:-/tmp}/mysql-ha-e2e-block-size.XXXXXX")"
+  printf '[mysqld]\nloose-group_replication_gtid_assignment_block_size = 1000000\n' > "$cnf"
+  chmod 644 "$cnf"
+  local -a env
+  mapfile -t env < <(pitr_ha_archive_env /e2e-pitr-ha-blk)
+  env+=("-v" "$cnf:/etc/mysql/conf.d/zz-zz-e2e-gtid-block-size.cnf:ro")
+  start_node 1 "${env[@]}"; start_node 2 "${env[@]}"; start_node 3 "${env[@]}"
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; rm -f "$cnf"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; rm -f "$cnf"; return; }
+  local block_size
+  block_size="$(sql "$primary" "SELECT @@global.group_replication_gtid_assignment_block_size")"
+  [ "$block_size" = "1000000" ] \
+    && ok "group runs on GTID assignment block size 1000000 (the pre-pin default)" \
+    || { bad "group block size is '$block_size', not 1000000 — the fixture did not take, so the scenario proves nothing"; rm -f "$cnf"; return; }
+  wait_until 180 "initial full backup on $primary" \
+    bash -c 'docker logs '"$primary"' 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "no initial full backup"; docker logs "$primary" 2>&1 | tail -40; rm -f "$cnf"; return; }
+
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'first-block');"
+  local f1
+  f1="$(active_binlog "$primary")"
+  sql "$primary" "FLUSH BINARY LOGS;"
+  wait_uploaded "$primary" "$f1" || { bad "row-1 binlog never shipped"; rm -f "$cnf"; return; }
+  ok "row 1 shipped from $primary ($f1)"
+
+  docker pause "$primary" >/dev/null
+  local others=() survivor
+  for survivor in mysql-1 mysql-2 mysql-3; do
+    [ "$survivor" != "$primary" ] && others+=("$survivor")
+  done
+  wait_until 120 "a new primary elected" any_role_200 "${others[0]}" "${others[@]}" \
+    || { bad "no new primary after the pause"; docker unpause "$primary" >/dev/null; rm -f "$cnf"; return; }
+  local new_primary
+  new_primary="$(current_primary "${others[0]}" "${others[@]}")" || { bad "no new primary"; docker unpause "$primary" >/dev/null; rm -f "$cnf"; return; }
+  wait_until 90 "archiver started on $new_primary" \
+    bash -c 'docker logs '"$new_primary"' 2>&1 | grep -q "starting PITR archiver"' \
+    || { bad "the new primary never started archiving"; docker logs "$new_primary" 2>&1 | tail -40; docker unpause "$primary" >/dev/null; rm -f "$cnf"; return; }
+
+  # The new primary's first write reserves ITS block: the group's sequence
+  # jumps from wherever the old primary's block stood to 1000001.
+  sql "$new_primary" "INSERT INTO t.kv VALUES (2,'second-block');"
+  local group executed
+  group="$(sql "$new_primary" "SELECT @@group_replication_group_name")"
+  executed="$(sql "$new_primary" "SELECT @@global.gtid_executed" | tr -d '\n')"
+  case "$executed" in
+    *"$group:"*":1000001"*) ok "the failover opened a block jump in the group's sequence ($executed)" ;;
+    *) bad "no block jump in gtid_executed ('$executed') — the scenario does not exercise the jump"; docker unpause "$primary" >/dev/null; rm -f "$cnf"; return ;;
+  esac
+  local f2
+  f2="$(active_binlog "$new_primary")"
+  sql "$new_primary" "FLUSH BINARY LOGS;"
+  wait_uploaded "$new_primary" "$f2" || { bad "the new primary never shipped $f2"; docker logs "$new_primary" 2>&1 | tail -40; docker unpause "$primary" >/dev/null; rm -f "$cnf"; return; }
+  sleep 2
+  local t
+  t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  sleep 2
+
+  local -a renv
+  mapfile -t renv < <(pitr_recover_env /e2e-pitr-ha-blk "$t")
+  start_standalone "$restore" "${renv[@]}"
+  wait_until 240 "restored node serving" \
+    bash -c 'docker exec '"$restore"' wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "THE assertion: a block-size-1000000 history was refused or never served — the block jump was read as a hole"; dump_node_log "$restore"; docker unpause "$primary" >/dev/null; rm -f "$cnf"; return; }
+  node_logged "$restore" "restored GTID history has holes" \
+    && bad "restore reported holes on an intact history" \
+    || ok "the block jump was not reported as a hole"
+  local v1 v2
+  v1="$(sql "$restore" "SELECT v FROM t.kv WHERE k=1")"
+  v2="$(sql "$restore" "SELECT v FROM t.kv WHERE k=2")"
+  [ "$v1" = "first-block" ] && ok "row from the first block present" || bad "row 1 missing (got '$v1')"
+  [ "$v2" = "second-block" ] && ok "row from the second block present" || bad "row 2 missing (got '$v2')"
+
+  # Negative: $f2 is the only archived carrier of row 2 (the paused primary
+  # never saw it). Ship one more file past it, delete $f2, and a restore
+  # beyond it must still refuse: the file after the loss vouches for row 2's
+  # transaction, whatever the block size.
+  sql "$new_primary" "INSERT INTO t.kv VALUES (3,'after-the-hole');"
+  local f3
+  f3="$(active_binlog "$new_primary")"
+  sql "$new_primary" "FLUSH BINARY LOGS;"
+  wait_uploaded "$new_primary" "$f3" || { bad "$f3 never shipped"; docker unpause "$primary" >/dev/null; rm -f "$cnf"; return; }
+  sleep 2
+  local t2
+  t2="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  sleep 2
+  local uuid2
+  uuid2="$(sql "$new_primary" "SELECT @@server_uuid")"
+  mc_rm_key "e2e-pitr-ha-blk/server-$uuid2/binlog/$f2" || { bad "could not delete $f2 from the bucket"; docker unpause "$primary" >/dev/null; rm -f "$cnf"; return; }
+  ok "deleted $f2 from the archive — row 2 now exists in no lineage"
+
+  mapfile -t renv < <(pitr_recover_env /e2e-pitr-ha-blk "$t2")
+  start_standalone "$hole" "${renv[@]}"
+  wait_until 240 "restore refused on the GTID hole" \
+    bash -c 'docker logs '"$hole"' 2>&1 | grep "\"message\":" | grep -qi "restored GTID history has holes"' \
+    || { bad "the restore never reported the GTID hole on a block-size-1000000 history"; dump_node_log "$hole"; docker unpause "$primary" >/dev/null; rm -f "$cnf"; return; }
+  ok "restore detected and named the GTID hole (block size 1000000)"
+  node_logged "$hole" "point-in-time restore completed" \
+    && bad "restore claimed completion despite the hole" || ok "restore never claimed completion"
+
+  docker unpause "$primary" >/dev/null 2>&1
+  rm -f "$cnf"
+  pitr_ha_teardown "$restore" "$hole"
+}
+
 # In Group Replication mode the wrapper never purges binlogs itself (a purge
 # would force a clone on every rejoin); mysqld's own expiry does —
 # binlog_expire_logs_seconds = 3 days in mysql_conf.rs — and mysqld cannot
@@ -3540,7 +3665,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
 
 main() {
   ensure_image

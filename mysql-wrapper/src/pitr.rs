@@ -544,71 +544,149 @@ pub fn full_taken_at_from_key(key: &str) -> Option<DateTime<Utc>> {
     parse_target_time(stem).ok()
 }
 
-/// One UUID's missing range inside a GTID set — transaction numbers between
-/// two executed intervals that nothing delivered.
+/// What a binlog file's head says about the history before it: when the
+/// file was opened (its Format_description event's timestamp — the rotation
+/// that created it) and every transaction its server had executed by then
+/// (its Previous_gtids event), as a GTID set string mysqld takes back
+/// verbatim (`uuid:1-5:8-9,uuid2:1-3`; empty when the server had no GTID
+/// history, gtid_mode=OFF included).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GtidHole {
-    pub uuid: String,
-    /// First missing transaction number.
-    pub from: u64,
-    /// Last missing transaction number (inclusive).
-    pub to: u64,
+pub struct BinlogHead {
+    pub created_at: DateTime<Utc>,
+    pub previous_gtids: String,
 }
 
-impl std::fmt::Display for GtidHole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.from == self.to {
-            write!(f, "{}:{}", self.uuid, self.from)
-        } else {
-            write!(f, "{}:{}-{}", self.uuid, self.from, self.to)
-        }
-    }
-}
+const BINLOG_MAGIC: [u8; 4] = [0xfe, b'b', b'i', b'n'];
+/// v4 event header: timestamp(4) type(1) server_id(4) event_length(4)
+/// next_position(4) flags(2).
+const BINLOG_EVENT_HEADER_LEN: usize = 19;
+const FORMAT_DESCRIPTION_EVENT: u8 = 15;
+const PREVIOUS_GTIDS_LOG_EVENT: u8 = 35;
+/// Events to look through for the Previous_gtids event before giving up: the
+/// server writes it second, right after the Format_description event.
+const BINLOG_HEAD_EVENT_BUDGET: usize = 4;
+/// Bytes of a binlog file the head parser reads: the two events it needs sit
+/// at the very start, and a Previous_gtids event grows by ~40 bytes per
+/// UUID, so this bounds even a set with thousands of lineages.
+pub const BINLOG_HEAD_READ_BYTES: usize = 4 * 1024 * 1024;
 
-/// Every hole in a GTID set: `uuid:1-5:8-9,other:1-3` → `uuid:6-7`. The
-/// server prints each UUID's executed intervals sorted and coalesced, so a
-/// UUID with more than one interval has, by construction, skipped the
-/// numbers between them. Under Group Replication every group transaction
-/// takes the group's UUID and the next number in sequence, so a hole in a
-/// restored server's `gtid_executed` is exactly "a transaction the archive
-/// never delivered" — the fail-closed signal a shared-history restore keys
-/// on (see restore.rs). Malformed ranges are ignored rather than reported:
-/// this judges completeness, and cannot judge what it cannot parse.
-pub fn gtid_set_holes(set: &str) -> Vec<GtidHole> {
-    let mut holes = Vec::new();
-    for entry in set.split(',') {
-        let entry: String = entry.split_whitespace().collect();
-        if entry.is_empty() {
-            continue;
-        }
-        let mut parts = entry.split(':');
-        let Some(uuid) = parts.next() else {
-            continue;
-        };
-        let mut intervals: Vec<(u64, u64)> = Vec::new();
-        for range in parts {
-            let parsed = match range.split_once('-') {
-                Some((lo, hi)) => lo.parse::<u64>().ok().zip(hi.parse::<u64>().ok()),
-                None => range.parse::<u64>().ok().map(|n| (n, n)),
-            };
-            if let Some(iv) = parsed {
-                intervals.push(iv);
+/// Parse a binlog file's head (see [`BinlogHead`]) from its first bytes.
+/// Fails loudly on anything it cannot read — a foreign magic (an encrypted
+/// binlog, a relay log, not a binlog at all), a truncated head, a GTID set
+/// in the tagged encoding this image never produces — because a caller
+/// asking completeness questions must not mistake "unreadable" for "empty".
+pub fn parse_binlog_head(bytes: &[u8]) -> Result<BinlogHead> {
+    anyhow::ensure!(
+        bytes.len() >= BINLOG_MAGIC.len() && bytes[..BINLOG_MAGIC.len()] == BINLOG_MAGIC,
+        "not a binlog file (bad magic)"
+    );
+    let mut offset = BINLOG_MAGIC.len();
+    let mut created_at: Option<DateTime<Utc>> = None;
+    for _ in 0..BINLOG_HEAD_EVENT_BUDGET {
+        let header = bytes
+            .get(offset..offset + BINLOG_EVENT_HEADER_LEN)
+            .context("binlog head is truncated inside an event header")?;
+        let timestamp = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let type_code = header[4];
+        let event_len =
+            u32::from_le_bytes([header[9], header[10], header[11], header[12]]) as usize;
+        anyhow::ensure!(
+            event_len >= BINLOG_EVENT_HEADER_LEN,
+            "binlog event of type {type_code} declares an impossible length {event_len}"
+        );
+        let payload = bytes
+            .get(offset + BINLOG_EVENT_HEADER_LEN..offset + event_len)
+            .with_context(|| {
+                format!("binlog head is truncated inside an event of type {type_code}")
+            })?;
+        match type_code {
+            FORMAT_DESCRIPTION_EVENT => {
+                created_at = DateTime::from_timestamp(i64::from(timestamp), 0);
             }
-        }
-        intervals.sort_unstable();
-        for pair in intervals.windows(2) {
-            let (_, prev_hi) = pair[0];
-            let (next_lo, _) = pair[1];
-            if next_lo > prev_hi + 1 {
-                holes.push(GtidHole {
-                    uuid: uuid.to_string(),
-                    from: prev_hi + 1,
-                    to: next_lo - 1,
+            PREVIOUS_GTIDS_LOG_EVENT => {
+                let created_at = created_at
+                    .context("binlog has a Previous_gtids event before its Format_description")?;
+                let previous_gtids = decode_gtid_set(payload)?;
+                return Ok(BinlogHead {
+                    created_at,
+                    previous_gtids,
                 });
             }
+            _ => {}
         }
+        offset += event_len;
     }
-    holes
+    anyhow::bail!(
+        "no Previous_gtids event within the first {BINLOG_HEAD_EVENT_BUDGET} events of the binlog"
+    )
+}
+
+/// mysqld's binary GTID set: n_sids(8), then per SID: uuid(16) n_intervals(8)
+/// and per interval start(8) end(8, exclusive). Trailing bytes (the event's
+/// checksum) are ignored. The high byte of n_sids carries the encoding format
+/// since 8.3 (0 = this one, 1 = tagged GTIDs), and only the format this
+/// image writes is accepted.
+fn decode_gtid_set(payload: &[u8]) -> Result<String> {
+    fn u64_at(bytes: &[u8], at: usize) -> Result<u64> {
+        let b = bytes
+            .get(at..at + 8)
+            .context("GTID set encoding is truncated")?;
+        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+    let n_sids_field = u64_at(payload, 0)?;
+    anyhow::ensure!(
+        n_sids_field >> 56 == 0,
+        "GTID set uses the tagged encoding (format {}), which this image does not read",
+        n_sids_field >> 56
+    );
+    let mut at = 8;
+    let mut sids = Vec::with_capacity(n_sids_field as usize);
+    for _ in 0..n_sids_field {
+        let uuid = payload
+            .get(at..at + 16)
+            .context("GTID set encoding is truncated inside a UUID")?;
+        at += 16;
+        let n_intervals = u64_at(payload, at)?;
+        at += 8;
+        let mut text = format_binlog_uuid(uuid);
+        for _ in 0..n_intervals {
+            let start = u64_at(payload, at)?;
+            let end = u64_at(payload, at + 8)?;
+            at += 16;
+            anyhow::ensure!(end > start, "GTID interval {start}-{end} is empty or inverted");
+            if end == start + 1 {
+                text.push_str(&format!(":{start}"));
+            } else {
+                text.push_str(&format!(":{start}-{}", end - 1));
+            }
+        }
+        sids.push(text);
+    }
+    Ok(sids.join(","))
+}
+
+fn format_binlog_uuid(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Whether a binlog's Previous_gtids are owed to a restore cut at `target`:
+/// the replay applies every event stamped before the target's second
+/// (`mysqlbinlog --stop-datetime` is whole-second and exclusive), and every
+/// transaction in a file's Previous_gtids committed at or before the second
+/// the file was opened — so a file opened before the target's second vouches
+/// for a set the restore must hold in full. A file opened within the
+/// target's second may vouch for transactions the replay deliberately cut,
+/// and is not consulted.
+pub fn binlog_opened_before_cutoff(created_at: DateTime<Utc>, target: DateTime<Utc>) -> bool {
+    created_at.timestamp() < target.timestamp()
 }
 
 fn extract_quoted(line: &str, key: &str) -> Option<String> {
@@ -2595,41 +2673,110 @@ mod tests {
         assert_eq!(parse_gtid_purged(head), None);
     }
 
-    #[test]
-    fn gtid_set_holes_finds_every_skipped_range_per_uuid() {
-        let holes = gtid_set_holes("aaaa:1-5:8-9:12,\nbbbb:1-3,\ncccc:4-6");
-        assert_eq!(
-            holes,
-            vec![
-                GtidHole {
-                    uuid: "aaaa".to_string(),
-                    from: 6,
-                    to: 7
-                },
-                GtidHole {
-                    uuid: "aaaa".to_string(),
-                    from: 10,
-                    to: 11
-                },
-            ]
-        );
-        assert_eq!(holes[0].to_string(), "aaaa:6-7");
-        assert_eq!(
-            GtidHole {
-                uuid: "x".to_string(),
-                from: 4,
-                to: 4
+    fn binlog_event(timestamp: u32, type_code: u8, payload: &[u8]) -> Vec<u8> {
+        let mut event = Vec::new();
+        event.extend_from_slice(&timestamp.to_le_bytes());
+        event.push(type_code);
+        event.extend_from_slice(&1u32.to_le_bytes()); // server_id
+        let len = (19 + payload.len()) as u32;
+        event.extend_from_slice(&len.to_le_bytes());
+        event.extend_from_slice(&0u32.to_le_bytes()); // next_position (unused here)
+        event.extend_from_slice(&0u16.to_le_bytes()); // flags
+        event.extend_from_slice(payload);
+        event
+    }
+
+    fn encoded_gtid_set(sids: &[([u8; 16], &[(u64, u64)])]) -> Vec<u8> {
+        let mut out = (sids.len() as u64).to_le_bytes().to_vec();
+        for (uuid, intervals) in sids {
+            out.extend_from_slice(uuid);
+            out.extend_from_slice(&(intervals.len() as u64).to_le_bytes());
+            for (start, end) in intervals.iter() {
+                out.extend_from_slice(&start.to_le_bytes());
+                out.extend_from_slice(&end.to_le_bytes());
             }
-            .to_string(),
-            "x:4"
+        }
+        // The event's CRC32 trails the set; the decoder must not read it.
+        out.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        out
+    }
+
+    const UUID_A: [u8; 16] = [
+        0x8e, 0x2f, 0x4a, 0x10, 0x9c, 0x3b, 0x11, 0xef, 0xa1, 0xb2, 0x02, 0x42, 0xac, 0x12, 0x00,
+        0x02,
+    ];
+    const UUID_B: [u8; 16] = [0x01; 16];
+
+    fn binlog_bytes(created: u32, set: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xfe, b'b', b'i', b'n'];
+        // Format_description payload: binlog_version(2) + server_version(50) +
+        // create_timestamp(4) + header_len(1) + post-header lengths + checksum
+        // alg — opaque here, the parser only reads its header.
+        bytes.extend(binlog_event(created, 15, &[0u8; 80]));
+        bytes.extend(binlog_event(created, 35, set));
+        bytes
+    }
+
+    #[test]
+    fn binlog_head_reads_creation_time_and_previous_gtids() {
+        let set = encoded_gtid_set(&[(UUID_A, &[(1, 6)]), (UUID_B, &[(1, 2), (8, 10)])]);
+        let head = parse_binlog_head(&binlog_bytes(1_700_000_000, &set)).unwrap();
+        assert_eq!(head.created_at.timestamp(), 1_700_000_000);
+        assert_eq!(
+            head.previous_gtids,
+            "8e2f4a10-9c3b-11ef-a1b2-0242ac120002:1-5,01010101-0101-0101-0101-010101010101:1:8-9"
         );
-        // Contiguous sets, single numbers, adjacent intervals and the empty
-        // set all read as complete.
-        assert!(gtid_set_holes("aaaa:1-100,bbbb:7").is_empty());
-        assert!(gtid_set_holes("aaaa:1-5:6-9").is_empty());
-        assert!(gtid_set_holes("").is_empty());
-        // Unparseable ranges are ignored, not reported as holes.
-        assert!(gtid_set_holes("aaaa:1-5:garbage").is_empty());
+    }
+
+    #[test]
+    fn binlog_head_of_a_server_with_no_gtid_history_is_empty() {
+        let set = encoded_gtid_set(&[]);
+        let head = parse_binlog_head(&binlog_bytes(1_700_000_000, &set)).unwrap();
+        assert_eq!(head.previous_gtids, "");
+    }
+
+    #[test]
+    fn binlog_head_ignores_bytes_past_the_two_events() {
+        let set = encoded_gtid_set(&[(UUID_A, &[(1, 2)])]);
+        let mut bytes = binlog_bytes(1_700_000_000, &set);
+        bytes.extend(binlog_event(1_700_000_001, 33, &[7u8; 40])); // a Gtid event
+        bytes.extend_from_slice(&[0xff; 100]); // whatever follows, unread
+        let head = parse_binlog_head(&bytes).unwrap();
+        assert_eq!(head.previous_gtids, "8e2f4a10-9c3b-11ef-a1b2-0242ac120002:1");
+    }
+
+    #[test]
+    fn binlog_head_refuses_what_it_cannot_read() {
+        // Wrong magic: an encrypted binlog, a relay log, or not a binlog.
+        assert!(parse_binlog_head(b"\xfdbin\0\0\0\0").is_err());
+        // Truncated inside the Previous_gtids event.
+        let set = encoded_gtid_set(&[(UUID_A, &[(1, 6)])]);
+        let bytes = binlog_bytes(1_700_000_000, &set);
+        assert!(parse_binlog_head(&bytes[..bytes.len() - 30]).is_err());
+        // Tagged-GTID encoding (format byte 1 in n_sids' high byte).
+        let mut tagged = encoded_gtid_set(&[(UUID_A, &[(1, 6)])]);
+        tagged[7] = 1;
+        let err = parse_binlog_head(&binlog_bytes(1_700_000_000, &tagged)).unwrap_err();
+        assert!(err.to_string().contains("tagged"), "{err}");
+        // A file whose second event is not Previous_gtids, within budget.
+        let mut no_pg = vec![0xfe, b'b', b'i', b'n'];
+        no_pg.extend(binlog_event(1, 15, &[0u8; 80]));
+        for _ in 0..BINLOG_HEAD_EVENT_BUDGET {
+            no_pg.extend(binlog_event(1, 4, &[0u8; 8])); // Rotate events
+        }
+        assert!(parse_binlog_head(&no_pg).is_err());
+    }
+
+    #[test]
+    fn a_binlog_vouches_only_when_opened_before_the_targets_second() {
+        let target = parse_target_time("2026-09-10T12:00:05.700Z").unwrap();
+        let opened = |s: &str| parse_target_time(s).unwrap();
+        assert!(binlog_opened_before_cutoff(opened("2026-09-10T12:00:04.999Z"), target));
+        // Same second as the target: the replay cut events stamped 12:00:05,
+        // which this file's Previous_gtids may include.
+        assert!(!binlog_opened_before_cutoff(opened("2026-09-10T12:00:05.000Z"), target));
+        assert!(!binlog_opened_before_cutoff(opened("2026-09-10T12:00:05.900Z"), target));
+        assert!(!binlog_opened_before_cutoff(opened("2026-09-10T12:00:06.000Z"), target));
     }
 
     fn owner_now() -> DateTime<Utc> {
