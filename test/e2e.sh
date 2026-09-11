@@ -394,8 +394,22 @@ group_online_excluding() {
 }
 
 # wait_until <timeout-s> <description> <command...>
+#
+# The predicate runs in THIS shell, so a harness function is a valid predicate
+# (`wait_until 60 "..." group_is_fully_online mysql-1`). A predicate wrapped in
+# `bash -c` is a fresh process that inherits no shell functions: a harness
+# function called inside one is "command not found", the predicate is false on
+# every poll, and the wait burns its whole budget before reporting a timeout
+# that names the symptom instead of the cause (PR #74, run 34569526769: forty
+# `current_primary: command not found` lines, then "mysql-2 never became the
+# primary" on a switchover that had in fact completed). Resolve the predicate
+# once up front so that mistake fails immediately, and says what it is.
 wait_until() {
   local timeout="$1" desc="$2"; shift 2
+  if ! command -v "$1" >/dev/null 2>&1; then
+    log "BUG: wait_until predicate '$1' is not a command in this shell (waiting for: $desc)"
+    return 1
+  fi
   local waited=0
   until "$@"; do
     sleep 3
@@ -4216,8 +4230,8 @@ t_pitr_ha_reverted_roots_full_declares_the_group_history() {
   if [ "$primary" = "mysql-1" ]; then
     peer=mysql-2
     [ "$(switchover_code mysql-1 "$peer")" = "200" ] || { bad "switchover to $peer refused"; return; }
-    wait_until 120 "$peer is the primary" \
-      bash -c '[ "$(current_primary mysql-3 mysql-1 mysql-2 mysql-3)" = "'"$peer"'" ]' \
+    peer_is_primary() { [ "$(current_primary mysql-3 mysql-1 mysql-2 mysql-3)" = "$peer" ]; }
+    wait_until 120 "$peer is the primary" peer_is_primary \
       || { bad "$peer never became the primary"; return; }
   else
     peer="$primary"
@@ -4228,8 +4242,8 @@ t_pitr_ha_reverted_roots_full_declares_the_group_history() {
   sql "$peer" "FLUSH BINARY LOGS;"
   wait_uploaded "$peer" "$f2" || { bad "the peer tenure's binlog never shipped"; return; }
   [ "$(switchover_code "$peer" mysql-1)" = "200" ] || { bad "switchover back to the root refused"; return; }
-  wait_until 120 "the root is the primary again" \
-    bash -c '[ "$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" = "mysql-1" ]' \
+  root_is_primary() { [ "$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" = "mysql-1" ]; }
+  wait_until 120 "the root is the primary again" root_is_primary \
     || { bad "the root never took the primary back"; return; }
   sql mysql-1 "INSERT INTO t.kv VALUES (3,'root-tenure');"
   local f3
