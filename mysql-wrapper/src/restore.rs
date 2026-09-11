@@ -52,11 +52,21 @@
 //!        delivers it — that is what makes a failed-over primary's
 //!        never-uploaded tail recoverable from the next primary's lineage.
 //!        Completeness is then proven on the result, not assumed from the
-//!        file names: a hole in any UUID's `gtid_executed` interval set, or
-//!        a dump transaction missing from it, FAILS the restore loudly.
-//!        That is why a gap is not fatal on its own, and why the files past
-//!        it must still replay: cutting the lineage at the hole would leave
-//!        a contiguous, merely SHORT set that the check cannot fault.
+//!        file names: every replayed binlog opens with the set of
+//!        transactions its server had executed when the file was created
+//!        (its Previous_gtids event), and each such set — for every file
+//!        opened before the target — must be contained in the restored
+//!        `gtid_executed`, as must the dump's own set; a transaction some
+//!        file vouches for that no lineage delivered FAILS the restore
+//!        loudly. The files' own testimony is exact whatever the group's
+//!        GTID assignment block size: a group that hands each member a
+//!        block of a million numbers (the default, and every group formed
+//!        before this image pinned it to 1) leaves block-sized jumps in
+//!        its sequence that are not lost transactions, which is why the
+//!        set's intervals themselves are not the signal. That is also why
+//!        a gap is not fatal on its own, and why the files past it must
+//!        still replay: the file after the gap is the one that vouches
+//!        for what the gap held.
 //!      Either way the ACHIEVED recovery point is verified against the
 //!      target (see verify_achieved_point): mysqlbinlog exits 0 when the
 //!      logs simply end before --stop-datetime, so an archive that stopped
@@ -1023,6 +1033,29 @@ struct LineageRun {
     round: usize,
 }
 
+/// One replayed binlog's testimony: the transactions its server had executed
+/// when the file was opened (its Previous_gtids), all of which committed
+/// before the target when the file was opened before the target's second.
+struct BinlogWitness {
+    server_uuid: String,
+    file: String,
+    previous_gtids: String,
+}
+
+/// The head of a staged binlog (creation time and Previous_gtids), read from
+/// its first bytes — the two events sit at the very start of the file.
+fn read_binlog_head(path: &Path) -> Result<pitr::BinlogHead> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(pitr::BINLOG_HEAD_READ_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading the head of {}", path.display()))?;
+    pitr::parse_binlog_head(&bytes)
+}
+
 fn note_lineage_gap(server_uuid: &str, plan: &pitr::BinlogReplayPlan) {
     if let Some(gap) = &plan.gap {
         warn!(
@@ -1073,14 +1106,17 @@ fn push_runs_past_gap(
 /// primary's, after a failover) delivers them before anything that came
 /// after them replays. A sequence gap inside one lineage is therefore not
 /// fatal here — it is logged and the verdict left to the completeness check
-/// at the end: the restored server's `gtid_executed` must have no hole in
-/// any UUID, and must contain everything the dump declared. Either failing
-/// is the loud, fail-closed refusal: the archive lost a transaction on every
-/// lineage that held it. The files past a gap MUST replay for that check to
-/// mean anything: a lineage cut at its hole leaves a contiguous, merely
-/// short set, and a target within the rotation bound of that short end was
-/// accepted with the rows past the hole silently gone (the shape a group's
-/// binlog expiry leaves behind a stuck archiver).
+/// at the end: the restored server's `gtid_executed` must contain every
+/// transaction a replayed binlog's Previous_gtids vouches for (each file
+/// opened before the target names what its server had executed by then),
+/// and everything the dump declared. Either failing is the loud, fail-closed
+/// refusal: the archive lost a transaction on every lineage that held it.
+/// The files past a gap MUST replay for that check to mean anything: the
+/// file after the hole is exactly the witness to what the hole carried, and
+/// a lineage cut at its hole left a merely short history that a target
+/// within the rotation bound of that end accepted with the rows past the
+/// hole silently gone (the shape a group's binlog expiry leaves behind a
+/// stuck archiver).
 async fn replay_shared_history(
     s3: &S3Client,
     location: &S3Location,
@@ -1150,6 +1186,10 @@ async fn replay_shared_history(
 
     let scratch = Path::new(&config.data_dir).join(SCRATCH_DIR);
     let mut achieved = full.meta.taken_at;
+    // Every replayed file's testimony about the history before it, taken
+    // while the file is on disk; judged against the restored set after the
+    // replay (see the completeness check below).
+    let mut witnesses: Vec<BinlogWitness> = Vec::new();
     let replay: Result<()> = async {
         for run in &runs {
             if run.files.is_empty() {
@@ -1167,6 +1207,17 @@ async fn replay_shared_history(
                 s3.download_to_file(&key, &local)
                     .await
                     .with_context(|| format!("downloading {key}"))?;
+                let head = read_binlog_head(&local)
+                    .with_context(|| format!("reading the head of {key}"))?;
+                if pitr::binlog_opened_before_cutoff(head.created_at, target)
+                    && !head.previous_gtids.is_empty()
+                {
+                    witnesses.push(BinlogWitness {
+                        server_uuid: run.server_uuid.clone(),
+                        file: name.clone(),
+                        previous_gtids: head.previous_gtids,
+                    });
+                }
                 local_paths.push(local);
             }
             info!(
@@ -1199,22 +1250,41 @@ async fn replay_shared_history(
     let _ = std::fs::remove_dir_all(&scratch);
     replay?;
 
-    // Completeness, proven on the result. Under Group Replication every
-    // group transaction takes the group's UUID and the next number, so a
-    // hole in the restored gtid_executed is exactly a transaction no lineage
-    // delivered — the shared-history form of the single-lineage gap check,
-    // and the reason a per-lineage gap above was not fatal on its own.
+    // Completeness, proven on the result. Every replayed binlog opened with
+    // the set of transactions its server had executed by then; a file opened
+    // before the target therefore vouches for transactions that all
+    // committed before the target, and every one of them must be in the
+    // restored gtid_executed — whichever lineage delivered it. One that is
+    // not is a transaction the archive lost on every lineage that held it:
+    // the shared-history form of the single-lineage gap check, and the reason
+    // a per-lineage gap above was not fatal on its own. The set's own
+    // intervals are deliberately NOT the signal: a group whose GTID
+    // assignment block size is above 1 leaves block-sized jumps between
+    // members' numbers that are not lost transactions.
     let executed = sql
         .executed_gtid_set()
         .await
         .context("reading gtid_executed from the restored server")?;
-    let holes = pitr::gtid_set_holes(&executed);
+    let mut holes: Vec<String> = Vec::new();
+    for witness in &witnesses {
+        let lost = sql
+            .gtid_subtract(&witness.previous_gtids, &executed)
+            .await
+            .with_context(|| {
+                format!(
+                    "checking the transactions {}/{} vouches for against the restored server",
+                    witness.server_uuid, witness.file
+                )
+            })?;
+        if !lost.is_empty() {
+            holes.push(format!(
+                "{lost} (executed before {}/{} was opened)",
+                witness.server_uuid, witness.file
+            ));
+        }
+    }
     if !holes.is_empty() {
-        let listed = holes
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let listed = holes.join("; ");
         error!(
             holes = %listed,
             gtid_executed = %executed,
@@ -1252,7 +1322,9 @@ async fn replay_shared_history(
     }
     info!(
         gtid_executed = %executed,
-        "restored GTID history is contiguous and contains the full backup's set"
+        witnesses = witnesses.len(),
+        "restored GTID history holds every transaction the replayed binlogs vouch for and the \
+         full backup's set"
     );
 
     verify_achieved_point(achieved, target, config, fulls, full)?;
