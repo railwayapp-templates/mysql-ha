@@ -1323,6 +1323,78 @@ t_revert_to_standalone_drops_recovery_user() {
     || bad "second standalone boot changed or re-logged the cleanup"
 }
 
+# The template stamps GR_REPLICATION_PASSWORD as a reference to
+# MYSQL_ROOT_PASSWORD, so editing the root variable changes both — while the
+# live root password stays pinned. ensure_recovery_user used to rewrite each
+# restarted member's local gr_recovery with the NEW value; no peer held it, the
+# member could never join, and self-heal recloned with the same credential
+# until the attempt cap parked it. The recovery credential now follows the
+# root pin: an edited member rejoins ONLINE on the password the group still
+# enforces, its gr_recovery is left on that password, and the wrapper says so.
+t_coupled_password_edit_keeps_the_member_in_the_group() {
+  log "t_coupled_password_edit_keeps_the_member_in_the_group (template shape: GR_REPLICATION_PASSWORD follows MYSQL_ROOT_PASSWORD)"
+  teardown_trio
+  local real_root="$ROOT_PW" real_repl="$REPL_PW"
+  REPL_PW="$ROOT_PW"
+  start_trio
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 \
+    || { REPL_PW="$real_repl"; bad "coupled group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (20,'before-edit') ON DUPLICATE KEY UPDATE v='before-edit';"
+
+  local primary member other
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { REPL_PW="$real_repl"; bad "no primary"; return; }
+  for member in mysql-1 mysql-2 mysql-3; do [ "$member" != "$primary" ] && break; done
+  for other in mysql-1 mysql-2 mysql-3; do [ "$other" != "$primary" ] && [ "$other" != "$member" ] && break; done
+  local n="${member#mysql-}"
+
+  # Edit the variable on ONE secondary and redeploy it, the way the platform
+  # does: same volume, new MYSQL_ROOT_PASSWORD, GR_REPLICATION_PASSWORD moving
+  # with it because it is a reference.
+  # The member must catch up through the recovery channel, so a write lands
+  # while it is down: that row can only arrive via distributed recovery, which
+  # authenticates with the credential this change decides.
+  docker rm -f "$member" >/dev/null 2>&1
+  sql "$primary" "INSERT INTO t.kv VALUES (22,'while-away') ON DUPLICATE KEY UPDATE v='while-away';"
+  ROOT_PW="rotated-by-variable-edit"; REPL_PW="$ROOT_PW"
+  start_node "$n"
+  ROOT_PW="$real_root"; REPL_PW="$real_root"
+
+  wait_until 300 "edited member rejoins (3 ONLINE)" group_is_fully_online "$other" \
+    || { REPL_PW="$real_repl"; bad "edited member never rejoined the group — the recovery credential did not follow the pin"; docker logs "$member" 2>&1 | tail -30; return; }
+  ok "edited member rejoined ONLINE without anyone reverting the variable"
+  wait_until 60 "while-away write recovered onto the rejoined member" \
+    bash -c '[ "$(docker exec '"$member"' mysql -uroot -p'"$real_root"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=22" 2>/dev/null)" = "while-away" ]' \
+    && ok "the write made while the member was away arrived through distributed recovery" \
+    || bad "the write made while the member was away never arrived — recovery did not run with a credential the donors accept"
+  node_logged "$member" "the recovery credential follows the pinned active password" \
+    && ok "wrapper logged that the recovery credential followed the pin" \
+    || { bad "no log line explaining the coupled drift"; log "wrapper lines on $member about the credential:"; docker logs "$member" 2>&1 | grep -iE "recovery|root password|pin|drift" | tail -12; }
+  # Probe the member's local gr_recovery the way a peer does — over TCP from
+  # another member, encrypted as the group channel is — and keep the client's
+  # own words when it refuses, so a failure names its reason.
+  local peer_probe
+  peer_probe="$(docker exec "$other" mysql -h "$member" --ssl-mode=REQUIRED --connect-timeout=5 -ugr_recovery -p"$real_root" --batch --skip-column-names -e "SELECT 1" 2>&1 | tail -1)"
+  [ "$peer_probe" = "1" ] \
+    && ok "edited member's gr_recovery still authenticates the password the group enforces" \
+    || { bad "edited member's gr_recovery does not take the password the group enforces: ${peer_probe}"; sql "$member" "SELECT User, Host, plugin, account_locked, password_expired FROM mysql.user WHERE User='gr_recovery'" 2>&1 | head -5; }
+  peer_probe="$(docker exec "$other" mysql -h "$member" --ssl-mode=REQUIRED --connect-timeout=5 -ugr_recovery -p"rotated-by-variable-edit" --batch --skip-column-names -e "SELECT 1" 2>&1 | tail -1)"
+  if [ "$peer_probe" = "1" ]; then
+    bad "the edited (never-live) password authenticates gr_recovery on the rejoined member"
+  else
+    ok "the edited value never became a credential (${peer_probe})"
+  fi
+
+  sql "$primary" "INSERT INTO t.kv VALUES (21,'after-edit') ON DUPLICATE KEY UPDATE v='after-edit';"
+  wait_until 60 "write replicated to the rejoined member" \
+    bash -c '[ "$(docker exec '"$member"' mysql -uroot -p'"$real_root"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=21" 2>/dev/null)" = "after-edit" ]' \
+    && ok "rejoined member replicates writes" \
+    || bad "rejoined member is not receiving writes"
+  [ "$(sql "$other" "SELECT COUNT(*) FROM mysql.user WHERE User='gr_recovery' AND Host='%'")" = "1" ] \
+    && ok "untouched members are exactly as they were" \
+    || bad "an untouched member's recovery account changed"
+  REPL_PW="$real_repl"
+}
+
 t_sigterm_primary_demotes_before_exit() {
   log "t_sigterm_primary_demotes_before_exit (planned shutdown = switchover, not timeout failover)"
   teardown_trio
@@ -4179,7 +4251,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump t_coupled_password_edit_keeps_the_member_in_the_group)
 
 main() {
   ensure_image
