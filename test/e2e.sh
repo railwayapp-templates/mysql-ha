@@ -394,8 +394,22 @@ group_online_excluding() {
 }
 
 # wait_until <timeout-s> <description> <command...>
+#
+# The predicate runs in THIS shell, so a harness function is a valid predicate
+# (`wait_until 60 "..." group_is_fully_online mysql-1`). A predicate wrapped in
+# `bash -c` is a fresh process that inherits no shell functions: a harness
+# function called inside one is "command not found", the predicate is false on
+# every poll, and the wait burns its whole budget before reporting a timeout
+# that names the symptom instead of the cause (PR #74, run 34569526769: forty
+# `current_primary: command not found` lines, then "mysql-2 never became the
+# primary" on a switchover that had in fact completed). Resolve the predicate
+# once up front so that mistake fails immediately, and says what it is.
 wait_until() {
   local timeout="$1" desc="$2"; shift 2
+  if ! command -v "$1" >/dev/null 2>&1; then
+    log "BUG: wait_until predicate '$1' is not a command in this shell (waiting for: $desc)"
+    return 1
+  fi
   local waited=0
   until "$@"; do
     sleep 3
@@ -4179,7 +4193,123 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+# A cluster reverted to standalone keeps the root, and the root keeps
+# archiving into the archive its former peers wrote to. Every full it takes
+# from then on must declare the group history it contains: a restore that
+# picks such a full replays the peers' lineages too and relies on the server
+# to skip what the dump already holds. Production, 2026-09-11: the reverted
+# root dumped with gtid_mode=OFF, its full declared nothing, and a restore
+# past it replayed a peer's lineage again — `Duplicate entry '1' for key
+# 'pitrtest.PRIMARY'`. Shape reproduced here: a peer takes the full, the
+# root takes the primary back, the cluster is reverted, the reverted root
+# takes a full of its own, and a restore past that full holds every row once.
+t_pitr_ha_reverted_roots_full_declares_the_group_history() {
+  log "t_pitr_ha_reverted_roots_full_declares_the_group_history (a restore past the reverted root's own full replays no peer lineage twice)"
+  local restore=mysql-pitr-ha-revert-full-restore
+  pitr_ha_teardown "$restore"
+  start_minio || { bad "minio never became healthy"; return; }
+  local env
+  mapfile -t env < <(pitr_ha_archive_env /e2e-pitr-revert-full)
+  start_node 1 "${env[@]}"; start_node 2 "${env[@]}"; start_node 3 "${env[@]}"
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; return; }
+  wait_until 180 "initial full backup on $primary" \
+    bash -c 'docker logs '"$primary"' 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "the primary never completed an initial full backup"; dump_node_log "$primary"; return; }
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'in-group');"
+  local f1
+  f1="$(active_binlog "$primary")"
+  sql "$primary" "FLUSH BINARY LOGS;"
+  wait_uploaded "$primary" "$f1" || { bad "the first primary's binlog never shipped"; return; }
+
+  # A peer must hold a tenure of its own: hand the primary to one if the root
+  # took the full, write there, then hand it back to the root — the platform
+  # only reverts a cluster whose primary is the root.
+  local peer
+  if [ "$primary" = "mysql-1" ]; then
+    peer=mysql-2
+    [ "$(switchover_code mysql-1 "$peer")" = "200" ] || { bad "switchover to $peer refused"; return; }
+    peer_is_primary() { [ "$(current_primary mysql-3 mysql-1 mysql-2 mysql-3)" = "$peer" ]; }
+    wait_until 120 "$peer is the primary" peer_is_primary \
+      || { bad "$peer never became the primary"; return; }
+  else
+    peer="$primary"
+  fi
+  sql "$peer" "INSERT INTO t.kv VALUES (2,'peer-tenure');"
+  local f2
+  f2="$(active_binlog "$peer")"
+  sql "$peer" "FLUSH BINARY LOGS;"
+  wait_uploaded "$peer" "$f2" || { bad "the peer tenure's binlog never shipped"; return; }
+  [ "$(switchover_code "$peer" mysql-1)" = "200" ] || { bad "switchover back to the root refused"; return; }
+  root_is_primary() { [ "$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" = "mysql-1" ]; }
+  wait_until 120 "the root is the primary again" root_is_primary \
+    || { bad "the root never took the primary back"; return; }
+  sql mysql-1 "INSERT INTO t.kv VALUES (3,'root-tenure');"
+  local f3
+  f3="$(active_binlog mysql-1)"
+  sql mysql-1 "FLUSH BINARY LOGS;"
+  wait_uploaded mysql-1 "$f3" || { bad "the root tenure's binlog never shipped"; return; }
+  ok "three tenures archived: $primary took the full, $peer and mysql-1 wrote after it"
+
+  # Revert: the peers are deleted, the root boots standalone on its volume
+  # with the HA variables stripped and the archive contract kept — on a short
+  # full-backup cadence, so it takes a full of its own within the scenario.
+  docker rm -f mysql-2 mysql-3 >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-2 mysql-ha-e2e-vol-3 >/dev/null 2>&1
+  docker rm -f mysql-1 >/dev/null 2>&1
+  start_reverted_node 1 "${env[@]}" -e RAILWAY_SERVICE_ID="svc-mysql-1" -e BINLOG_FULL_BACKUP_INTERVAL_SECONDS=20
+  wait_until 240 "reverted root up standalone" \
+    bash -c 'docker exec mysql-1 wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "the reverted root never came up standalone"; dump_node_log mysql-1; return; }
+  wait_until 180 "the reverted root took a full of its own" \
+    bash -c 'docker logs mysql-1 2>&1 | grep -q "full backup completed"' \
+    || { bad "the reverted root took no full"; dump_node_log mysql-1; return; }
+  local uuid1 meta
+  uuid1="$(sql mysql-1 "SELECT @@server_uuid")"
+  meta="$(mc_find_keys "e2e-pitr-revert-full/server-$uuid1/full/" | grep '\.meta\.json$' | sort | tail -1)"
+  [ -n "$meta" ] || { bad "no full under the reverted root's lineage"; return; }
+  local gtid_purged
+  gtid_purged="$(mc_cat_key "$meta" | grep -o '"gtid_purged":[^,}]*')"
+  if printf '%s' "$gtid_purged" | grep -qE '"gtid_purged": ?"[0-9a-f-]{36}:' ; then
+    ok "the reverted root's full declares the history it contains ($gtid_purged)"
+  else
+    bad "the reverted root's full declares no GTID set ($gtid_purged) — a restore past it replays the peers' lineages again"
+    return
+  fi
+
+  sql mysql-1 "INSERT INTO t.kv VALUES (4,'after-revert');"
+  sleep 2
+  local t
+  t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  log "captured T=$t (four rows across three tenures and the revert before it)"
+  sleep 2
+  sql mysql-1 "INSERT INTO t.kv VALUES (5,'after-t');"
+  local f4
+  f4="$(active_binlog mysql-1)"
+  sql mysql-1 "FLUSH BINARY LOGS;"
+  wait_uploaded mysql-1 "$f4" 120 || { bad "the standalone tenure's binlog never shipped"; dump_node_log mysql-1; return; }
+
+  local renv
+  mapfile -t renv < <(pitr_recover_env /e2e-pitr-revert-full "$t")
+  start_standalone "$restore" "${renv[@]}"
+  wait_until 240 "restore past the reverted root's full completed and serving" \
+    bash -c 'docker exec '"$restore"' wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a restore past the reverted root's own full did not complete"; dump_node_log "$restore"; return; }
+  local dump="${meta%.meta.json}.sql.gz"
+  docker logs "$restore" 2>&1 | grep '"selected full backup for restore"' | grep -qF "$dump" \
+    && ok "the restore started from the reverted root's own full" \
+    || bad "the restore did not start from the reverted root's full ($(docker logs "$restore" 2>&1 | grep -o '"dump_key":"[^"]*"' | tail -1))"
+  [ "$(sql "$restore" "SELECT v FROM t.kv WHERE k=1")" = "in-group" ] && ok "first tenure row restored" || bad "first tenure row missing"
+  [ "$(sql "$restore" "SELECT v FROM t.kv WHERE k=2")" = "peer-tenure" ] && ok "peer tenure row restored" || bad "peer tenure row missing"
+  [ "$(sql "$restore" "SELECT v FROM t.kv WHERE k=3")" = "root-tenure" ] && ok "root tenure row restored" || bad "root tenure row missing"
+  [ "$(sql "$restore" "SELECT v FROM t.kv WHERE k=4")" = "after-revert" ] && ok "standalone tenure row restored" || bad "standalone tenure row missing"
+  [ -z "$(sql "$restore" "SELECT v FROM t.kv WHERE k=5")" ] && ok "row after T absent" || bad "row after T present"
+  [ "$(sql "$restore" "SELECT COUNT(*) FROM t.kv")" = "4" ] && ok "every row exactly once (4)" || bad "row count is not 4: $(sql "$restore" "SELECT COUNT(*) FROM t.kv")"
+  pitr_ha_teardown "$restore"
+}
+
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump t_pitr_ha_reverted_roots_full_declares_the_group_history)
 
 main() {
   ensure_image

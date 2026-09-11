@@ -100,28 +100,23 @@ const SCRATCH_DIR: &str = ".pitr_restore_binlogs";
 /// shared GTID history (see the module doc). Replaying another lineage
 /// relies on the server skipping GTIDs it already holds, so the phase runs
 /// with GTIDs on; enforce_gtid_consistency=ON is what any gtid_mode above
-/// OFF_PERMISSIVE requires. Which gtid_mode depends on the selected full:
+/// OFF_PERMISSIVE requires.
 ///
-///   - A GTID full (its meta carries `gtid_purged`) loads a dump that sets
-///     `@@GLOBAL.GTID_PURGED`, and everything replayed after it is GTID
-///     binlogs (its own lineage from the dump coordinate onward, other
-///     members' lineages) — `gtid_mode=ON`, the mode GTID_PURGED is
-///     documented to load under, and the strictest.
-///   - An anonymous full (a standalone server later converted to HA; the
-///     archive is shared only by the marker) has no GTID set to load, and
-///     its own lineage continues with anonymous binlogs BEFORE the GTID ones
-///     begin — only `ON_PERMISSIVE` accepts both in one replay.
+/// `ON_PERMISSIVE`, never `ON`: a shared archive can hold anonymous
+/// transactions next to GTID ones, and only ON_PERMISSIVE replays both in
+/// one pass. A standalone converted to HA has anonymous binlogs before its
+/// GTID ones begin; a member reverted to standalone by an image that did not
+/// keep GTIDs on for it (see mysql_conf.rs) wrote anonymous binlogs AFTER a
+/// GTID full. Under `ON` the second shape died half-way (`ERROR 1782:
+/// GTID_NEXT cannot be set to ANONYMOUS when GTID_MODE = ON`, 2026-09-11).
+/// ON_PERMISSIVE still loads the dump's `GTID_PURGED` (only `OFF` refuses
+/// that) and still skips every GTID the server already holds.
 ///
 /// Restore-phase only: the serving mysqld main.rs starts afterwards is
 /// spawned with the service's own args.
-fn shared_history_restore_args(full: &FullBackupRef) -> [String; 2] {
-    let gtid_mode = if full.meta.gtid_purged.is_some() {
-        "ON"
-    } else {
-        "ON_PERMISSIVE"
-    };
+fn shared_history_restore_args() -> [String; 2] {
     [
-        format!("--gtid-mode={gtid_mode}"),
+        "--gtid-mode=ON_PERMISSIVE".to_string(),
         "--enforce-gtid-consistency=ON".to_string(),
     ]
 }
@@ -552,7 +547,7 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
     // (replica_max_allowed_packet); the clients below ask for the same.
     args.push(format!("--max-allowed-packet={MAX_ALLOWED_PACKET}"));
     if shared_history {
-        let gtid_args = shared_history_restore_args(&full);
+        let gtid_args = shared_history_restore_args();
         info!(
             gtid_args = ?gtid_args,
             "the archive is one shared GTID history (Group Replication); the restore-phase \
