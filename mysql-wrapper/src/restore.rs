@@ -168,8 +168,9 @@ pub struct RestoreMarker {
 /// dump and downloading the binlog run again — until someone deleted the
 /// fork. Three attempts cover a transient (a bucket blip, a client dropping
 /// mid-load) without turning a refused restore into a standing egress bill;
-/// the workflow that started the restore fails on the FIRST verdict anyway
-/// (mono #38619), so nothing waits on the later ones.
+/// the workflow that started the restore reads the verdict line's `attempt`
+/// / `max_attempts` (and waits out a retry it sees starting) before it calls
+/// a `failed` attempt the restore's outcome.
 pub const MAX_RESTORE_ATTEMPTS: u32 = 3;
 
 /// How many attempts the marker on this volume records so far (0 when there
@@ -377,7 +378,9 @@ fn write_restore_marker(
 /// `Config::restore_enabled()` and the datadir is still uninitialized.
 /// `run`, plus the one line the platform reads. Every attempt ends with a
 /// `point-in-time restore verdict` record — `verdict` completed/refused/failed,
-/// `kind` for refusals, `reason`, `elapsed_seconds` — and a refused or failed
+/// `kind` for refusals, `reason`, `elapsed_seconds`, `attempt` and
+/// `max_attempts` (so a `failed` line the next boot retries is told apart
+/// from the last one) — and a refused or failed
 /// attempt leaves its reason in the marker for the next boot to repeat. The
 /// fork's deployment turns healthy the moment its container is up, so this
 /// line is what tells anyone outside the container how the restore went.
@@ -409,7 +412,13 @@ fn with_said(what: &str, said: &str) -> String {
 
 pub async fn run_reporting(config: &Config) -> Result<()> {
     let started = std::time::Instant::now();
-    match run(config, started).await {
+    // Which attempt this is, counted before the run bumps the marker: the
+    // verdict line says so, and how many the wrapper makes in all, so whoever
+    // reads it can tell a failure the next boot retries from the last one.
+    // The platform's restore workflow used to fail on the FIRST `failed`
+    // verdict while the retry, seconds later, completed the restore.
+    let attempt = recorded_attempts(&config.data_dir) + 1;
+    match run(config, started, attempt).await {
         Ok(()) => Ok(()),
         Err(e) => {
             let (verdict, kind) = classify_restore_error(&e);
@@ -421,6 +430,8 @@ pub async fn run_reporting(config: &Config) -> Result<()> {
                 reason = %reason,
                 target = ?target.map(pitr::format_rfc3339_millis),
                 elapsed_seconds = started.elapsed().as_secs(),
+                attempt,
+                max_attempts = MAX_RESTORE_ATTEMPTS,
                 "point-in-time restore verdict"
             );
             if let Some(target) = target {
@@ -440,7 +451,7 @@ pub async fn run_reporting(config: &Config) -> Result<()> {
     }
 }
 
-pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
+pub async fn run(config: &Config, started: std::time::Instant, attempt: u32) -> Result<()> {
     let data_dir = config.data_dir.clone();
     let target = config
         .recovery_target_time()
@@ -632,6 +643,8 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
         target = %pitr::format_rfc3339_millis(target),
         achieved = %pitr::format_rfc3339_millis(achieved),
         elapsed_seconds = started.elapsed().as_secs(),
+        attempt,
+        max_attempts = MAX_RESTORE_ATTEMPTS,
         "point-in-time restore verdict"
     );
     Ok(())
