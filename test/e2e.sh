@@ -608,9 +608,28 @@ seed_adopted_volume() {
 t_fresh_members_wait_for_a_seed_they_never_met() {
   local t=t_fresh_members_wait_for_a_seed_they_never_met
   log "$t"
+  # Same discipline as t_deleted_peer_unfences_bootstrap: clear whatever trio
+  # is live under its REAL identity before switching NODE_SUFFIX, or the
+  # teardown below targets the wrong names and leaves that trio running.
   teardown_trio
-  seed_adopted_volume 1 || { bad "$t" "standalone seed never came up"; return; }
-  ok "adopted volume seeded for mysql-1 (binlog off, 1 row of base data)"
+  # The gate under test only engages once a peer's name is PROVABLY gone: the
+  # probe answers Gone on an authoritative NXDOMAIN and on nothing else
+  # (dns_probe.rs — RCODE 3 is Gone, every other rcode, NODATA, SERVFAIL and
+  # timeout are ExistsOrUnknown, which keeps the fence up for a reason that
+  # has nothing to do with waiving). A bare docker name that was never
+  # registered is forwarded upstream and comes back as one of those, so the
+  # fresh pair would hold for the trivial reason and the scenario would prove
+  # nothing. Names under the reserved .invalid TLD (RFC 2606) are guaranteed
+  # NXDOMAIN, so the live pair still resolves through its docker alias while
+  # the root that never starts is deletion-proven — the exact state a node
+  # that MAY waive acts on, which is what makes a fresh node's refusal to
+  # waive meaningful. Same device as the two waiver scenarios below.
+  local NODE_SUFFIX=".fs.e2e.invalid"
+  local SEEDS="mysql-1$NODE_SUFFIX:3306,mysql-2$NODE_SUFFIX:3306,mysql-3$NODE_SUFFIX:3306"
+  local n1="mysql-1$NODE_SUFFIX" n2="mysql-2$NODE_SUFFIX" n3="mysql-3$NODE_SUFFIX"
+
+  seed_adopted_volume 1 || { bad "$t" "standalone seed never came up"; teardown_trio; return; }
+  ok "adopted volume seeded for $n1 (binlog off, 1 row of base data)"
 
   # The root never starts; the fresh pair sees its name authoritatively gone.
   start_node 2 -e PEER_GONE_DWELL_SECONDS=20
@@ -618,33 +637,33 @@ t_fresh_members_wait_for_a_seed_they_never_met() {
   # A fresh node initialises its datadir before it probes anyone; CI takes
   # minutes for that, so the budget is the same as the other fresh-node waits.
   wait_until 300 "fresh pair sees the root's name gone" \
-    bash -c 'docker logs mysql-2 2>&1 | grep -q "authoritatively gone"' \
-    || { bad "$t" "mysql-2 never noticed the root's name was gone"; dump_node_log mysql-2; return; }
+    node_logged "$n2" "authoritatively gone" \
+    || { bad "$t" "$n2 never noticed the root's name was gone"; dump_node_log "$n2"; teardown_trio; return; }
   # Past the dwell (20 s) with a wide margin: no waiver, no bootstrap.
   sleep 75
-  if any_role_200 mysql-2 mysql-2 mysql-3; then
+  if any_role_200 "$n2" "$n2" "$n3"; then
     bad "$t" "the fresh pair bootstrapped a group WITHOUT the adopted root — the empty group the customer saw on 2026-09-08"
   else
     ok "fresh pair holds: no primary without the adopted root, well past the dwell"
   fi
-  node_logged mysql-2 "has never been a group member" \
-    && ok "mysql-2 said why it is not waiving the gone peer" \
-    || bad "$t" "mysql-2 did not log the never-a-member reason for holding"
-  node_logged mysql-2 "bootstrapping a new group" \
-    && bad "$t" "mysql-2 bootstrapped a group while the adopted root was absent" \
-    || ok "mysql-2 never bootstrapped"
+  node_logged "$n2" "has never been a group member" \
+    && ok "$n2 said why it is not waiving the gone peer" \
+    || bad "$t" "$n2 did not log the never-a-member reason for holding"
+  node_logged "$n2" "bootstrapping a new group" \
+    && bad "$t" "$n2 bootstrapped a group while the adopted root was absent" \
+    || ok "$n2 never bootstrapped"
 
   # The root arrives: the group forms around ITS data.
   start_node 1
-  wait_until 500 "group fully ONLINE around the adopted root" group_is_fully_online mysql-1 \
-    || { bad "$t" "group never formed once the adopted root arrived"; return; }
+  wait_until 500 "group fully ONLINE around the adopted root" group_is_fully_online "$n1" \
+    || { bad "$t" "group never formed once the adopted root arrived"; dump_node_log "$n1"; teardown_trio; return; }
   local v
-  v="$(sql mysql-3 "SELECT v FROM railway.legacy WHERE id=1")"
+  v="$(sql "$n3" "SELECT v FROM railway.legacy WHERE id=1")"
   [ "$v" = "pre-conversion" ] \
     && ok "the adopted base data reached a fresh member (cloned, not skipped)" \
     || bad "$t" "fresh member is missing the adopted base data (got: '$v')"
   local primary
-  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)"
+  primary="$(current_primary "$n2" "$n1" "$n2" "$n3")"
   [ -n "$primary" ] && ok "one primary after the root arrived ($primary)" || bad "$t" "no primary after the root arrived"
   teardown_trio
 }

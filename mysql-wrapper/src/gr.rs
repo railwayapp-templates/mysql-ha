@@ -1385,6 +1385,7 @@ pub async fn orchestrate(
     let mut gone_tracker = GoneTracker::new();
     let mut last_waiver_note = String::new();
     let mut last_never_member_note = String::new();
+    let mut last_unproven_gone_note = String::new();
     let mut adopted_refusal_reported = false;
     let gone_dwell = Duration::from_secs(config.peer_gone_dwell_seconds);
     let dns_deadline = Duration::from_millis(config.peer_query_timeout_ms);
@@ -1464,6 +1465,7 @@ pub async fn orchestrate(
         let may_waive = read_group_name_marker(&config.data_dir).is_some()
             || has_pre_gtid_data(&config.data_dir);
         let mut never_member_holds: Vec<&String> = Vec::new();
+        let mut unproven_gone: Vec<String> = Vec::new();
         for (host, answer) in &answers {
             if matches!(answer, PeerAnswer::Unreachable) {
                 let (verdict, detail) = probe_name_detailed(host, dns_deadline).await;
@@ -1477,10 +1479,31 @@ pub async fn orchestrate(
                     );
                 } else if verdict == NameVerdict::Gone && !may_waive {
                     never_member_holds.push(host);
+                } else if verdict == NameVerdict::ExistsOrUnknown {
+                    unproven_gone.push(format!("{host} ({detail:?})"));
                 }
             } else {
                 gone_tracker.observe_reachable(host);
             }
+        }
+        // An unreachable peer whose name is NOT provably gone is the ordinary
+        // case — a deploy in flight, a resolver hiccup — and the fence stays
+        // up for that reason alone, nothing to do with the waiver. Say so
+        // once per change: without this line a node waiting on a name that
+        // never NXDOMAINs logs nothing at all after its first wait reason,
+        // and the only readable state is silence.
+        let unproven_note = if unproven_gone.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "unreachable peers whose names are not provably gone: {unproven_gone:?} — waiting for them (only an authoritative NXDOMAIN across the whole dwell can retire a peer)"
+            )
+        };
+        if last_unproven_gone_note != unproven_note {
+            if !unproven_note.is_empty() {
+                info!("{unproven_note}");
+            }
+            last_unproven_gone_note = unproven_note;
         }
         let never_member_note = if never_member_holds.is_empty() {
             String::new()
