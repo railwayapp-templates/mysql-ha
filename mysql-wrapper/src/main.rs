@@ -61,7 +61,7 @@ use common::{init_logging, Telemetry, TelemetryEvent};
 use config::Config;
 use health_server::AppState;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -199,7 +199,27 @@ async fn main() -> Result<()> {
 
     // Behind /pitr in both modes; the archiver (or its role supervisor)
     // writes it, the health server reads it.
-    let pitr_status = archiver::PitrStatus::new(config.archive_enabled());
+    let pitr_status = archiver::PitrStatus::new(config.archive_configured());
+    // The archive contract is present but unusable (a sibling missing, a
+    // malformed bucket or endpoint): archiving is off for this boot and
+    // mysqld serves exactly as it would without the contract. Loud and where
+    // the platform reads it — the log, telemetry, and /pitr's last_error (the
+    // field the PITR monitor's banner and the enable workflow read) — never
+    // fatal: a bad archive setting may cost the customer their backups, not
+    // their database.
+    if let Some(reason) = config.archive_refusal.as_deref() {
+        error!(
+            reason,
+            "PITR archiving refused: the archive configuration is not usable; archiving is \
+             disabled for this boot, mysqld is unaffected. Fix the variable named and redeploy"
+        );
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "mysql-wrapper".to_string(),
+            error: reason.to_string(),
+            context: "pitr_archive_config".to_string(),
+        });
+        pitr_status.note_refusal(reason);
+    }
 
     let mut boot_note = None;
     if config.gr_enabled() {

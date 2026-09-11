@@ -2182,6 +2182,97 @@ t_pitr_archive_root_belongs_to_one_service() {
 # is a bare "unhandled error". The status must still say what happened: the
 # HTTP status the service answered with, and the cause chain, not just the
 # outermost "HEAD binlog/owner.json" (prod harness, 2026-09-11 02:04Z).
+# A malformed archive variable never takes the database down. The archive
+# contract's two failure modes that used to be boot-fatal — a missing sibling
+# and a malformed shape (a bare host as the endpoint, the pgBackRest
+# convention) — now leave mysqld serving exactly as without the contract,
+# archiving off for the boot, and the reason where the platform already reads
+# archive trouble: /pitr's last_error (the field the PITR monitor's credential
+# banner reads), the log, telemetry. The restore side judges the recover-from
+# shape where a restore runs: a fork with a bare-host recover endpoint ends
+# its attempt with a refused/recover-config verdict naming the variable — not
+# a boot that never reaches a verdict.
+t_pitr_malformed_archive_config_refuses_archiving_not_the_database() {
+  log "t_pitr_malformed_archive_config_refuses_archiving_not_the_database"
+  docker rm -f mysql-pitr-badshape mysql-pitr-nosibling mysql-pitr-badshape-restore >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-badshape mysql-ha-e2e-vol-mysql-pitr-nosibling mysql-ha-e2e-vol-mysql-pitr-badshape-restore >/dev/null 2>&1
+
+  # (a) malformed shape: a bare host as the endpoint.
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-badshape"
+  )
+  start_standalone mysql-pitr-badshape "${archive_env[@]}"
+  # (b) missing sibling: only the bucket.
+  start_standalone mysql-pitr-nosibling -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+
+  wait_until 120 "node serves mysqld regardless of the malformed archive endpoint" \
+    bash -c 'docker exec mysql-pitr-badshape wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a malformed archive endpoint must not take the database down"; docker logs mysql-pitr-badshape 2>&1 | tail -40; return; }
+  sql mysql-pitr-badshape "CREATE DATABASE t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1, 'served');" \
+    && [ "$(sql mysql-pitr-badshape "SELECT v FROM t.kv WHERE k=1")" = "served" ] \
+    && ok "the database serves and accepts writes with a malformed archive endpoint" \
+    || { bad "the database did not accept a write with a malformed archive endpoint"; docker logs mysql-pitr-badshape 2>&1 | tail -40; return; }
+
+  local last_error
+  last_error="$(pitr_field mysql-pitr-badshape mysql-pitr-badshape last_error)"
+  log "last_error: $last_error"
+  printf '%s' "$last_error" | grep -q 'BINLOG_ARCHIVE_ENDPOINT' \
+    && printf '%s' "$last_error" | grep -q 'https://mysql-ha-e2e-minio:9000' \
+    && ok "/pitr names the malformed variable and the fix in last_error (the field the monitor's banner reads)" \
+    || bad "/pitr's last_error does not name BINLOG_ARCHIVE_ENDPOINT and the fix: '$last_error'"
+  local configured archiving
+  configured="$(pitr_field mysql-pitr-badshape mysql-pitr-badshape archive_configured)"
+  archiving="$(pitr_field mysql-pitr-badshape mysql-pitr-badshape archiving)"
+  [ "$configured" = "true" ] && [ "$archiving" = "false" ] \
+    && ok "/pitr reports the contract present (archive_configured=true) and archiving off" \
+    || bad "/pitr should report archive_configured=true archiving=false; got configured=$configured archiving=$archiving"
+  docker logs mysql-pitr-badshape 2>&1 | grep -q '"message":"PITR archiving refused' \
+    && ok "the refusal is logged" \
+    || bad "no 'PITR archiving refused' log line on the malformed-endpoint node"
+  docker logs mysql-pitr-badshape 2>&1 | grep -qE 'initial full backup|binlog uploaded|building the PITR' \
+    && bad "the archiver ran against a malformed endpoint" \
+    || ok "the archiver never started against the malformed endpoint"
+
+  wait_until 120 "node serves mysqld with only BINLOG_ARCHIVE_BUCKET set" \
+    bash -c 'docker exec mysql-pitr-nosibling wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a missing archive sibling must not take the database down"; docker logs mysql-pitr-nosibling 2>&1 | tail -40; return; }
+  [ "$(sql mysql-pitr-nosibling "SELECT 1")" = "1" ] \
+    && ok "the database answers queries with a missing archive sibling" \
+    || bad "the database did not answer with a missing archive sibling"
+  last_error="$(pitr_field mysql-pitr-nosibling mysql-pitr-nosibling last_error)"
+  printf '%s' "$last_error" | grep -q 'BINLOG_ARCHIVE_KEY' \
+    && ok "/pitr names the missing sibling (BINLOG_ARCHIVE_KEY) in last_error" \
+    || bad "/pitr's last_error does not name the missing sibling: '$last_error'"
+
+  # Restore side: the recover-from shape is judged on the fork that restores,
+  # as a verdict the platform reads (kind is free text, reason verbatim).
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-badshape"
+    -e "MYSQL_RECOVERY_TARGET_TIME=2026-01-01T00:00:00.000Z"
+  )
+  start_standalone mysql-pitr-badshape-restore "${recover_env[@]}"
+  wait_until 120 "refused/recover-config verdict for a bare-host recover endpoint" \
+    bash -c 'docker logs mysql-pitr-badshape-restore 2>&1 | grep "\"message\":\"point-in-time restore verdict\"" | grep "\"verdict\":\"refused\"" | grep -q "\"kind\":\"recover-config\""' \
+    && ok "a bare-host BINLOG_RECOVER_FROM_ENDPOINT ends the attempt with a refused/recover-config verdict" \
+    || { bad "no refused/recover-config verdict for a bare-host recover endpoint"; docker logs mysql-pitr-badshape-restore 2>&1 | tail -30; }
+  docker logs mysql-pitr-badshape-restore 2>&1 | grep '"kind":"recover-config"' | grep -q 'BINLOG_RECOVER_FROM_ENDPOINT' \
+    && ok "the recover-config verdict names BINLOG_RECOVER_FROM_ENDPOINT" \
+    || bad "the recover-config verdict does not name the variable"
+
+  docker rm -f mysql-pitr-badshape mysql-pitr-nosibling mysql-pitr-badshape-restore >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-badshape mysql-ha-e2e-vol-mysql-pitr-nosibling mysql-ha-e2e-vol-mysql-pitr-badshape-restore >/dev/null 2>&1
+}
+
 t_pitr_rejected_credentials_are_named_in_status() {
   log "t_pitr_rejected_credentials_are_named_in_status"
   docker rm -f mysql-pitr-badcred mysql-ha-e2e-minio >/dev/null 2>&1
@@ -3330,10 +3421,22 @@ dump_node_log() {
 # pitr_field <from-node> <target-node> <json-field> — one field of the
 # target's /pitr (archiver status). Bare value: `true`/`false`/`null` or the
 # quoted string. Empty on any unreachable/non-200 answer.
+# pitr_field <exec-node> <target-host> <field> — one field of the target's
+# /pitr, decoded as JSON: a string value is printed as is (commas, quotes and
+# escapes included — the old `[^,}]*` grep cut a last_error off at its first
+# comma), other values in their JSON spelling (true/false/null/numbers).
 pitr_field() {
   local body
   body="$(docker exec "$1" wget -q -O - "http://$2:8080/pitr" 2>/dev/null)" || return 0
-  echo "$body" | grep -o "\"$3\":[^,}]*" | head -1 | cut -d: -f2- | tr -d '"'
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+v = d.get(sys.argv[1])
+print(v if isinstance(v, str) else json.dumps(v))
+' "$3"
 }
 
 # active_binlog <node> — the name of the node's ACTIVE binlog file: the file
@@ -4179,7 +4282,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_malformed_archive_config_refuses_archiving_not_the_database t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
 
 main() {
   ensure_image

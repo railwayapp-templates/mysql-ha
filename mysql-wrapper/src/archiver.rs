@@ -151,6 +151,16 @@ impl PitrStatus {
         }
     }
 
+    /// The archive contract is present but cannot be used this boot (a
+    /// missing sibling, a malformed bucket or endpoint — `Config::
+    /// archive_refusal`). Recorded where the platform already reads archive
+    /// trouble: the monitor's credential banner and the e2e harness read
+    /// `last_error` off `/pitr`. `archiving` stays false.
+    pub fn note_refusal(&self, reason: &str) {
+        let text = reason.to_string();
+        self.update(|s| s.last_error = Some(text));
+    }
+
     fn note_error(&self, error: &anyhow::Error) {
         // The whole chain — the operation that failed AND why. The outermost
         // context alone ("HEAD binlog/owner.json") says nothing about a
