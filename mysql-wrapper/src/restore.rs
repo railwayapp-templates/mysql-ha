@@ -205,6 +205,26 @@ fn refusal(kind: &'static str, reason: String) -> anyhow::Error {
     anyhow::Error::new(RestoreRefusal { kind, reason })
 }
 
+/// A recover-from location the S3 client cannot dial or that would land in
+/// the wrong place — a bare-host `BINLOG_RECOVER_FROM_ENDPOINT` (the SDK fails
+/// every request with a construction error that names no variable) or a
+/// `BINLOG_RECOVER_FROM_BUCKET` carrying a slash (a key prefix inside some
+/// other bucket under path-style addressing). Judged here, on the fork that
+/// is about to restore, never at boot: a serving database that still carries
+/// its fork's recover variables is not this path's business. A `recover-config`
+/// refusal, so the verdict line and the marker name the variable and the fix.
+pub(crate) fn recover_config_refusal(location: &crate::pitr::S3Location) -> Result<()> {
+    for check in [
+        crate::config::check_bucket_shape("BINLOG_RECOVER_FROM_BUCKET", &location.bucket),
+        crate::config::check_endpoint_shape("BINLOG_RECOVER_FROM_ENDPOINT", &location.endpoint),
+    ] {
+        if let Err(e) = check {
+            return Err(refusal("recover-config", e.to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// (verdict, kind) for the terminal log line and the marker. A refusal keeps
 /// its kind through any `.context(..)` layers on the way out.
 pub fn classify_restore_error(e: &anyhow::Error) -> (&'static str, &'static str) {
@@ -450,6 +470,7 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
     let location = config
         .restore_s3_location()
         .expect("restore::run is only called when Config::restore_enabled()");
+    recover_config_refusal(&location)?;
     let s3 = S3Client::new(&location)
         .await
         .context("building the PITR restore S3 client")?;
@@ -1566,6 +1587,39 @@ mod tests {
         // Target one second past: the missing file may hold it → refused,
         // however small the distance (no rotation tolerance across a hole).
         assert!(gap_blocks_target(last, last + chrono::Duration::seconds(1)));
+    }
+
+    #[test]
+    fn a_malformed_recover_location_is_a_recover_config_refusal() {
+        let good = crate::pitr::S3Location {
+            bucket: "src-bucket".to_string(),
+            access_key: "ak".to_string(),
+            secret_key: "sk".to_string(),
+            region: "auto".to_string(),
+            endpoint: "https://s3.example.com".to_string(),
+            path: "/binlog".to_string(),
+        };
+        assert!(recover_config_refusal(&good).is_ok());
+
+        let bare_host = crate::pitr::S3Location {
+            endpoint: "s3.example.com".to_string(),
+            ..good.clone()
+        };
+        let e = recover_config_refusal(&bare_host).err().expect("refused");
+        assert_eq!(classify_restore_error(&e), ("refused", "recover-config"));
+        let text = format!("{e:#}");
+        assert!(text.contains("BINLOG_RECOVER_FROM_ENDPOINT"), "{text}");
+        assert!(text.contains("https://s3.example.com"), "{text}");
+
+        let prefixed_bucket = crate::pitr::S3Location {
+            bucket: "src/bucket".to_string(),
+            ..good
+        };
+        let e = recover_config_refusal(&prefixed_bucket)
+            .err()
+            .expect("refused");
+        assert_eq!(classify_restore_error(&e), ("refused", "recover-config"));
+        assert!(format!("{e:#}").contains("BINLOG_RECOVER_FROM_PATH"));
     }
 
     #[test]

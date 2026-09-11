@@ -2944,6 +2944,7 @@ mod tests {
             binlog_archive_region: None,
             binlog_archive_endpoint: None,
             binlog_archive_path: "/binlog".to_string(),
+            archive_refusal: None,
             binlog_full_backup_interval_seconds: 86_400,
             binlog_rotate_interval_seconds: 60,
             binlog_retention_days: None,
