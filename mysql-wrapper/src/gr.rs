@@ -1384,6 +1384,8 @@ pub async fn orchestrate(
     let mut last_wait_reason = String::new();
     let mut gone_tracker = GoneTracker::new();
     let mut last_waiver_note = String::new();
+    let mut last_never_member_note = String::new();
+    let mut adopted_refusal_reported = false;
     let gone_dwell = Duration::from_secs(config.peer_gone_dwell_seconds);
     let dns_deadline = Duration::from_millis(config.peer_query_timeout_ms);
 
@@ -1450,6 +1452,18 @@ pub async fn orchestrate(
         // resolver; only continuous NXDOMAIN across the whole dwell earns a
         // waiver (see GoneTracker). Reachable peers reset their clock.
         let now = Instant::now();
+        // Who may waive a gone peer: a node that has been a group member
+        // (persisted group name) or one that holds data of its own (an
+        // adopted volume). A FRESH node that has never met any peer cannot
+        // tell a deleted peer from one whose deploy is failing, and it has
+        // nothing to lose by waiting — while the peer it would waive may
+        // hold the only copy of the customer's data. 2026-09-08, production:
+        // a converted root's deploy failed on registry credentials, the two
+        // fresh replicas waited out the dwell, waived it and bootstrapped an
+        // EMPTY group, which the edge then served for two days.
+        let may_waive = read_group_name_marker(&config.data_dir).is_some()
+            || has_pre_gtid_data(&config.data_dir);
+        let mut never_member_holds: Vec<&String> = Vec::new();
         for (host, answer) in &answers {
             if matches!(answer, PeerAnswer::Unreachable) {
                 let (verdict, detail) = probe_name_detailed(host, dns_deadline).await;
@@ -1461,15 +1475,31 @@ pub async fn orchestrate(
                         dwell = ?gone_dwell,
                         "unreachable peer's name is authoritatively gone; will stop waiting on it if this persists for the whole dwell"
                     );
+                } else if verdict == NameVerdict::Gone && !may_waive {
+                    never_member_holds.push(host);
                 }
             } else {
                 gone_tracker.observe_reachable(host);
             }
         }
+        let never_member_note = if never_member_holds.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "peers {never_member_holds:?} are gone past the dwell, but this node has never been a group member and holds no data of its own: not waiving them — a declared seed that never came up may hold the only copy of the data (an adopted volume whose deploy is failing); waiting for it"
+            )
+        };
+        if last_never_member_note != never_member_note {
+            if !never_member_note.is_empty() {
+                warn!("{never_member_note}");
+            }
+            last_never_member_note = never_member_note;
+        }
         let waived: Vec<&String> = answers
             .iter()
             .filter(|(host, answer)| {
-                matches!(answer, PeerAnswer::Unreachable)
+                may_waive
+                    && matches!(answer, PeerAnswer::Unreachable)
                     && gone_tracker.is_waived(host, now, gone_dwell)
             })
             .map(|(host, _)| host)
@@ -1699,15 +1729,51 @@ pub async fn orchestrate(
                 }
             }
 
+            let group_has_pre_gtid_data = answers.iter().any(
+                |(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active && s.pre_gtid_data),
+            );
+            let i_hold_pre_gtid_data = has_pre_gtid_data(&config.data_dir);
+
+            // Adopted-data guard: this node holds base data that predates any
+            // GTID history (an adopted standalone volume) and the live group
+            // carries no trace of such data — it formed WITHOUT this node (a
+            // fresh pair past a waiver while this deploy was failing, or a
+            // foreign group at the same seeds). Joining would be the worst of
+            // both worlds: binlog recovery hides the base data behind an empty
+            // primary, and any conflict during recovery walks the stuck-member
+            // self-heal into recloning this datadir off that empty group.
+            // Refuse, loud, every pass: the data stays put, fenced, and the
+            // operator decides which history wins — the group formed without
+            // this node's data, not the other way round.
+            if i_hold_pre_gtid_data && !group_has_pre_gtid_data {
+                let live_peers: Vec<&String> = answers
+                    .iter()
+                    .filter(|(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active))
+                    .map(|(h, _)| h)
+                    .collect();
+                if !adopted_refusal_reported {
+                    error!(
+                        ?live_peers,
+                        "refusing to join: this volume holds data that predates any GTID history and the live group carries no trace of it — the group formed without this node; joining would hide this data behind an empty primary or reclone it away. Delete the members that formed without it and redeploy this service to seed the group from its data, or revert the cluster to standalone"
+                    );
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "mysql-wrapper".to_string(),
+                        error: format!(
+                            "adopted volume refused to join a group that formed without its data (live peers {live_peers:?})"
+                        ),
+                        context: "adopted_data_guard".to_string(),
+                    });
+                    adopted_refusal_reported = true;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+
             // Clone-first path: the group carries data that predates its
             // GTID history (adopted standalone volume), and this node has no
             // GTID history of its own to prove it holds that base data.
             // Binlog-based recovery would join "successfully" while silently
             // skipping everything that was never binlogged — clone instead.
-            let group_has_pre_gtid_data = answers.iter().any(
-                |(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active && s.pre_gtid_data),
-            );
-            let i_hold_pre_gtid_data = has_pre_gtid_data(&config.data_dir);
             // Fail closed: my_gtid_now collapsed a read error to empty above,
             // so an unreadable local GTID set clones rather than START
             // GROUP_REPLICATION without the adopted base.
@@ -1841,7 +1907,8 @@ pub async fn orchestrate(
         let considered: Vec<(String, PeerAnswer)> = answers
             .into_iter()
             .filter(|(host, answer)| {
-                !(matches!(answer, PeerAnswer::Unreachable)
+                !(may_waive
+                    && matches!(answer, PeerAnswer::Unreachable)
                     && gone_tracker.is_waived(host, now, gone_dwell))
             })
             .collect();
