@@ -468,7 +468,7 @@ pub(crate) fn check_bucket_shape(var: &str, value: &str) -> Result<()> {
     if value.contains('/') || value.chars().any(char::is_whitespace) {
         let path_var = var.replace("_BUCKET", "_PATH");
         bail!(
-            "{var} must be a bare bucket name, got {value:?}; a prefix inside the bucket \
+            "{var} must be a bare bucket name - got {value} - a prefix inside the bucket \
              belongs in {path_var}"
         );
     }
@@ -485,7 +485,11 @@ pub(crate) fn check_endpoint_shape(var: &str, value: &str) -> Result<()> {
         .strip_prefix("https://")
         .or_else(|| lower.strip_prefix("http://"))
     else {
-        bail!("{var} must be an absolute http(s) URL, got {value:?}; write it as https://{value}");
+        // No comma and no quotes in the message: it travels as /pitr's
+        // last_error, and readers that cut the JSON value at the first comma
+        // (the fleet monitor's banner, the e2e's pitr_field) must still see
+        // the variable AND the fix.
+        bail!("{var} must be an absolute http(s) URL - got {value} - set it to https://{value}");
     };
     let host = rest.split('/').next().unwrap_or("");
     if host.is_empty() {

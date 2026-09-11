@@ -3421,10 +3421,22 @@ dump_node_log() {
 # pitr_field <from-node> <target-node> <json-field> — one field of the
 # target's /pitr (archiver status). Bare value: `true`/`false`/`null` or the
 # quoted string. Empty on any unreachable/non-200 answer.
+# pitr_field <exec-node> <target-host> <field> — one field of the target's
+# /pitr, decoded as JSON: a string value is printed as is (commas, quotes and
+# escapes included — the old `[^,}]*` grep cut a last_error off at its first
+# comma), other values in their JSON spelling (true/false/null/numbers).
 pitr_field() {
   local body
   body="$(docker exec "$1" wget -q -O - "http://$2:8080/pitr" 2>/dev/null)" || return 0
-  echo "$body" | grep -o "\"$3\":[^,}]*" | head -1 | cut -d: -f2- | tr -d '"'
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+v = d.get(sys.argv[1])
+print(v if isinstance(v, str) else json.dumps(v))
+' "$3"
 }
 
 # active_binlog <node> — the name of the node's ACTIVE binlog file: the file
