@@ -9,6 +9,7 @@
 use anyhow::{anyhow, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::{Opts, OptsBuilder, Pool};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -25,19 +26,48 @@ const BACKUP_LOCK_WAIT: Duration = Duration::from_secs(60);
 /// next borrower would otherwise inherit a session still holding the lock.
 pub struct BackupLock {
     conn: Option<mysql_async::Conn>,
+    /// The `Sql` handle's shared "this process holds the backup lock" flag
+    /// (`Sql::backup_lock_held`). Cleared only once `UNLOCK INSTANCE` (or the
+    /// connection close) has actually run, so a reader that sees `false` can
+    /// issue `PURGE BINARY LOGS` without meeting our own lock.
+    held: Arc<AtomicBool>,
 }
 
 impl Drop for BackupLock {
     fn drop(&mut self) {
         if let Some(mut conn) = self.conn.take() {
+            let held = self.held.clone();
             tokio::spawn(async move {
                 if let Err(e) = conn.query_drop("UNLOCK INSTANCE").await {
                     tracing::warn!(error = %e, "UNLOCK INSTANCE failed; closing the lock's connection releases it regardless");
                 }
                 let _ = conn.disconnect().await;
+                held.store(false, Ordering::SeqCst);
             });
         }
     }
+}
+
+/// `ER_CANNOT_PURGE_BINLOG_WITH_BACKUP_LOCK` (MySQL 8.4 server error 4085):
+/// "Could not purge binary logs since another session is executing LOCK
+/// INSTANCE FOR BACKUP." The manual (§15.3.5): "PURGE BINARY LOGS cannot be
+/// issued while a LOCK INSTANCE FOR BACKUP statement is in effect for the
+/// instance" — it is refused outright, it does not wait.
+pub const ER_CANNOT_PURGE_BINLOG_WITH_BACKUP_LOCK: u16 = 4085;
+
+/// What `PURGE BINARY LOGS TO` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeOutcome {
+    Purged,
+    /// A backup lock (this process's full backup, or any other session's)
+    /// refused the purge. Nothing is wrong: the binlogs are uploaded already
+    /// and stay on disk until the next pass reclaims them.
+    DeferredByBackupLock,
+}
+
+/// The one server error a refused reclaim is allowed to mean.
+pub fn purge_refused_by_backup_lock(error: &mysql_async::Error) -> bool {
+    matches!(error, mysql_async::Error::Server(e) if e.code == ER_CANNOT_PURGE_BINLOG_WITH_BACKUP_LOCK)
 }
 const PASSWORD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for `SET GLOBAL super_read_only = ON`, the boot-time write fence.
@@ -65,6 +95,10 @@ pub struct Sql {
     /// password mysqld actually enforces (see password_pin.rs). Every clone
     /// of this handle observes the swap.
     pool: Arc<RwLock<Pool>>,
+    /// True while a `BackupLock` handed out by this handle (or any clone of
+    /// it) is alive: the archiver's shipping pass reads it before reclaiming
+    /// binlogs, because `PURGE BINARY LOGS` is refused under the lock.
+    backup_lock_held: Arc<AtomicBool>,
 }
 
 fn root_opts(socket_path: &str, root_password: &str) -> Opts {
@@ -113,7 +147,14 @@ impl Sql {
                 socket_path,
                 root_password,
             )))),
+            backup_lock_held: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether this process currently holds `LOCK INSTANCE FOR BACKUP` through
+    /// a live [`BackupLock`]. Conservative: stays true until the unlock has run.
+    pub fn backup_lock_held(&self) -> bool {
+        self.backup_lock_held.load(Ordering::SeqCst)
     }
 
     /// Rebuild the pool with a different root password (the pin resolver's
@@ -172,7 +213,11 @@ impl Sql {
             return Err(e)
                 .context("taking the instance backup lock (a DDL statement may be running)");
         }
-        Ok(BackupLock { conn: Some(conn) })
+        self.backup_lock_held.store(true, Ordering::SeqCst);
+        Ok(BackupLock {
+            conn: Some(conn),
+            held: self.backup_lock_held.clone(),
+        })
     }
 
     async fn short<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
@@ -779,12 +824,23 @@ impl Sql {
     /// Reclaim every binlog strictly before `file` (never `file` itself) —
     /// only ever called with a file every predecessor of which the archiver
     /// has already confirmed uploaded (see pitr::purge_cut).
-    pub async fn purge_binary_logs_to(&self, file: &str) -> Result<()> {
+    ///
+    /// A refusal by a backup lock — this process's own full backup, or any
+    /// other session's `LOCK INSTANCE FOR BACKUP` — is not a failure: the
+    /// files are uploaded already, and the next pass reclaims them.
+    pub async fn purge_binary_logs_to(&self, file: &str) -> Result<PurgeOutcome> {
         self.short(async {
             let mut conn = self.conn().await?;
-            conn.query_drop(format!("PURGE BINARY LOGS TO {}", sql_string_literal(file)))
-                .await?;
-            Ok(())
+            match conn
+                .query_drop(format!("PURGE BINARY LOGS TO {}", sql_string_literal(file)))
+                .await
+            {
+                Ok(()) => Ok(PurgeOutcome::Purged),
+                Err(e) if purge_refused_by_backup_lock(&e) => {
+                    Ok(PurgeOutcome::DeferredByBackupLock)
+                }
+                Err(e) => Err(e.into()),
+            }
         })
         .await
     }
@@ -860,6 +916,27 @@ pub fn role_is_writable_primary(members: &[MemberRow], self_uuid: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_error(code: u16) -> mysql_async::Error {
+        mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: "x".to_string(),
+            state: "HY000".to_string(),
+        })
+    }
+
+    #[test]
+    fn a_purge_refused_by_the_backup_lock_is_the_one_error_that_defers() {
+        assert!(purge_refused_by_backup_lock(&server_error(
+            ER_CANNOT_PURGE_BINLOG_WITH_BACKUP_LOCK
+        )));
+        // Access denied, a syntax error, a lost connection: all still failures.
+        assert!(!purge_refused_by_backup_lock(&server_error(1045)));
+        assert!(!purge_refused_by_backup_lock(&server_error(1064)));
+        assert!(!purge_refused_by_backup_lock(&mysql_async::Error::Driver(
+            mysql_async::DriverError::PoolDisconnected
+        )));
+    }
 
     fn member(id: &str, state: &str, role: &str) -> MemberRow {
         MemberRow {

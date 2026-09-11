@@ -2260,6 +2260,10 @@ t_pitr_full_backup_holds_ddl_and_stays_consistent() {
       i=$((i+1))
       sql mysql-pitr-ddl-src "CREATE TABLE t.storm_$i (id INT PRIMARY KEY, note VARCHAR(32)); INSERT INTO t.storm_$i VALUES (1,'made'); ALTER TABLE t.storm_$i ADD COLUMN extra INT DEFAULT 0; INSERT INTO t.kv (v) VALUES ('during-storm-$i');" >/dev/null 2>&1 || echo "iteration $i failed" >> "$failures"
       [ $((i % 3)) -eq 0 ] && { sql mysql-pitr-ddl-src "DROP TABLE t.storm_$i;" >/dev/null 2>&1 || echo "drop $i failed" >> "$failures"; }
+      # Close a binlog every few iterations so the shipping pass has files to
+      # upload AND reclaim throughout the storm — some of those reclaims land
+      # while the scheduled full holds the backup lock, which refuses PURGE.
+      [ $((i % 3)) -eq 0 ] && sql mysql-pitr-ddl-src "FLUSH BINARY LOGS;" >/dev/null 2>&1
     done
     echo "$i" > "$failures.count"
   ) &
@@ -2282,6 +2286,21 @@ t_pitr_full_backup_holds_ddl_and_stays_consistent() {
   [ "$(docker logs mysql-pitr-ddl-src 2>&1 | grep -c "holding the instance backup lock for the dump")" -ge 2 ] \
     && ok "the scheduled full held the instance backup lock too" \
     || bad "the scheduled full did not take the instance backup lock"
+  # The lock refuses PURGE BINARY LOGS outright (server error 4085). The
+  # archiver's own reclaim must step aside for its own dump — never be
+  # counted as a shipping failure that lands on /pitr and reaches the monitor.
+  node_logged mysql-pitr-ddl-src "binlog reclaim deferred" \
+    && log "a reclaim overlapped a dump and was deferred (the case under test occurred)" \
+    || log "no reclaim overlapped a dump in this run (the case under test did not occur; the guards below still hold)"
+  node_logged mysql-pitr-ddl-src "binlog shipping pass failed" \
+    && bad "a shipping pass was reported failed while the fulls held the backup lock: $(docker logs mysql-pitr-ddl-src 2>&1 | grep 'binlog shipping pass failed' | head -1 | cut -c1-200)" \
+    || ok "no shipping pass was reported failed across the storm's fulls"
+  [ -z "$(pitr_field mysql-pitr-ddl-src localhost last_error)" ] \
+    && ok "/pitr carries no last_error after the storm" \
+    || bad "/pitr carries a last_error after the storm: $(pitr_field mysql-pitr-ddl-src localhost last_error)"
+  node_logged mysql-pitr-ddl-src "reclaimed uploaded binlogs" \
+    && ok "uploaded binlogs were reclaimed once the lock was released" \
+    || bad "no reclaim ever ran across the storm"
 
   # The source's shape at T, then a restore to T must match it exactly.
   sleep 2

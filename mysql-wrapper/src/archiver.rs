@@ -1250,10 +1250,42 @@ async fn ship_once(
             Duration::from_secs(pitr::GR_BINLOG_EXPIRE_SECONDS),
         ),
     };
-    if let Some(cut) = cut {
-        sql.purge_binary_logs_to(&cut)
-            .await
-            .with_context(|| format!("PURGE BINARY LOGS TO {cut}"))?;
+    let cut = match reclaim_decision(cut, sql.backup_lock_held()) {
+        Reclaim::Nothing => return Ok(()),
+        Reclaim::Defer(cut) => {
+            // Our own full backup is dumping under LOCK INSTANCE FOR BACKUP,
+            // which refuses PURGE BINARY LOGS outright (manual §15.3.5;
+            // server error 4085). Everything above already shipped; the files
+            // stay on disk until the next pass, which is not a failure and
+            // must not be reported as one — a shipping-loop Err lands on
+            // /pitr's last_error and reaches the platform monitor.
+            info!(
+                cut = %cut,
+                "binlog reclaim deferred: this node's full backup holds the instance \
+                 backup lock; the next shipping pass reclaims"
+            );
+            return Ok(());
+        }
+        Reclaim::Purge(cut) => cut,
+    };
+    match sql
+        .purge_binary_logs_to(&cut)
+        .await
+        .with_context(|| format!("PURGE BINARY LOGS TO {cut}"))?
+    {
+        crate::sql::PurgeOutcome::DeferredByBackupLock => {
+            // Another session's backup lock (a customer-run backup tool, or a
+            // full of ours whose unlock is still in flight). Same verdict.
+            info!(
+                cut = %cut,
+                "binlog reclaim deferred: a session holds the instance backup lock; \
+                 the next shipping pass reclaims"
+            );
+            return Ok(());
+        }
+        crate::sql::PurgeOutcome::Purged => {}
+    }
+    {
         // The purged names are gone from disk — nothing left to verify on a
         // future startup reconciliation pass, so drop them from the state
         // file too (keeps it from growing unbounded over the volume's life).
@@ -1268,6 +1300,29 @@ async fn ship_once(
     }
 
     Ok(())
+}
+
+/// What the shipping pass does with the reclaim cut it computed.
+#[derive(Debug, PartialEq, Eq)]
+enum Reclaim {
+    /// Nothing uploaded is reclaimable yet.
+    Nothing,
+    /// This node's full backup holds `LOCK INSTANCE FOR BACKUP`, under which
+    /// `PURGE BINARY LOGS` is refused (not queued): keep the uploaded files
+    /// for one more pass instead of reporting a failure.
+    Defer(String),
+    Purge(String),
+}
+
+/// Reclaiming is the only step of a shipping pass that the archiver's own
+/// backup lock forbids, so it is the only step the lock defers — the uploads
+/// before it are unaffected and already recorded.
+fn reclaim_decision(cut: Option<String>, backup_lock_held: bool) -> Reclaim {
+    match cut {
+        None => Reclaim::Nothing,
+        Some(cut) if backup_lock_held => Reclaim::Defer(cut),
+        Some(cut) => Reclaim::Purge(cut),
+    }
 }
 
 /// A binlog's age on disk by its mtime — the group primary's stand-in for
@@ -1402,6 +1457,28 @@ async fn rotation_loop(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reclaim_is_deferred_while_this_node_holds_the_backup_lock() {
+        assert_eq!(
+            reclaim_decision(Some("binlog.000007".to_string()), true),
+            Reclaim::Defer("binlog.000007".to_string())
+        );
+    }
+
+    #[test]
+    fn reclaim_runs_when_no_backup_lock_is_held() {
+        assert_eq!(
+            reclaim_decision(Some("binlog.000007".to_string()), false),
+            Reclaim::Purge("binlog.000007".to_string())
+        );
+    }
+
+    #[test]
+    fn no_reclaim_cut_means_nothing_to_do_lock_or_not() {
+        assert_eq!(reclaim_decision(None, true), Reclaim::Nothing);
+        assert_eq!(reclaim_decision(None, false), Reclaim::Nothing);
+    }
 
     fn temp_dir(tag: &str) -> String {
         let dir = std::env::temp_dir().join(format!(
