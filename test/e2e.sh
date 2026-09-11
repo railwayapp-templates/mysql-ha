@@ -2449,7 +2449,7 @@ t_pitr_archive_and_restore_to_point_in_time() {
   docker logs mysql-pitr-restore 2>&1 | grep -q "point-in-time restore completed" \
     && ok "restore log confirms completion" \
     || bad "no restore-completed log line found"
-  docker logs mysql-pitr-restore 2>&1 | grep '"message":"point-in-time restore verdict"' | grep '"verdict":"completed"' | grep -q '"elapsed_seconds"' \
+  docker logs mysql-pitr-restore 2>&1 | grep '"message":"point-in-time restore verdict"' | grep '"verdict":"completed"' | grep '"elapsed_seconds"' | grep '"max_attempts":3' | grep -q '"attempt":1' \
     && ok "verdict line says completed, with the elapsed time" \
     || bad "no completed verdict line — the platform has nothing to surface"
 
