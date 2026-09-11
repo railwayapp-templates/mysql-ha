@@ -14,6 +14,31 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 const SHORT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a full backup waits for `LOCK INSTANCE FOR BACKUP` before giving
+/// this attempt up (the loop retries). Long enough for an ordinary DDL to
+/// finish, short enough that a migration never sees a backup queue behind it
+/// for long.
+const BACKUP_LOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// The instance backup lock, alive while this value is. Dropping it releases
+/// the lock and closes its connection — never returned to the pool, whose
+/// next borrower would otherwise inherit a session still holding the lock.
+pub struct BackupLock {
+    conn: Option<mysql_async::Conn>,
+}
+
+impl Drop for BackupLock {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            tokio::spawn(async move {
+                if let Err(e) = conn.query_drop("UNLOCK INSTANCE").await {
+                    tracing::warn!(error = %e, "UNLOCK INSTANCE failed; closing the lock's connection releases it regardless");
+                }
+                let _ = conn.disconnect().await;
+            });
+        }
+    }
+}
 const PASSWORD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for `SET GLOBAL super_read_only = ON`, the boot-time write fence.
 /// Enabling super_read_only legitimately waits for in-flight transactions to
@@ -108,6 +133,46 @@ impl Sql {
     async fn conn(&self) -> Result<mysql_async::Conn> {
         let pool = self.pool.read().await.clone();
         Ok(pool.get_conn().await?)
+    }
+
+    /// `LOCK INSTANCE FOR BACKUP`, held on a connection of its own for as long
+    /// as the returned guard lives. DDL (and the file operations that go with
+    /// it) waits; DML flows. `mysqldump --single-transaction` reads one
+    /// consistent snapshot ONLY if no ALTER/CREATE/DROP/RENAME/TRUNCATE
+    /// touches a table it is dumping — MySQL's own manual says so — and a
+    /// customer's migration does not know a backup is running. The lock is
+    /// what makes the dump's consistency a property of the archiver rather
+    /// than of the customer's timing. Bounded wait: a DDL already running
+    /// when the lock is asked for holds it up, and a backup that cannot start
+    /// within the bound fails loudly and is retried by its loop rather than
+    /// queueing behind a migration for an hour.
+    pub async fn lock_instance_for_backup(&self) -> Result<BackupLock> {
+        let pool = self.pool.read().await.clone();
+        let mut conn = tokio::time::timeout(SHORT_QUERY_TIMEOUT, pool.get_conn())
+            .await
+            .map_err(|_| anyhow!("connection for the backup lock timed out"))??;
+        // A pooled connection carries its session state back to the pool, so
+        // this one never returns there: the guard closes it (see Drop).
+        let acquired = tokio::time::timeout(BACKUP_LOCK_WAIT + Duration::from_secs(5), async {
+            conn.query_drop(format!(
+                "SET SESSION lock_wait_timeout = {}",
+                BACKUP_LOCK_WAIT.as_secs()
+            ))
+            .await?;
+            conn.query_drop("LOCK INSTANCE FOR BACKUP").await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow!("LOCK INSTANCE FOR BACKUP did not return within {BACKUP_LOCK_WAIT:?}"))
+        .and_then(|r| r);
+        if let Err(e) = acquired {
+            tokio::spawn(async move {
+                let _ = conn.disconnect().await;
+            });
+            return Err(e)
+                .context("taking the instance backup lock (a DDL statement may be running)");
+        }
+        Ok(BackupLock { conn: Some(conn) })
     }
 
     async fn short<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {

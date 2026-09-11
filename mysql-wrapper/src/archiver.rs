@@ -666,6 +666,16 @@ async fn take_full_backup(
 
     let data_flag = probe_dump_data_flag(sql).await;
     info!(data_flag, %dump_key, "starting full backup");
+    // Held across the dump (released the moment mysqldump exits, before the
+    // meta upload): a concurrent ALTER/CREATE/DROP/RENAME/TRUNCATE on a table
+    // being dumped makes `--single-transaction` read wrong contents or fail,
+    // and a restore from such a full is wrong from its base. DDL waits for the
+    // dump; DML never waits. See Sql::lock_instance_for_backup.
+    let backup_lock = sql
+        .lock_instance_for_backup()
+        .await
+        .context("could not take the instance backup lock for the full backup")?;
+    info!("holding the instance backup lock for the dump (DDL waits, DML flows)");
     // Measured before the dump so it describes the data the dump captures,
     // not the binlogs the dump itself generates while running.
     let datadir_bytes = dir_size_bytes(&config.data_dir).await;
@@ -731,6 +741,7 @@ async fn take_full_backup(
         .context("tee/scan task panicked")?
         .context("copying mysqldump output into gzip")?;
     let mysqldump_status = mysqldump.wait().await.context("waiting for mysqldump")?;
+    drop(backup_lock);
     let gzip_status = gzip.wait().await.context("waiting for gzip")?;
     upload_result.context("uploading the full backup to S3")?;
 
