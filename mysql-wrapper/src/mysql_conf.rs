@@ -269,6 +269,11 @@ pub const ARCHIVE_CONF_FILE_NAME: &str = "zz-railway-pitr-archive.cnf";
 pub struct StandaloneArchiveConfInput {
     pub server_id: u32,
     pub buffer_pool_bytes: u64,
+    /// The volume carries the group-name marker: this server was a Group
+    /// Replication member once (an HA cluster reverted to standalone keeps
+    /// the root and its volume). Its data is GTID history, and it keeps
+    /// writing GTIDs — see the rendering.
+    pub former_group_member: bool,
 }
 
 pub fn render_standalone_archive_conf(input: &StandaloneArchiveConfInput) -> String {
@@ -315,11 +320,37 @@ innodb_buffer_pool_size = {buffer_pool}
 # corrupting point-in-time recovery — the failure a backup system must never
 # trade for disk space.
 binlog_expire_logs_seconds = 0
-"#,
+{gtid}"#,
         server_id = input.server_id,
         buffer_pool = input.buffer_pool_bytes,
+        gtid = if input.former_group_member {
+            FORMER_MEMBER_GTID_DIRECTIVES
+        } else {
+            ""
+        },
     )
 }
+
+/// A reverted member keeps GTIDs on. Its archive is one shared history: the
+/// fulls its former peers took carry `gtid_purged`, and the restore replays
+/// every lineage relying on the server to skip transactions the loaded dump
+/// already holds. That only works when the dump SAYS what it holds. A
+/// reverted root dumping with gtid_mode=OFF produced an anonymous full whose
+/// contents were also in its peers' lineages; a restore past that full
+/// replayed those lineages again and died on the first duplicate key
+/// (2026-09-11, `haPitrRevertToStandalone` against production). With GTIDs
+/// on, the full declares the group history it contains and the replay skips
+/// it. The server ran under exactly these settings as a member, so nothing
+/// the customer's application does changes.
+const FORMER_MEMBER_GTID_DIRECTIVES: &str = r#"
+# This volume was a Group Replication member: its data is GTID history and
+# the archive it ships to is shared with its former peers' lineages. GTIDs
+# stay on so every full backup declares the history it contains
+# (`SET @@GLOBAL.GTID_PURGED`), which the point-in-time restore needs to
+# replay the shared archive without applying a transaction twice.
+gtid_mode = ON
+enforce_gtid_consistency = ON
+"#;
 
 /// Write the standalone archive config fragment. Must run before mysqld is
 /// spawned, same requirement as `write_gr_conf`. Never called when GR_SEEDS
@@ -331,6 +362,7 @@ pub fn write_standalone_archive_conf(config: &Config, server_id: u32) -> Result<
             read_cgroup_memory_limit(),
             config.innodb_buffer_pool_mb,
         ),
+        former_group_member: crate::gr::read_group_name_marker(&config.data_dir).is_some(),
     });
     let path = Path::new(&config.conf_dir).join(ARCHIVE_CONF_FILE_NAME);
     std::fs::create_dir_all(&config.conf_dir)
@@ -431,6 +463,7 @@ mod tests {
         let conf = render_standalone_archive_conf(&StandaloneArchiveConfInput {
             server_id: 1,
             buffer_pool_bytes: 536870912,
+            former_group_member: false,
         });
         for directive in [
             "server_id = 1",
@@ -455,5 +488,41 @@ mod tests {
         // Never renders any Group Replication directive — this file only
         // ever ships in standalone mode.
         assert!(!conf.contains("group_replication"));
+    }
+
+    #[test]
+    fn a_former_group_member_keeps_gtids_on_when_archiving_standalone() {
+        let plain = render_standalone_archive_conf(&StandaloneArchiveConfInput {
+            server_id: 1,
+            buffer_pool_bytes: 536870912,
+            former_group_member: false,
+        });
+        assert!(
+            !plain.contains("gtid_mode"),
+            "a never-member standalone stays anonymous:\n{plain}"
+        );
+
+        let reverted = render_standalone_archive_conf(&StandaloneArchiveConfInput {
+            server_id: 1,
+            buffer_pool_bytes: 536870912,
+            former_group_member: true,
+        });
+        for directive in ["gtid_mode = ON", "enforce_gtid_consistency = ON"] {
+            assert!(
+                reverted.contains(directive),
+                "missing {directive}:\n{reverted}"
+            );
+        }
+        // The rest of the rendering is untouched.
+        for directive in [
+            "log_bin = binlog",
+            "binlog_expire_logs_seconds = 0",
+            "performance_schema = OFF",
+        ] {
+            assert!(
+                reverted.contains(directive),
+                "missing {directive}:\n{reverted}"
+            );
+        }
     }
 }
