@@ -615,9 +615,11 @@ t_fresh_members_wait_for_a_seed_they_never_met() {
   # The root never starts; the fresh pair sees its name authoritatively gone.
   start_node 2 -e PEER_GONE_DWELL_SECONDS=20
   start_node 3 -e PEER_GONE_DWELL_SECONDS=20
-  wait_until 120 "fresh pair sees the root's name gone" \
+  # A fresh node initialises its datadir before it probes anyone; CI takes
+  # minutes for that, so the budget is the same as the other fresh-node waits.
+  wait_until 300 "fresh pair sees the root's name gone" \
     bash -c 'docker logs mysql-2 2>&1 | grep -q "authoritatively gone"' \
-    || { bad "$t" "mysql-2 never noticed the root's name was gone"; return; }
+    || { bad "$t" "mysql-2 never noticed the root's name was gone"; dump_node_log mysql-2; return; }
   # Past the dwell (20 s) with a wide margin: no waiver, no bootstrap.
   sleep 75
   if any_role_200 mysql-2 mysql-2 mysql-3; then
