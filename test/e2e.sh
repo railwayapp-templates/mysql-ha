@@ -2175,6 +2175,47 @@ t_pitr_archive_root_belongs_to_one_service() {
 # GR trio at all — a fresh pair of standalone (non-GR) nodes plus a minio
 # container standing in for the S3-compatible bucket. Self-contained: no
 # teardown_trio, no shared GR state, safe to run anywhere in the list.
+# The platform's credential banner and the prod harness read a rejected
+# archive credential off /pitr's last_error. Since the ownership check
+# (owner.json) runs before the first upload, the first failure a bad secret
+# produces is a HEAD — which carries no error body, so the SDK's account of it
+# is a bare "unhandled error". The status must still say what happened: the
+# HTTP status the service answered with, and the cause chain, not just the
+# outermost "HEAD binlog/owner.json" (prod harness, 2026-09-11 02:04Z).
+t_pitr_rejected_credentials_are_named_in_status() {
+  log "t_pitr_rejected_credentials_are_named_in_status"
+  docker rm -f mysql-pitr-badcred mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-badcred mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=not-the-secret"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-badcred"
+  )
+  start_standalone mysql-pitr-badcred "${archive_env[@]}"
+  wait_until 120 "node serves mysqld regardless of the archive" \
+    bash -c 'docker exec mysql-pitr-badcred wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a rejected archive credential must not take the database down"; docker logs mysql-pitr-badcred 2>&1 | tail -40; return; }
+
+  wait_until 180 "/pitr carries a last_error" \
+    bash -c '[ -n "$(docker exec mysql-pitr-badcred wget -q -O - http://localhost:8080/pitr 2>/dev/null | grep -o "\"last_error\":\"[^\"]*\"")" ]' \
+    || { bad "/pitr never recorded an error for a rejected credential"; docker logs mysql-pitr-badcred 2>&1 | tail -40; return; }
+  local last_error
+  last_error="$(pitr_field mysql-pitr-badcred mysql-pitr-badcred last_error)"
+  log "last_error: $last_error"
+  printf '%s' "$last_error" | grep -qE 'AccessDenied|SignatureDoesNotMatch|InvalidAccessKeyId|Forbidden|(^|[^0-9])403([^0-9]|$)' \
+    && ok "/pitr names the rejection (status or code), not just the operation" \
+    || bad "/pitr's last_error does not name the credential rejection: $last_error"
+  [ "$(mc_count e2e-pitr-badcred/ 2>/dev/null || echo x)" = "0" ] \
+    && ok "nothing reached the archive root under the rejected credential" \
+    || bad "objects landed under the archive root despite the rejected credential"
+}
+
 t_pitr_archive_and_restore_to_point_in_time() {
   log "t_pitr_archive_and_restore_to_point_in_time"
   docker rm -f mysql-pitr-src mysql-pitr-restore mysql-ha-e2e-minio >/dev/null 2>&1
@@ -3791,7 +3832,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
 
 main() {
   ensure_image
