@@ -563,15 +563,34 @@ pub async fn stuck_watch(
     sql: Sql,
     telemetry: Arc<Telemetry>,
     healing: Arc<AtomicBool>,
+    active_root_password: String,
 ) {
     let dwell = Duration::from_secs(config.stuck_member_dwell_seconds);
     let peer_hosts = config.peer_hosts();
     let timeout = Duration::from_millis(config.peer_query_timeout_ms);
     let client = reqwest::Client::new();
-    let recovery_password = config
+    // The reclone authenticates to the donor as the group's recovery account,
+    // so it must present the credential the group enforces — the same
+    // resolution gr::orchestrate applies (a coupled GR_REPLICATION_PASSWORD
+    // follows the pinned active root, a distinct literal is taken as
+    // written). Reading the variable here would hand an edited value to the
+    // donor, which would refuse every reclone until the attempt cap parked
+    // this member.
+    let env_recovery_password = config
         .gr_replication_password
         .clone()
         .expect("HA mode requires GR_REPLICATION_PASSWORD (validated in Config::from_env)");
+    let recovery_password = gr::recovery_credential(
+        &env_recovery_password,
+        &config.mysql_root_password,
+        &active_root_password,
+    );
+    if recovery_password != env_recovery_password {
+        info!(
+            "stuck-member reclone will present the pinned recovery credential: \
+             GR_REPLICATION_PASSWORD follows an edited MYSQL_ROOT_PASSWORD that the group does not enforce"
+        );
+    }
 
     let mut stuck_since: Option<Instant> = None;
     let mut last_progress_sig = String::new();

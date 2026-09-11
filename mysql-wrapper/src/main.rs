@@ -284,6 +284,10 @@ async fn main() -> Result<()> {
             sql.clone(),
             telemetry.clone(),
             healing.clone(),
+            // Same pinned active root the orchestrator receives below: the
+            // stuck-member reclone is the third CLONE path and must
+            // authenticate to the donor with the credential the group enforces.
+            boot_password.clone(),
         ));
 
         tokio::spawn(gr::orchestrate(
