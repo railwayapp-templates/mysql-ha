@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::oneshot;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
@@ -642,12 +643,43 @@ async fn full_backup_loop(
     }
 }
 
+/// How long the dump gets to open its snapshot once mysqldump is started —
+/// the window the global read lock stays up. mysqldump opens the snapshot
+/// before it writes its first database, within a second on any server; a
+/// dump that has not by then is killed and this full fails (the loop
+/// retries) rather than holding the customer's writes any longer.
+const SNAPSHOT_OPEN_WAIT: Duration = Duration::from_secs(60);
+
 /// `mysqldump --single-transaction --routines --events --triggers
-/// --all-databases <data-flag>`, gzipped, streamed to S3 as it's produced —
-/// nothing here buffers the whole (potentially huge) dump. The coordinate
-/// line the data-flag emits is scanned out of the first
-/// [`COORD_SCAN_CAP`] bytes of mysqldump's own output (before gzip) and
-/// becomes this full's `meta.json`.
+/// --all-databases`, gzipped, streamed to S3 as it's produced — nothing here
+/// buffers the whole (potentially huge) dump.
+///
+/// The binlog coordinates the full starts replay from are read by the
+/// wrapper itself, under a global read lock that stands until mysqldump has
+/// opened its snapshot, and become this full's `meta.json`; the GTID set the
+/// dump holds is scanned out of the first [`COORD_SCAN_CAP`] bytes of
+/// mysqldump's own output (its `SET @@GLOBAL.GTID_PURGED`).
+///
+/// The lock order is the one MySQL Shell's dump utility uses, and it is not
+/// interchangeable:
+///
+///   1. `FLUSH TABLES WITH READ LOCK` — waits only for statements already
+///      running; a DDL that arrives while it stands queues on the global
+///      lock holding no table.
+///   2. `LOCK INSTANCE FOR BACKUP` — immediate under the read lock (no DDL
+///      can be in flight), held across the whole dump: DDL waits, DML flows,
+///      and `--single-transaction` reads one consistent snapshot.
+///   3. `SHOW BINARY LOG STATUS` on the read-locking session: nothing
+///      commits while it stands, so these are the coordinates of the
+///      snapshot mysqldump opens next.
+///   4. mysqldump starts; the read lock is released the moment its output
+///      shows the snapshot is open (its first per-database line).
+///
+/// The other order — the backup lock first, then mysqldump's own FLUSH
+/// TABLES WITH READ LOCK for `--source-data` — deadlocked under a DDL storm
+/// (e2e, 2026-09-11): an ALTER queued on the backup lock already held its
+/// table open, FLUSH TABLES waited for that table, and the dump never
+/// started while the storm's DDL waited on the dump.
 async fn take_full_backup(
     config: &Config,
     sql: &Sql,
@@ -664,18 +696,33 @@ async fn take_full_backup(
     let dump_key = pitr::full_dump_key(location, server_uuid, &rfc);
     let meta_key = pitr::full_meta_key(location, server_uuid, &rfc);
 
-    let data_flag = probe_dump_data_flag(sql).await;
-    info!(data_flag, %dump_key, "starting full backup");
-    // Held across the dump (released the moment mysqldump exits, before the
-    // meta upload): a concurrent ALTER/CREATE/DROP/RENAME/TRUNCATE on a table
-    // being dumped makes `--single-transaction` read wrong contents or fail,
-    // and a restore from such a full is wrong from its base. DDL waits for the
-    // dump; DML never waits. See Sql::lock_instance_for_backup.
+    info!(%dump_key, "starting full backup");
+    // Step 1: the global read lock, on a session of its own (see the order
+    // above). Dropping the guard on any early exit below releases it.
+    let mut read_lock = sql
+        .flush_tables_with_read_lock()
+        .await
+        .context("could not take the global read lock for the full backup's snapshot")?;
+    // Step 2: held across the dump (released the moment mysqldump exits,
+    // before the meta upload): a concurrent ALTER/CREATE/DROP/RENAME/TRUNCATE
+    // on a table being dumped makes `--single-transaction` read wrong
+    // contents or fail, and a restore from such a full is wrong from its
+    // base. DDL waits for the dump; DML never waits. See
+    // Sql::lock_instance_for_backup.
     let backup_lock = sql
         .lock_instance_for_backup()
         .await
         .context("could not take the instance backup lock for the full backup")?;
-    info!("holding the instance backup lock for the dump (DDL waits, DML flows)");
+    // Step 3: the coordinates of the snapshot about to open.
+    let (binlog_file, binlog_pos) = read_lock
+        .binary_log_status()
+        .await
+        .context("reading the binlog coordinates under the global read lock")?;
+    info!(
+        %binlog_file,
+        binlog_pos,
+        "holding the instance backup lock for the dump (DDL waits, DML flows)"
+    );
     // Measured before the dump so it describes the data the dump captures,
     // not the binlogs the dump itself generates while running.
     let datadir_bytes = dir_size_bytes(&config.data_dir).await;
@@ -707,7 +754,6 @@ async fn take_full_backup(
         // on (source_uuid, interval_start)) — aborting the load. Empty on a
         // gtid_mode=OFF standalone, so this changes nothing there.
         .arg("--ignore-table=mysql.gtid_executed")
-        .arg(data_flag)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -730,10 +776,48 @@ async fn take_full_backup(
     let gzip_stdout = gzip.stdout.take().context("gzip stdout was not piped")?;
 
     // Tee mysqldump's plaintext output into gzip's stdin while scanning the
-    // head of it for the coordinate line; concurrently, stream gzip's output
-    // straight to S3 via a multipart upload (unbounded length — no full-dump
-    // buffering on either side of the pipe).
-    let tee_task = tokio::spawn(tee_and_scan(dump_stdout, gzip_stdin, COORD_SCAN_CAP));
+    // head of it for the GTID set and for the snapshot-open marker; then
+    // stream gzip's output straight to S3 via a multipart upload (unbounded
+    // length — no full-dump buffering on either side of the pipe).
+    let (snapshot_open_tx, snapshot_open_rx) = oneshot::channel();
+    let tee_task = tokio::spawn(tee_and_scan(
+        dump_stdout,
+        gzip_stdin,
+        COORD_SCAN_CAP,
+        Some(snapshot_open_tx),
+    ));
+    // Step 4: the read lock goes the moment the dump's snapshot is open —
+    // mysqldump opens it before writing its first database, so that line in
+    // its output is the proof, and nothing committed between the coordinates
+    // above and the snapshot. The header alone is a few KiB; it reaches the
+    // tee long before gzip's un-drained output could stall the pipe.
+    match tokio::time::timeout(SNAPSHOT_OPEN_WAIT, snapshot_open_rx).await {
+        Ok(Ok(())) => {
+            read_lock
+                .release()
+                .await
+                .context("releasing the global read lock once the dump's snapshot was open")?;
+            info!("dump snapshot open at the recorded coordinates; global read lock released (DML flows)");
+        }
+        // The tee ended before any per-database line: mysqldump exited early.
+        // Release the lock now; its exit status below says why.
+        Ok(Err(_)) => {
+            read_lock
+                .release()
+                .await
+                .context("releasing the global read lock after mysqldump ended early")?;
+            warn!("mysqldump ended before opening a snapshot; the global read lock was released");
+        }
+        Err(_) => {
+            let _ = mysqldump.kill().await;
+            let _ = gzip.kill().await;
+            drop(read_lock);
+            drop(backup_lock);
+            anyhow::bail!(
+                "mysqldump did not open its snapshot within {SNAPSHOT_OPEN_WAIT:?}; the global read lock was released and this full is abandoned"
+            );
+        }
+    }
     let upload_result = s3.upload_multipart(&dump_key, gzip_stdout).await;
 
     let (scanned, dump_bytes) = tee_task
@@ -753,9 +837,6 @@ async fn take_full_backup(
     }
 
     let dump_head = String::from_utf8_lossy(&scanned);
-    let (binlog_file, binlog_pos) = pitr::parse_change_master_coords(&dump_head).with_context(
-        || "could not find a CHANGE MASTER TO / CHANGE REPLICATION SOURCE TO coordinate line in mysqldump's output",
-    )?;
     // Present exactly when the source runs with GTIDs (every Group
     // Replication member does): the set of transactions the dump already
     // holds, by identity. Restore replays other lineages against it.
@@ -788,33 +869,36 @@ async fn take_full_backup(
     Ok(taken_at)
 }
 
-/// Probe the installed `mysqldump`'s supported coordinate flag via its own
-/// `--help` output; only falls back to a major-version guess when the probe
-/// itself can't run (binary missing/exec error), which should never happen
-/// in the shipped image.
-async fn probe_dump_data_flag(sql: &Sql) -> &'static str {
-    match Command::new("mysqldump").arg("--help").output().await {
-        Ok(output) => pitr::pick_dump_data_flag(&String::from_utf8_lossy(&output.stdout)),
-        Err(e) => {
-            warn!(error = %e, "could not run `mysqldump --help`; falling back to a version-based guess");
-            let major = sql
-                .mysql_version()
-                .await
-                .ok()
-                .and_then(|v| pitr::mysql_major_version(&v))
-                .unwrap_or(8);
-            pitr::dump_data_flag_by_major(major)
-        }
-    }
+/// The first line mysqldump writes AFTER it has opened its snapshot: it
+/// starts the transaction (`--single-transaction`), writes the header (the
+/// `SET @@GLOBAL.GTID_PURGED` among it), and only then dumps databases. Any
+/// of these therefore proves the snapshot is open; `--all-databases` always
+/// produces the first one (the `mysql` schema at least).
+const SNAPSHOT_OPEN_MARKERS: &[&[u8]] = &[
+    b"\n-- Current Database: ",
+    b"\n-- Table structure for table",
+    b"\nCREATE TABLE ",
+    b"\n-- Dumping events for database",
+    b"\n-- Dump completed",
+];
+
+/// Whether `head` (the start of mysqldump's output) shows the snapshot open.
+fn dump_shows_snapshot_open(head: &[u8]) -> bool {
+    SNAPSHOT_OPEN_MARKERS
+        .iter()
+        .any(|m| head.windows(m.len()).any(|w| w == *m))
 }
 
 /// Copy `src` into `dst` byte-for-byte, capturing up to `scan_cap` bytes of
-/// the earliest data read (for the coordinate-line scan) without holding the
-/// rest in memory.
+/// the earliest data read (for the GTID-set scan) without holding the rest
+/// in memory. `snapshot_open`, when given, fires once the captured head
+/// shows mysqldump has opened its snapshot (see SNAPSHOT_OPEN_MARKERS); it is
+/// dropped unfired if the copy ends first.
 async fn tee_and_scan(
     mut src: impl AsyncRead + Unpin,
     mut dst: impl AsyncWrite + Unpin,
     scan_cap: usize,
+    mut snapshot_open: Option<oneshot::Sender<()>>,
 ) -> Result<(Vec<u8>, u64)> {
     let mut scanned = Vec::with_capacity(scan_cap.min(64 * 1024));
     let mut buf = [0u8; 64 * 1024];
@@ -834,6 +918,11 @@ async fn tee_and_scan(
         if scanned.len() < scan_cap {
             let take = (scan_cap - scanned.len()).min(n);
             scanned.extend_from_slice(&buf[..take]);
+            if snapshot_open.is_some() && dump_shows_snapshot_open(&scanned) {
+                if let Some(tx) = snapshot_open.take() {
+                    let _ = tx.send(());
+                }
+            }
         }
     }
     dst.shutdown().await.context("closing gzip's stdin")?;

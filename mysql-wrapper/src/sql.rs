@@ -21,6 +21,78 @@ const SHORT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// for long.
 const BACKUP_LOCK_WAIT: Duration = Duration::from_secs(60);
 
+/// How long a full backup waits for `FLUSH TABLES WITH READ LOCK` before
+/// giving this attempt up (the loop retries). The lock waits for statements
+/// already running to finish, and while it waits new writes queue behind it
+/// — so this bound is also the longest stall a customer's traffic can see
+/// from a backup, the same bound as the instance backup lock. mysqldump's
+/// own `--source-data` used to take this very lock with the server default
+/// of a year.
+const GLOBAL_READ_LOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// The global read lock (`FLUSH TABLES WITH READ LOCK`), alive while this
+/// value is — for the instant a dump needs to open its snapshot at the
+/// exact coordinates the wrapper records (see archiver::take_full_backup).
+/// `release` runs `UNLOCK TABLES` and closes the session; a guard dropped
+/// without it is released on a background task, so no exit path can leave
+/// the server read-only.
+pub struct GlobalReadLock {
+    conn: Option<mysql_async::Conn>,
+}
+
+impl GlobalReadLock {
+    /// `SHOW BINARY LOG STATUS` on the locking session: with the read lock
+    /// held nothing commits, so these are the coordinates of every snapshot
+    /// opened while the lock stands.
+    pub async fn binary_log_status(&mut self) -> Result<(String, u64)> {
+        let conn = self
+            .conn
+            .as_mut()
+            .context("the global read lock was already released")?;
+        binary_log_status_on(conn).await
+    }
+
+    /// `UNLOCK TABLES`, then close the session.
+    pub async fn release(mut self) -> Result<()> {
+        if let Some(mut conn) = self.conn.take() {
+            let unlocked = conn.query_drop("UNLOCK TABLES").await;
+            let _ = conn.disconnect().await;
+            unlocked.context("UNLOCK TABLES")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GlobalReadLock {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            tokio::spawn(async move {
+                if let Err(e) = conn.query_drop("UNLOCK TABLES").await {
+                    tracing::warn!(error = %e, "UNLOCK TABLES failed; closing the lock's connection releases it regardless");
+                }
+                let _ = conn.disconnect().await;
+            });
+        }
+    }
+}
+
+/// `SHOW BINARY LOG STATUS` (8.4+), falling back to `SHOW MASTER STATUS` on
+/// the old series, on the given connection. Read as a raw `Row` and indexed
+/// by column NAME: both statements return several more columns than
+/// File/Position, and `FromRow` for tuples requires an exact count.
+async fn binary_log_status_on(conn: &mut mysql_async::Conn) -> Result<(String, u64)> {
+    let row: Option<mysql_async::Row> = match conn.query_first("SHOW BINARY LOG STATUS").await {
+        Ok(row) => row,
+        Err(_) => conn.query_first("SHOW MASTER STATUS").await?,
+    };
+    let row = row.context(
+        "SHOW BINARY LOG STATUS / SHOW MASTER STATUS returned no row (is log_bin enabled?)",
+    )?;
+    let file: String = row.get("File").context("row has no File column")?;
+    let pos: u64 = row.get("Position").context("row has no Position column")?;
+    Ok((file, pos))
+}
+
 /// The instance backup lock, alive while this value is. Dropping it releases
 /// the lock and closes its connection — never returned to the pool, whose
 /// next borrower would otherwise inherit a session still holding the lock.
@@ -187,6 +259,44 @@ impl Sql {
     /// when the lock is asked for holds it up, and a backup that cannot start
     /// within the bound fails loudly and is retried by its loop rather than
     /// queueing behind a migration for an hour.
+    /// `FLUSH TABLES WITH READ LOCK` on a connection of its own, for as long
+    /// as the returned guard lives (see GlobalReadLock). Bounded wait, like
+    /// the backup lock: a statement still running when the lock is asked for
+    /// holds it up, and a backup that cannot start within the bound fails
+    /// loudly and is retried by its loop rather than stalling writes.
+    pub async fn flush_tables_with_read_lock(&self) -> Result<GlobalReadLock> {
+        let pool = self.pool.read().await.clone();
+        let mut conn = tokio::time::timeout(SHORT_QUERY_TIMEOUT, pool.get_conn())
+            .await
+            .map_err(|_| anyhow!("connection for the global read lock timed out"))??;
+        // A pooled connection carries its session state back to the pool, so
+        // this one never returns there: the guard closes it.
+        let acquired =
+            tokio::time::timeout(GLOBAL_READ_LOCK_WAIT + Duration::from_secs(5), async {
+                conn.query_drop(format!(
+                    "SET SESSION lock_wait_timeout = {}",
+                    GLOBAL_READ_LOCK_WAIT.as_secs()
+                ))
+                .await?;
+                conn.query_drop("FLUSH TABLES WITH READ LOCK").await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|_| {
+                anyhow!("FLUSH TABLES WITH READ LOCK did not return within {GLOBAL_READ_LOCK_WAIT:?}")
+            })
+            .and_then(|r| r);
+        if let Err(e) = acquired {
+            tokio::spawn(async move {
+                let _ = conn.disconnect().await;
+            });
+            return Err(e).context(
+                "taking the global read lock for the dump's snapshot (a long statement may be running)",
+            );
+        }
+        Ok(GlobalReadLock { conn: Some(conn) })
+    }
+
     pub async fn lock_instance_for_backup(&self) -> Result<BackupLock> {
         let pool = self.pool.read().await.clone();
         let mut conn = tokio::time::timeout(SHORT_QUERY_TIMEOUT, pool.get_conn())
@@ -795,17 +905,7 @@ impl Sql {
     pub async fn binary_log_status(&self) -> Result<(String, u64)> {
         self.short(async {
             let mut conn = self.conn().await?;
-            let row: Option<mysql_async::Row> =
-                match conn.query_first("SHOW BINARY LOG STATUS").await {
-                    Ok(row) => row,
-                    Err(_) => conn.query_first("SHOW MASTER STATUS").await?,
-                };
-            let row = row.context(
-                "SHOW BINARY LOG STATUS / SHOW MASTER STATUS returned no row (is log_bin enabled?)",
-            )?;
-            let file: String = row.get("File").context("row has no File column")?;
-            let pos: u64 = row.get("Position").context("row has no Position column")?;
-            Ok((file, pos))
+            binary_log_status_on(&mut conn).await
         })
         .await
     }
