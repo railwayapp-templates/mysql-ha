@@ -152,7 +152,11 @@ impl PitrStatus {
     }
 
     fn note_error(&self, error: &anyhow::Error) {
-        let text = error.to_string();
+        // The whole chain — the operation that failed AND why. The outermost
+        // context alone ("HEAD binlog/owner.json") says nothing about a
+        // rejected credential; the platform's credential banner and the e2e
+        // harness read the rejection off this field.
+        let text = format!("{error:#}");
         self.update(|s| s.last_error = Some(text));
     }
 }
@@ -302,16 +306,18 @@ pub async fn run(
     // the remedy, /pitr carries it as last_error, and mysqld itself is
     // unaffected.
     if let Err(e) = ensure_archive_ownership(&s3, &location, &config, &sql, mode).await {
+        // Refusal or an unreadable record alike; the chain says which (a
+        // rejected credential surfaces here first, as the HEAD's HTTP status).
         error!(
-            error = %e,
+            error = %format!("{e:#}"),
             bucket = %location.bucket,
             path = %location.path,
-            "PITR archiving refused: this archive root is not this service's; archiving is \
-             disabled for this boot"
+            "PITR archiving refused: this archive root is not this service's, or its owner record \
+             could not be read; archiving is disabled for this boot"
         );
         telemetry.send(TelemetryEvent::ComponentError {
             component: "mysql-wrapper".to_string(),
-            error: e.to_string(),
+            error: format!("{e:#}"),
             context: "pitr_archive_ownership".to_string(),
         });
         status.note_error(&e);

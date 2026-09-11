@@ -69,7 +69,7 @@ impl S3Client {
             Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
                 Ok(false)
             }
-            Err(e) => Err(anyhow::Error::new(e).context(format!("HEAD {key}"))),
+            Err(e) => Err(head_failure(key, e)),
         }
     }
 
@@ -229,7 +229,7 @@ impl S3Client {
             {
                 Ok(None)
             }
-            Err(e) => Err(anyhow!(e).context(format!("HEAD {key}"))),
+            Err(e) => Err(head_failure(key, e)),
         }
     }
 
@@ -363,4 +363,22 @@ impl S3Client {
         }
         Ok(parts)
     }
+}
+
+/// A failed HEAD, named the way an operator reads it: the key, then the HTTP
+/// status when the service answered. A HEAD carries no error body, so the
+/// SDK's own account of a rejected credential is a bare "unhandled error" —
+/// `HTTP 403` is the whole story there, and it is what `/pitr`'s `last_error`
+/// and the platform's credential banner key on.
+fn head_failure(key: &str, e: SdkError<HeadObjectError>) -> anyhow::Error {
+    let status = match &e {
+        SdkError::ServiceError(se) => Some(se.raw().status().as_u16()),
+        SdkError::ResponseError(re) => Some(re.raw().status().as_u16()),
+        _ => None,
+    };
+    let context = match status {
+        Some(code) => format!("HEAD {key}: HTTP {code}"),
+        None => format!("HEAD {key}"),
+    };
+    anyhow::Error::new(e).context(context)
 }
