@@ -2216,6 +2216,86 @@ t_pitr_rejected_credentials_are_named_in_status() {
     || bad "objects landed under the archive root despite the rejected credential"
 }
 
+# The dump carries every CREATE EVENT (`--events`) and MySQL's scheduler is ON
+# by default, so a restore-phase server that loads the dump starts running the
+# customer's scheduled events while the binlog is still being replayed: rows
+# the source never had at the target, written with log_bin OFF so nothing
+# records them. The restore-phase mysqld runs with the scheduler disabled; the
+# serving mysqld that boots on the finished datadir runs it as configured.
+t_pitr_restore_keeps_scheduled_events_quiet_during_replay() {
+  log "t_pitr_restore_keeps_scheduled_events_quiet_during_replay"
+  docker rm -f mysql-pitr-ev-src mysql-pitr-ev-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-ev-src mysql-ha-e2e-vol-mysql-pitr-ev-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-events"
+  )
+  start_standalone mysql-pitr-ev-src "${archive_env[@]}"
+  wait_until 120 "PITR source node healthy" \
+    bash -c 'docker exec mysql-pitr-ev-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "PITR source node never became healthy"; return; }
+
+  # A scheduled event ticking every second. Each row records whether the server
+  # that wrote it had binary logging on: the source and the serving fork do
+  # (1); only the restore-phase server runs with --skip-log-bin (0), so a row
+  # with log_bin=0 can only have been written DURING the restore.
+  sql mysql-pitr-ev-src "CREATE DATABASE t; CREATE TABLE t.ticks (id INT AUTO_INCREMENT PRIMARY KEY, at DATETIME(3) NOT NULL, logbin TINYINT NOT NULL); CREATE EVENT t.tick ON SCHEDULE EVERY 1 SECOND DO INSERT INTO t.ticks (at, logbin) VALUES (UTC_TIMESTAMP(3), @@log_bin);"
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-ev-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-ev-src 2>&1 | tail -40; return; }
+  wait_until 30 "the event has ticked a few times" \
+    bash -c '[ "$(docker exec mysql-pitr-ev-src mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT COUNT(*) FROM t.ticks" 2>/dev/null)" -ge 3 ]' \
+    || { bad "the scheduled event never ran on the source"; return; }
+  sleep 2
+  local t
+  t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  sleep 3
+  local expected
+  expected="$(sql mysql-pitr-ev-src "SELECT COUNT(*) FROM t.ticks WHERE at < '${t:0:10} ${t:11:8}'")"
+  log "captured T=$t; the source had $expected ticks before it"
+  sql mysql-pitr-ev-src "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog shipped" \
+    bash -c 'docker logs mysql-pitr-ev-src 2>&1 | grep -q "binlog uploaded"' \
+    || { bad "binlog was never shipped to the bucket"; docker logs mysql-pitr-ev-src 2>&1 | tail -40; return; }
+
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-events"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$t"
+  )
+  start_standalone mysql-pitr-ev-restore "${recover_env[@]}"
+  wait_until 180 "restore completed and serving" \
+    bash -c 'docker exec mysql-pitr-ev-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "restored node never became healthy"; docker logs mysql-pitr-ev-restore 2>&1 | tail -60; return; }
+
+  local quiet before_t sched
+  quiet="$(sql mysql-pitr-ev-restore "SELECT COUNT(*) FROM t.ticks WHERE logbin = 0")"
+  [ "$quiet" = "0" ] \
+    && ok "no event fired on the restore-phase server (0 rows written with log_bin off)" \
+    || bad "the scheduled event ran $quiet time(s) on the restore-phase server, writing rows the source never had at the target"
+  before_t="$(sql mysql-pitr-ev-restore "SELECT COUNT(*) FROM t.ticks WHERE at < '${t:0:10} ${t:11:8}'")"
+  [ "$before_t" = "$expected" ] \
+    && ok "the fork holds exactly the source's $expected ticks before T" \
+    || bad "the fork holds $before_t ticks before T; the source had $expected"
+  sched="$(sql mysql-pitr-ev-restore "SELECT @@event_scheduler")"
+  [ "$sched" = "ON" ] \
+    && ok "the serving fork runs the event scheduler again (the customer's events resume after the restore)" \
+    || bad "the serving fork's event scheduler is '$sched'; the restore-phase setting leaked into the serving server"
+
+  docker rm -f mysql-pitr-ev-src mysql-pitr-ev-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-ev-src mysql-ha-e2e-vol-mysql-pitr-ev-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
 # The target is UTC and the replay's cut-off is `--stop-datetime`, which
 # mysqlbinlog reads in ITS local time zone; the wrapper pins TZ=UTC on that
 # process. A customer's service may well run with TZ set (Railway passes the
@@ -4179,7 +4259,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_keeps_scheduled_events_quiet_during_replay t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
 
 main() {
   ensure_image

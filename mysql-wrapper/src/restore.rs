@@ -543,6 +543,14 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
     args.push("--sync-binlog=0".to_string());
     args.push("--innodb-doublewrite=OFF".to_string());
     args.push("--skip-log-bin".to_string());
+    // Scheduled events must not fire on the restore-phase server. The dump
+    // brings every CREATE EVENT along (`--events`), the scheduler is ON by
+    // default, and an event running during the load and the replay writes
+    // rows the source never had at the target — unlogged here, so nothing
+    // records them and the verdict cannot see them. The serving mysqld that
+    // boots on the finished datadir runs the scheduler as the customer
+    // configured it, so the fork's events resume once the restore is done.
+    args.push("--event-scheduler=DISABLED".to_string());
     // mysqlbinlog flushes a statement's row events as ONE `BINLOG '…'`
     // literal (at STMT_END_F), so a bulk INSERT of N MiB arrives as a single
     // ~1.33N MiB packet. The 64 MiB server default and the 16 MiB client
