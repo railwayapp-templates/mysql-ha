@@ -2216,6 +2216,171 @@ t_pitr_rejected_credentials_are_named_in_status() {
     || bad "objects landed under the archive root despite the rejected credential"
 }
 
+# The target is UTC and the replay's cut-off is `--stop-datetime`, which
+# mysqlbinlog reads in ITS local time zone; the wrapper pins TZ=UTC on that
+# process. A customer's service may well run with TZ set (Railway passes the
+# service's variables to the container), so the contract is pinned under a
+# non-UTC zone on both the source and the fork: the restore lands on the exact
+# UTC second; three hours off would be the symptom.
+t_pitr_restore_honours_utc_targets_under_a_local_timezone() {
+  log "t_pitr_restore_honours_utc_targets_under_a_local_timezone"
+  docker rm -f mysql-pitr-tz-src mysql-pitr-tz-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-tz-src mysql-ha-e2e-vol-mysql-pitr-tz-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-tz"
+    -e "TZ=America/Sao_Paulo"
+  )
+  start_standalone mysql-pitr-tz-src "${archive_env[@]}"
+  wait_until 120 "PITR source node healthy" \
+    bash -c 'docker exec mysql-pitr-tz-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "PITR source node never became healthy"; return; }
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-tz-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-tz-src 2>&1 | tail -40; return; }
+  local zone
+  zone="$(sql mysql-pitr-tz-src "SELECT @@system_time_zone")"
+  [ -n "$zone" ] && [ "$zone" != "UTC" ] \
+    && ok "the source runs under a non-UTC zone ($zone)" \
+    || { bad "the source did not pick up TZ (system_time_zone='$zone'); the scenario proves nothing"; return; }
+
+  sql mysql-pitr-tz-src "CREATE DATABASE t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'before-t');"
+  sleep 2
+  local t
+  t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  log "captured T=$t (UTC)"
+  sleep 2
+  sql mysql-pitr-tz-src "INSERT INTO t.kv VALUES (2,'after-t');"
+  sql mysql-pitr-tz-src "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog shipped" \
+    bash -c 'docker logs mysql-pitr-tz-src 2>&1 | grep -q "binlog uploaded"' \
+    || { bad "binlog was never shipped to the bucket"; docker logs mysql-pitr-tz-src 2>&1 | tail -40; return; }
+
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-tz"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$t"
+    -e "TZ=America/Sao_Paulo"
+  )
+  start_standalone mysql-pitr-tz-restore "${recover_env[@]}"
+  wait_until 180 "restore completed and serving" \
+    bash -c 'docker exec mysql-pitr-tz-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "restored node never became healthy"; docker logs mysql-pitr-tz-restore 2>&1 | tail -60; return; }
+  [ "$(sql mysql-pitr-tz-restore "SELECT v FROM t.kv WHERE k=1")" = "before-t" ] \
+    && ok "pre-T row present under a local time zone" || bad "pre-T row missing under a local time zone"
+  [ -z "$(sql mysql-pitr-tz-restore "SELECT v FROM t.kv WHERE k=2")" ] \
+    && ok "post-T row absent: the UTC target was not shifted by the container's zone" \
+    || bad "post-T row present: the target was read in the container's local zone (a three-hour shift)"
+
+  docker rm -f mysql-pitr-tz-src mysql-pitr-tz-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-tz-src mysql-ha-e2e-vol-mysql-pitr-tz-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
+# PITR disabled and re-enabled on the same service: the platform's disable
+# strips BINLOG_ARCHIVE_* and redeploys, re-enable puts them back. Binlogs
+# closed while archiving was off stay in the datadir (mysqld's expiry is
+# days), so the re-enabled archiver ships them late and the window has no
+# hole: a target INSIDE the disabled stretch restores. No new full is taken
+# for it; the archive-wide cadence still holds.
+t_pitr_disable_then_reenable_ships_the_gap_late() {
+  log "t_pitr_disable_then_reenable_ships_the_gap_late"
+  docker rm -f mysql-pitr-toggle-src mysql-pitr-toggle-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-toggle-src mysql-ha-e2e-vol-mysql-pitr-toggle-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-toggle"
+    -e "BINLOG_ROTATE_INTERVAL_SECONDS=3600"
+  )
+  start_standalone mysql-pitr-toggle-src "${archive_env[@]}"
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-toggle-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-toggle-src 2>&1 | tail -40; return; }
+  sql mysql-pitr-toggle-src "CREATE DATABASE t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'while-enabled');"
+  local f1
+  f1="$(active_binlog mysql-pitr-toggle-src)"
+  sql mysql-pitr-toggle-src "FLUSH BINARY LOGS;"
+  wait_uploaded mysql-pitr-toggle-src "$f1" || { bad "the first binlog never shipped"; return; }
+  ok "archiving on: $f1 shipped"
+
+  # Disable: same volume, no archive contract.
+  docker rm -f mysql-pitr-toggle-src >/dev/null 2>&1
+  start_standalone mysql-pitr-toggle-src
+  wait_until 120 "node serving with archiving off" \
+    bash -c 'docker exec mysql-pitr-toggle-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "node never came back with archiving off"; return; }
+  node_logged mysql-pitr-toggle-src "starting PITR archiver" \
+    && bad "an archiver started without an archive contract" \
+    || ok "archiving off: no archiver started"
+  sql mysql-pitr-toggle-src "INSERT INTO t.kv VALUES (2,'while-disabled');"
+  local f2
+  f2="$(active_binlog mysql-pitr-toggle-src)"
+  sql mysql-pitr-toggle-src "FLUSH BINARY LOGS;"
+  sleep 3
+  sql mysql-pitr-toggle-src "INSERT INTO t.kv VALUES (3,'also-while-disabled');"
+  sleep 2
+  local t
+  t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  log "captured T=$t inside the disabled stretch (rows 1-3 before it)"
+  sleep 2
+  sql mysql-pitr-toggle-src "INSERT INTO t.kv VALUES (4,'after-t-still-disabled');"
+  local f3
+  f3="$(active_binlog mysql-pitr-toggle-src)"
+  sql mysql-pitr-toggle-src "FLUSH BINARY LOGS;"
+
+  # Re-enable: the archive contract is back on the same volume.
+  docker rm -f mysql-pitr-toggle-src >/dev/null 2>&1
+  start_standalone mysql-pitr-toggle-src "${archive_env[@]}"
+  wait_uploaded mysql-pitr-toggle-src "$f2" 180 \
+    && ok "re-enabled archiver shipped $f2, closed while archiving was off" \
+    || { bad "the binlog closed while archiving was off ($f2) was never shipped after re-enable"; docker logs mysql-pitr-toggle-src 2>&1 | tail -40; return; }
+  wait_uploaded mysql-pitr-toggle-src "$f3" 120 \
+    && ok "re-enabled archiver shipped $f3 too" \
+    || { bad "$f3 was never shipped after re-enable"; return; }
+  local fulls
+  fulls="$(mc_count_matching e2e-pitr-toggle/ .meta.json)" || { bad "could not count fulls"; return; }
+  [ "$fulls" = "1" ] \
+    && ok "re-enable took no new full backup (the archive-wide cadence holds; 1 full)" \
+    || bad "expected 1 full after re-enable, found $fulls"
+
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-toggle"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$t"
+  )
+  start_standalone mysql-pitr-toggle-restore "${recover_env[@]}"
+  wait_until 180 "restore into the once-disabled stretch completed and serving" \
+    bash -c 'docker exec mysql-pitr-toggle-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a target inside the once-disabled stretch was not restorable"; docker logs mysql-pitr-toggle-restore 2>&1 | tail -60; return; }
+  [ "$(sql mysql-pitr-toggle-restore "SELECT v FROM t.kv WHERE k=3")" = "also-while-disabled" ] \
+    && ok "a row written while archiving was off is restorable (its binlog shipped late)" \
+    || bad "a row written while archiving was off is missing from the restore"
+  [ -z "$(sql mysql-pitr-toggle-restore "SELECT v FROM t.kv WHERE k=4")" ] \
+    && ok "the row after T is absent" || bad "the row after T is present"
+
+  docker rm -f mysql-pitr-toggle-src mysql-pitr-toggle-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-toggle-src mysql-ha-e2e-vol-mysql-pitr-toggle-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
 t_pitr_archive_and_restore_to_point_in_time() {
   log "t_pitr_archive_and_restore_to_point_in_time"
   docker rm -f mysql-pitr-src mysql-pitr-restore mysql-ha-e2e-minio >/dev/null 2>&1
@@ -3251,6 +3416,188 @@ pitr_recover_env() {
     "-e" "MYSQL_RECOVERY_TARGET_TIME=$target"
 }
 
+# Scale-up and member removal on a group that archives. Members added to a
+# PITR cluster carry the same archive contract as the trio (the platform stamps
+# it on every member) and must NOT archive while secondaries; a switchover onto
+# a scaled-up member moves the archiver there; and removing the archiving
+# member for good (the platform's scale-down deletes the service) hands the
+# archiver to the next primary. The removed member's lineage stays in the
+# archive and the restore stitches every tenure into one history.
+t_pitr_ha_scale_up_then_remove_the_archiver() {
+  log "t_pitr_ha_scale_up_then_remove_the_archiver (5 members; archiver follows the role; the removed archiver's lineage still restores)"
+  local restore=mysql-pitr-ha-scale-restore
+  pitr_ha_teardown "$restore"
+  start_minio || { bad "minio never became healthy"; return; }
+  local -a env
+  mapfile -t env < <(pitr_ha_archive_env /e2e-pitr-scale)
+  start_node 1 "${env[@]}"; start_node 2 "${env[@]}"; start_node 3 "${env[@]}"
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; return; }
+  wait_until 180 "initial full backup on $primary" \
+    bash -c 'docker logs '"$primary"' 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "the primary never completed an initial full backup"; docker logs "$primary" 2>&1 | tail -40; return; }
+
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'trio');"
+  local f1
+  f1="$(active_binlog "$primary")"
+  sql "$primary" "FLUSH BINARY LOGS;"
+  wait_uploaded "$primary" "$f1" || { bad "the trio's binlog never shipped"; return; }
+
+  # Scale 3 -> 5 with the same archive contract on the new members.
+  start_node 4 "${env[@]}"; start_node 5 "${env[@]}"
+  wait_until 420 "5 ONLINE members" has_n_online mysql-1 5 \
+    || { bad "scale-up never reached 5 ONLINE"; return; }
+  ok "scaled 3 -> 5 with the archive contract on every member"
+  local n
+  for n in mysql-4 mysql-5; do
+    [ "$(pitr_field mysql-2 "$n" archiving)" = "false" ] \
+      && ok "scaled-up member $n does not archive as a secondary" \
+      || bad "scaled-up member $n reports archiving=$(pitr_field mysql-2 "$n" archiving)"
+    node_logged "$n" "starting PITR archiver" && bad "$n started an archiver of its own" || ok "$n never started an archiver"
+  done
+  [ "$(sql mysql-5 "SELECT v FROM t.kv WHERE k=1")" = "trio" ] \
+    && ok "the scaled-up member cloned the dataset" || bad "the scaled-up member is missing the trio's row"
+
+  # Switchover onto a scaled-up member: the archiver moves there.
+  [ "$(switchover_code mysql-2 mysql-4)" = "200" ] \
+    && ok "switchover to the scaled-up member mysql-4 answered 200" \
+    || { bad "switchover to mysql-4 refused"; return; }
+  wait_until 90 "archiver started on mysql-4" \
+    bash -c 'docker logs mysql-4 2>&1 | grep -q "starting PITR archiver"' \
+    || { bad "mysql-4 never started an archiver after promotion"; docker logs mysql-4 2>&1 | tail -40; return; }
+  wait_until 60 "the demoted node stopped archiving" \
+    bash -c 'docker logs '"$primary"' 2>&1 | grep -q "no longer the group.s writable primary"' \
+    || { bad "the demoted node $primary never stopped its archiver"; return; }
+  sql mysql-4 "INSERT INTO t.kv VALUES (2,'scaled-up-primary');"
+  local f2
+  f2="$(active_binlog mysql-4)"
+  sql mysql-4 "FLUSH BINARY LOGS;"
+  wait_uploaded mysql-4 "$f2" || { bad "the scaled-up primary's binlog never shipped"; docker logs mysql-4 2>&1 | tail -40; return; }
+  ok "the scaled-up primary archives under its own lineage"
+
+  # Remove the archiving member for good (scale-down deletes the service).
+  docker rm -f mysql-4 >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-4 >/dev/null 2>&1
+  local -a others=(mysql-1 mysql-2 mysql-3 mysql-5)
+  wait_until 180 "a new primary elected after the archiver was removed" any_role_200 mysql-2 "${others[@]}" \
+    || { bad "no primary after the archiving member was removed"; return; }
+  local new_primary
+  new_primary="$(current_primary mysql-2 "${others[@]}")" || { bad "no new primary"; return; }
+  wait_until 90 "archiver started on $new_primary" \
+    bash -c '[ "$(docker exec '"$new_primary"' wget -q -O - http://localhost:8080/pitr 2>/dev/null | grep -o "\"archiving\":[a-z]*" | cut -d: -f2)" = "true" ]' \
+    || { bad "$new_primary does not archive after the removal (/pitr: $(pitr_field mysql-2 "$new_primary" archiving))"; docker logs "$new_primary" 2>&1 | tail -40; return; }
+  ok "the archiver moved to $new_primary after the removal"
+  sql "$new_primary" "INSERT INTO t.kv VALUES (3,'after-removal');"
+  sleep 2
+  local t
+  t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  log "captured T=$t (rows 1-3 before it, across three tenures)"
+  sleep 2
+  sql "$new_primary" "INSERT INTO t.kv VALUES (4,'after-t');"
+  local f3
+  f3="$(active_binlog "$new_primary")"
+  sql "$new_primary" "FLUSH BINARY LOGS;"
+  wait_uploaded "$new_primary" "$f3" || { bad "the new primary's binlog never shipped"; return; }
+
+  local fulls lineages
+  fulls="$(mc_count_matching e2e-pitr-scale/ .meta.json)" || { bad "could not count fulls"; return; }
+  [ "$fulls" = "1" ] && ok "no new full across the scale-up, the switchover and the removal (1 full)" || bad "expected 1 full, found $fulls"
+  lineages="$(mc_lineage_count e2e-pitr-scale/)" || { bad "could not count lineages"; return; }
+  [ "$lineages" -ge 2 ] && ok "$lineages lineages in the archive (one per tenure)" || bad "expected at least 2 lineages, found $lineages"
+
+  local -a renv
+  mapfile -t renv < <(pitr_recover_env /e2e-pitr-scale "$t")
+  start_standalone "$restore" "${renv[@]}"
+  wait_until 240 "restored node serving" \
+    bash -c 'docker exec '"$restore"' wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "restored node never became healthy"; dump_node_log "$restore"; return; }
+  node_logged "$restore" "replaying the shared history across lineages" \
+    && ok "restore took the shared-history path" || bad "restore did not take the shared-history path"
+  node_logged "$restore" "restored GTID history holds every transaction the replayed binlogs vouch for" \
+    && ok "restore judged the stitched history complete" || bad "restore did not confirm completeness"
+  [ "$(sql "$restore" "SELECT v FROM t.kv WHERE k=1")" = "trio" ] && ok "trio tenure row restored" || bad "trio tenure row missing"
+  [ "$(sql "$restore" "SELECT v FROM t.kv WHERE k=2")" = "scaled-up-primary" ] && ok "removed member's tenure row restored (its lineage outlived it)" || bad "the removed member's tenure row is missing"
+  [ "$(sql "$restore" "SELECT v FROM t.kv WHERE k=3")" = "after-removal" ] && ok "post-removal tenure row restored" || bad "post-removal tenure row missing"
+  [ -z "$(sql "$restore" "SELECT v FROM t.kv WHERE k=4")" ] && ok "row after T absent" || bad "row after T present"
+
+  pitr_ha_teardown "$restore"
+}
+
+# HA -> standalone revert with PITR on. The platform keeps the root on its
+# volume, strips the HA variables and deletes the other members; the archive
+# contract stays. Archiving must continue on the reverted standalone (the same
+# history, now with one server) and a restore that spans the group tenure and
+# the standalone tenure must replay both.
+t_pitr_ha_revert_to_standalone_keeps_the_archive() {
+  log "t_pitr_ha_revert_to_standalone_keeps_the_archive (the reverted root keeps archiving; a restore spans both tenures)"
+  local restore=mysql-pitr-ha-revert-restore
+  pitr_ha_teardown "$restore"
+  start_minio || { bad "minio never became healthy"; return; }
+  local -a env
+  mapfile -t env < <(pitr_ha_archive_env /e2e-pitr-revert)
+  start_node 1 "${env[@]}"; start_node 2 "${env[@]}"; start_node 3 "${env[@]}"
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { bad "no primary"; return; }
+  wait_until 180 "initial full backup on $primary" \
+    bash -c 'docker logs '"$primary"' 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "the primary never completed an initial full backup"; docker logs "$primary" 2>&1 | tail -40; return; }
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'in-group');"
+  wait_until 60 "group row replicated to the root" \
+    bash -c '[ "$(docker exec mysql-1 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null)" = "in-group" ]' \
+    || { bad "the group row never reached mysql-1"; return; }
+  local f1
+  f1="$(active_binlog "$primary")"
+  sql "$primary" "FLUSH BINARY LOGS;"
+  wait_uploaded "$primary" "$f1" || { bad "the group tenure's binlog never shipped"; return; }
+  ok "group tenure archived from $primary"
+
+  # Revert: the other members are deleted, the root boots standalone on its
+  # volume with the HA variables stripped and the archive contract kept.
+  docker rm -f mysql-2 mysql-3 >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-2 mysql-ha-e2e-vol-3 >/dev/null 2>&1
+  docker rm -f mysql-1 >/dev/null 2>&1
+  start_reverted_node 1 "${env[@]}" -e RAILWAY_SERVICE_ID="svc-mysql-1"
+  wait_until 240 "reverted root up standalone" \
+    bash -c 'docker exec mysql-1 wget -q -O /dev/null http://mysql-1:8080/role 2>/dev/null' \
+    || { bad "the reverted root never came up standalone"; docker logs mysql-1 2>&1 | tail -60; return; }
+  wait_until 120 "archiver running on the reverted root" \
+    bash -c '[ "$(docker exec mysql-1 wget -q -O - http://localhost:8080/pitr 2>/dev/null | grep -o "\"archiving\":[a-z]*" | cut -d: -f2)" = "true" ]' \
+    || { bad "the reverted root does not archive (/pitr: $(docker exec mysql-1 wget -q -O - http://localhost:8080/pitr 2>/dev/null | cut -c1-300))"; docker logs mysql-1 2>&1 | grep -i "refused\|owner\|archiv" | tail -20; return; }
+  node_logged mysql-1 "PITR archiving refused" \
+    && bad "the reverted root was refused its own archive root" \
+    || ok "the reverted root kept its archive root (a reverted member is the same history)"
+
+  sql mysql-1 "INSERT INTO t.kv VALUES (2,'after-revert');"
+  sleep 2
+  local t
+  t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  log "captured T=$t (group row and post-revert row before it)"
+  sleep 2
+  sql mysql-1 "INSERT INTO t.kv VALUES (3,'after-t');"
+  local f2
+  f2="$(active_binlog mysql-1)"
+  sql mysql-1 "FLUSH BINARY LOGS;"
+  wait_uploaded mysql-1 "$f2" 120 || { bad "the standalone tenure's binlog never shipped"; docker logs mysql-1 2>&1 | tail -40; return; }
+  ok "standalone tenure archived from the reverted root"
+  local fulls
+  fulls="$(mc_count_matching e2e-pitr-revert/ .meta.json)" || { bad "could not count fulls"; return; }
+  [ "$fulls" = "1" ] && ok "the revert took no new full backup (1 full)" || bad "expected 1 full after the revert, found $fulls"
+
+  local -a renv
+  mapfile -t renv < <(pitr_recover_env /e2e-pitr-revert "$t")
+  start_standalone "$restore" "${renv[@]}"
+  wait_until 240 "restore spanning both tenures completed and serving" \
+    bash -c 'docker exec '"$restore"' wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a restore spanning the group tenure and the standalone tenure did not complete"; dump_node_log "$restore"; return; }
+  [ "$(sql "$restore" "SELECT v FROM t.kv WHERE k=1")" = "in-group" ] && ok "group tenure row restored" || bad "group tenure row missing"
+  [ "$(sql "$restore" "SELECT v FROM t.kv WHERE k=2")" = "after-revert" ] && ok "standalone tenure row restored" || bad "standalone tenure row missing"
+  [ -z "$(sql "$restore" "SELECT v FROM t.kv WHERE k=3")" ] && ok "row after T absent" || bad "row after T present"
+
+  pitr_ha_teardown "$restore"
+}
+
 # Exactly one member archives — the writable primary — and the archiver
 # follows the role across a controlled switchover without a new full backup.
 # The restore then has to stitch the two tenures (two server-<uuid>/
@@ -3832,7 +4179,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
 
 main() {
   ensure_image
