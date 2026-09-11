@@ -575,6 +575,149 @@ t_cold_restart_preserves_group() {
   fi
 }
 
+# seed_adopted_volume <n> — a standalone volume for mysql-<n> with one row of
+# never-binlogged base data, the way a converted customer database arrives:
+# Railway's standalone template runs with binlog off, so nothing about this
+# data is visible to any GTID comparison.
+seed_adopted_volume() {
+  local n="$1"
+  docker volume create --label "$LABEL" "mysql-ha-e2e-vol-$n" >/dev/null
+  docker run -d --label "$LABEL" --name "seed-mysql-$n" --network "$NET" \
+    -v "mysql-ha-e2e-vol-$n:/var/lib/mysql" \
+    -e MYSQL_ROOT_PASSWORD="$ROOT_PW" -e MYSQL_DATABASE=railway \
+    "mysql:${MYSQL_VERSION}" \
+    mysqld --disable-log-bin --performance_schema=0 >/dev/null
+  wait_until 240 "standalone seed mysqld up" \
+    bash -c 'docker exec seed-mysql-'"$n"' mysql -uroot -p'"$ROOT_PW"' -e "SELECT 1" >/dev/null 2>&1' \
+    || return 1
+  docker exec "seed-mysql-$n" mysql -uroot -p"$ROOT_PW" -e \
+    "CREATE TABLE railway.legacy (id INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO railway.legacy VALUES (1, 'pre-conversion');" 2>/dev/null
+  docker stop "seed-mysql-$n" >/dev/null && docker rm "seed-mysql-$n" >/dev/null
+}
+
+# 2026-09-08, production: a standalone database was converted to HA; the
+# root's own deploy failed (registry credentials), so its name never resolved.
+# The two fresh replicas waited out the peer-gone dwell, WAIVED the root as a
+# deleted peer and bootstrapped a fresh, EMPTY group — which the edge then
+# served for two days while the customer's data sat on the root's volume. The
+# waiver exists for peers the platform deleted; a node that has never been a
+# group member cannot tell a deleted peer from one that never came up, and it
+# has nothing to lose by waiting, so it must not waive. Fresh members wait for
+# every declared seed, and the group forms around the adopted data once the
+# root arrives.
+t_fresh_members_wait_for_a_seed_they_never_met() {
+  local t=t_fresh_members_wait_for_a_seed_they_never_met
+  log "$t"
+  # Same discipline as t_deleted_peer_unfences_bootstrap: clear whatever trio
+  # is live under its REAL identity before switching NODE_SUFFIX, or the
+  # teardown below targets the wrong names and leaves that trio running.
+  teardown_trio
+  # The gate under test only engages once a peer's name is PROVABLY gone: the
+  # probe answers Gone on an authoritative NXDOMAIN and on nothing else
+  # (dns_probe.rs — RCODE 3 is Gone, every other rcode, NODATA, SERVFAIL and
+  # timeout are ExistsOrUnknown, which keeps the fence up for a reason that
+  # has nothing to do with waiving). A bare docker name that was never
+  # registered is forwarded upstream and comes back as one of those, so the
+  # fresh pair would hold for the trivial reason and the scenario would prove
+  # nothing. Names under the reserved .invalid TLD (RFC 2606) are guaranteed
+  # NXDOMAIN, so the live pair still resolves through its docker alias while
+  # the root that never starts is deletion-proven — the exact state a node
+  # that MAY waive acts on, which is what makes a fresh node's refusal to
+  # waive meaningful. Same device as the two waiver scenarios below.
+  local NODE_SUFFIX=".fs.e2e.invalid"
+  local SEEDS="mysql-1$NODE_SUFFIX:3306,mysql-2$NODE_SUFFIX:3306,mysql-3$NODE_SUFFIX:3306"
+  local n1="mysql-1$NODE_SUFFIX" n2="mysql-2$NODE_SUFFIX" n3="mysql-3$NODE_SUFFIX"
+
+  seed_adopted_volume 1 || { bad "$t" "standalone seed never came up"; teardown_trio; return; }
+  ok "adopted volume seeded for $n1 (binlog off, 1 row of base data)"
+
+  # The root never starts; the fresh pair sees its name authoritatively gone.
+  start_node 2 -e PEER_GONE_DWELL_SECONDS=20
+  start_node 3 -e PEER_GONE_DWELL_SECONDS=20
+  # A fresh node initialises its datadir before it probes anyone; CI takes
+  # minutes for that, so the budget is the same as the other fresh-node waits.
+  wait_until 300 "fresh pair sees the root's name gone" \
+    node_logged "$n2" "authoritatively gone" \
+    || { bad "$t" "$n2 never noticed the root's name was gone"; dump_node_log "$n2"; teardown_trio; return; }
+  # Past the dwell (20 s) with a wide margin: no waiver, no bootstrap.
+  sleep 75
+  if any_role_200 "$n2" "$n2" "$n3"; then
+    bad "$t" "the fresh pair bootstrapped a group WITHOUT the adopted root — the empty group the customer saw on 2026-09-08"
+  else
+    ok "fresh pair holds: no primary without the adopted root, well past the dwell"
+  fi
+  node_logged "$n2" "has never been a group member" \
+    && ok "$n2 said why it is not waiving the gone peer" \
+    || bad "$t" "$n2 did not log the never-a-member reason for holding"
+  node_logged "$n2" "bootstrapping a new group" \
+    && bad "$t" "$n2 bootstrapped a group while the adopted root was absent" \
+    || ok "$n2 never bootstrapped"
+
+  # The root arrives: the group forms around ITS data.
+  start_node 1
+  wait_until 500 "group fully ONLINE around the adopted root" group_is_fully_online "$n1" \
+    || { bad "$t" "group never formed once the adopted root arrived"; dump_node_log "$n1"; teardown_trio; return; }
+  local v
+  v="$(sql "$n3" "SELECT v FROM railway.legacy WHERE id=1")"
+  [ "$v" = "pre-conversion" ] \
+    && ok "the adopted base data reached a fresh member (cloned, not skipped)" \
+    || bad "$t" "fresh member is missing the adopted base data (got: '$v')"
+  local primary
+  primary="$(current_primary "$n2" "$n1" "$n2" "$n3")"
+  [ -n "$primary" ] && ok "one primary after the root arrived ($primary)" || bad "$t" "no primary after the root arrived"
+  teardown_trio
+}
+
+# The second layer, for a group that formed without the adopted root anyway
+# (an older build's waiver, a foreign group at the same seeds): the root
+# holds base data that predates any GTID history and the live group carries
+# no trace of it. Joining would hide that data behind an empty primary, and a
+# recovery conflict would reclone this datadir off the empty group. The root
+# refuses to join, says so, keeps its data and stays fenced — the operator
+# decides which history wins.
+t_adopted_root_refuses_a_group_that_formed_without_its_data() {
+  local t=t_adopted_root_refuses_a_group_that_formed_without_its_data
+  log "$t"
+  teardown_trio
+  seed_adopted_volume 1 || { bad "$t" "standalone seed never came up"; return; }
+
+  # A legitimate two-member group that never knew mysql-1.
+  local SEEDS="mysql-2:3306,mysql-3:3306"
+  start_node 2
+  start_node 3
+  wait_until 300 "fresh pair forms its own group" has_n_online mysql-2 2 \
+    || { bad "$t" "the two-member group never formed"; return; }
+  ok "a group formed without the adopted root (2 ONLINE)"
+
+  # The adopted root arrives declaring all three seeds.
+  SEEDS="mysql-1:3306,mysql-2:3306,mysql-3:3306"
+  start_node 1
+  wait_until 180 "the adopted root refuses the group" \
+    bash -c 'docker logs mysql-1 2>&1 | grep -q "refusing to join"' \
+    || { bad "$t" "the adopted root never refused a group that carries no trace of its data"; docker logs mysql-1 2>&1 | tail -40; return; }
+  ok "the adopted root refused to join, and said why"
+  sleep 20
+  [ "$(has_n_online mysql-2 2; echo $?)" = "0" ] \
+    && ok "the group stayed at its two members" \
+    || bad "$t" "the group's membership changed after the refusal ($(online_members mysql-2 | tr -d '[:space:]') ONLINE)"
+  local mine
+  mine="$(sql mysql-1 "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST LIKE 'mysql-1%'")"
+  [ -z "$mine" ] && ok "the adopted root never became a member" || bad "$t" "the adopted root joined as $mine"
+  node_logged mysql-1 "cloning instead of binlog recovery" \
+    && bad "$t" "the adopted root cloned off the empty group — its data would be gone" \
+    || ok "the adopted root never cloned off the empty group"
+  node_logged mysql-1 "discarding the orphaned transactions and recloning" \
+    && bad "$t" "the adopted root's data was treated as a stale fork" \
+    || ok "the adopted root's data was not treated as a stale fork"
+  [ "$(sql mysql-1 "SELECT v FROM railway.legacy WHERE id=1")" = "pre-conversion" ] \
+    && ok "the adopted root still holds its data" \
+    || bad "$t" "the adopted root lost its data"
+  [ "$(role_code mysql-2 mysql-1)" = "503" ] \
+    && ok "the refusing root answers /role 503 (fenced, not serving as a lone primary)" \
+    || bad "$t" "the refusing root answers /role 200"
+  teardown_trio
+}
+
 t_conversion_adopts_standalone_volume() {
   log "t_conversion_adopts_standalone_volume (fresh environment)"
   teardown_trio
@@ -4179,7 +4322,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump t_fresh_members_wait_for_a_seed_they_never_met t_adopted_root_refuses_a_group_that_formed_without_its_data)
 
 main() {
   ensure_image
