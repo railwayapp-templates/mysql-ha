@@ -133,6 +133,47 @@ fn waiver_generation_path(data_dir: &str) -> PathBuf {
 /// absent, so callers fall through to derivation instead (availability
 /// posture: a torn marker must never block boot; the next persist rewrites
 /// it, atomically).
+/// Written the first time this node sees itself ONLINE in a group; never
+/// removed. The group-name marker is NOT membership: every node persists the
+/// resolved name at the start of orchestration, before it has met anyone, so
+/// a fresh replica carried it within seconds of its first boot — which is
+/// why the never-member guard below never fired in the e2e (the fresh pair
+/// "had been members" by that measure and waived the root).
+const MEMBER_MARKER: &str = ".railway_gr_member";
+
+/// Whether this node has ever been ONLINE in a group, by the marker above.
+/// Members from before the marker existed are recognised by their datadir
+/// instead — see `has_been_group_member`.
+pub(crate) fn read_member_marker(data_dir: &str) -> bool {
+    Path::new(data_dir).join(MEMBER_MARKER).exists()
+}
+
+/// Persist the member marker once; idempotent and cheap on every later call.
+fn note_membership(data_dir: &str) {
+    let path = Path::new(data_dir).join(MEMBER_MARKER);
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = persist_atomically(&path, "online\n") {
+        warn!(error = %e, "could not persist the group-member marker");
+    }
+}
+
+/// Has this node ever been a member of `group_name`? The marker, or an
+/// executed GTID set that carries the group's own UUID (every group
+/// transaction is tagged with it, so a datadir that replicated anything from
+/// the group says so — the case of members deployed before the marker
+/// existed). A fresh node has neither.
+async fn has_been_group_member(sql: &Sql, data_dir: &str, group_name: &str) -> bool {
+    if read_member_marker(data_dir) {
+        return true;
+    }
+    match sql.executed_gtid_set().await {
+        Ok(set) => set.contains(&format!("{group_name}:")),
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn read_group_name_marker(data_dir: &str) -> Option<String> {
     let content = std::fs::read_to_string(Path::new(data_dir).join(GROUP_NAME_MARKER)).ok()?;
     let trimmed = content.trim();
@@ -337,6 +378,9 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
         .find(|m| m.member_id.eq_ignore_ascii_case(&self_uuid));
     let member_state = me.map(|m| m.state.clone());
     let group_active = group_active_from(member_state.as_deref(), &members);
+    if member_state.as_deref() == Some("ONLINE") {
+        note_membership(data_dir);
+    }
 
     Ok(GrState {
         group_active,
@@ -1462,7 +1506,10 @@ pub async fn orchestrate(
         // a converted root's deploy failed on registry credentials, the two
         // fresh replicas waited out the dwell, waived it and bootstrapped an
         // EMPTY group, which the edge then served for two days.
-        let may_waive = read_group_name_marker(&config.data_dir).is_some()
+        // "Has been a group member" is the member marker or the group's own
+        // GTIDs in this datadir — never the group-name marker, which every
+        // node writes before it has met anyone (see MEMBER_MARKER).
+        let may_waive = has_been_group_member(&sql, &config.data_dir, &group_name).await
             || has_pre_gtid_data(&config.data_dir);
         let mut never_member_holds: Vec<&String> = Vec::new();
         let mut unproven_gone: Vec<String> = Vec::new();
