@@ -2216,6 +2216,134 @@ t_pitr_rejected_credentials_are_named_in_status() {
     || bad "objects landed under the archive root despite the rejected credential"
 }
 
+# A customer's migration runs while the daily full is being dumped. MySQL's
+# manual: while a --single-transaction dump runs, no other connection may
+# ALTER/CREATE/DROP/RENAME/TRUNCATE a table being dumped, or the dump reads
+# wrong contents or fails — and a restore from such a full is wrong from its
+# base. The archiver holds LOCK INSTANCE FOR BACKUP across the dump: DDL waits
+# for it, DML flows, and a scheduled full taken under a DDL storm neither
+# fails nor lies — a restore to a target after the storm serves exactly the
+# source's tables and rows.
+t_pitr_full_backup_holds_ddl_and_stays_consistent() {
+  log "t_pitr_full_backup_holds_ddl_and_stays_consistent"
+  docker rm -f mysql-pitr-ddl-src mysql-pitr-ddl-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-ddl-src mysql-ha-e2e-vol-mysql-pitr-ddl-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_ARCHIVE_REGION=us-east-1"
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-ddl"
+    -e "BINLOG_FULL_BACKUP_INTERVAL_SECONDS=45"
+  )
+  start_standalone mysql-pitr-ddl-src "${archive_env[@]}"
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs mysql-pitr-ddl-src 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs mysql-pitr-ddl-src 2>&1 | tail -40; return; }
+  node_logged mysql-pitr-ddl-src "holding the instance backup lock for the dump" \
+    && ok "the initial full held the instance backup lock" \
+    || bad "the initial full did not take the instance backup lock"
+  sql mysql-pitr-ddl-src "CREATE DATABASE t; CREATE TABLE t.kv (k INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64));"
+
+  # The storm: DDL and DML interleaved for ~90 s, across the scheduled full
+  # due ~45 s in. Every statement's failure is counted; DDL may WAIT for the
+  # dump, none may fail, and DML must never wait on the lock.
+  local failures
+  failures="$(mktemp)"
+  (
+    i=0
+    end=$(( $(date +%s) + 90 ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+      i=$((i+1))
+      sql mysql-pitr-ddl-src "CREATE TABLE t.storm_$i (id INT PRIMARY KEY, note VARCHAR(32)); INSERT INTO t.storm_$i VALUES (1,'made'); ALTER TABLE t.storm_$i ADD COLUMN extra INT DEFAULT 0; INSERT INTO t.kv (v) VALUES ('during-storm-$i');" >/dev/null 2>&1 || echo "iteration $i failed" >> "$failures"
+      [ $((i % 3)) -eq 0 ] && { sql mysql-pitr-ddl-src "DROP TABLE t.storm_$i;" >/dev/null 2>&1 || echo "drop $i failed" >> "$failures"; }
+      # Close a binlog every few iterations so the shipping pass has files to
+      # upload AND reclaim throughout the storm — some of those reclaims land
+      # while the scheduled full holds the backup lock, which refuses PURGE.
+      [ $((i % 3)) -eq 0 ] && sql mysql-pitr-ddl-src "FLUSH BINARY LOGS;" >/dev/null 2>&1
+    done
+    echo "$i" > "$failures.count"
+  ) &
+  local storm_pid=$!
+  wait_until 120 "scheduled full backup completed under the storm" \
+    bash -c 'docker logs mysql-pitr-ddl-src 2>&1 | grep -q "scheduled full backup completed"' \
+    || { bad "no scheduled full completed while DDL ran"; kill "$storm_pid" 2>/dev/null; docker logs mysql-pitr-ddl-src 2>&1 | tail -40; return; }
+  wait "$storm_pid" 2>/dev/null
+  local iterations
+  iterations="$(cat "$failures.count" 2>/dev/null || echo 0)"
+  log "storm ran $iterations iterations; failures: $(wc -l < "$failures" | tr -d ' ')"
+  [ "$iterations" -ge 10 ] && ok "the storm ran $iterations DDL+DML iterations across the scheduled full" || bad "the storm barely ran ($iterations iterations)"
+  [ ! -s "$failures" ] \
+    && ok "no statement failed while the full was dumped (DDL waited, DML flowed)" \
+    || bad "statements failed during the full: $(head -3 "$failures" | tr '\n' ';')"
+  rm -f "$failures" "$failures.count"
+  node_logged mysql-pitr-ddl-src "full backup failed" \
+    && bad "a full backup failed under the DDL storm (the dump saw a table change under it)" \
+    || ok "no full backup failed under the storm"
+  [ "$(docker logs mysql-pitr-ddl-src 2>&1 | grep -c "holding the instance backup lock for the dump")" -ge 2 ] \
+    && ok "the scheduled full held the instance backup lock too" \
+    || bad "the scheduled full did not take the instance backup lock"
+  # The lock refuses PURGE BINARY LOGS outright (server error 4085). The
+  # archiver's own reclaim must step aside for its own dump — never be
+  # counted as a shipping failure that lands on /pitr and reaches the monitor.
+  node_logged mysql-pitr-ddl-src "binlog reclaim deferred" \
+    && log "a reclaim overlapped a dump and was deferred (the case under test occurred)" \
+    || log "no reclaim overlapped a dump in this run (the case under test did not occur; the guards below still hold)"
+  node_logged mysql-pitr-ddl-src "binlog shipping pass failed" \
+    && bad "a shipping pass was reported failed while the fulls held the backup lock: $(docker logs mysql-pitr-ddl-src 2>&1 | grep 'binlog shipping pass failed' | head -1 | cut -c1-200)" \
+    || ok "no shipping pass was reported failed across the storm's fulls"
+  [ -z "$(pitr_field mysql-pitr-ddl-src localhost last_error)" ] \
+    && ok "/pitr carries no last_error after the storm" \
+    || bad "/pitr carries a last_error after the storm: $(pitr_field mysql-pitr-ddl-src localhost last_error)"
+  node_logged mysql-pitr-ddl-src "reclaimed uploaded binlogs" \
+    && ok "uploaded binlogs were reclaimed once the lock was released" \
+    || bad "no reclaim ever ran across the storm"
+
+  # The source's shape at T, then a restore to T must match it exactly.
+  sleep 2
+  local t
+  t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  local src_tables src_rows
+  src_tables="$(sql mysql-pitr-ddl-src "SELECT GROUP_CONCAT(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_schema='t'")"
+  src_rows="$(sql mysql-pitr-ddl-src "SELECT COUNT(*) FROM t.kv")"
+  sleep 2
+  sql mysql-pitr-ddl-src "INSERT INTO t.kv (v) VALUES ('after-t');"
+  sql mysql-pitr-ddl-src "FLUSH BINARY LOGS;"
+  wait_until 60 "binlog shipped" \
+    bash -c 'docker logs mysql-pitr-ddl-src 2>&1 | grep -q "binlog uploaded"' \
+    || { bad "binlog was never shipped to the bucket"; return; }
+
+  local recover_env=(
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD"
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1"
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000"
+    -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-ddl"
+    -e "MYSQL_RECOVERY_TARGET_TIME=$t"
+  )
+  start_standalone mysql-pitr-ddl-restore "${recover_env[@]}"
+  wait_until 240 "restore after the storm completed and serving" \
+    bash -c 'docker exec mysql-pitr-ddl-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a restore from the full taken under the storm did not complete"; docker logs mysql-pitr-ddl-restore 2>&1 | tail -60; return; }
+  node_logged mysql-pitr-ddl-restore "selected full backup for restore" && ok "the restore started from the full taken under the storm" || bad "the restore selected no full"
+  local fork_tables fork_rows
+  fork_tables="$(sql mysql-pitr-ddl-restore "SELECT GROUP_CONCAT(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_schema='t'")"
+  fork_rows="$(sql mysql-pitr-ddl-restore "SELECT COUNT(*) FROM t.kv")"
+  [ "$fork_tables" = "$src_tables" ] \
+    && ok "the fork's tables match the source's at T" \
+    || bad "table set differs: source [$src_tables] vs fork [$fork_tables]"
+  [ "$fork_rows" = "$src_rows" ] \
+    && ok "the fork's kv rows ($fork_rows) match the source's at T" \
+    || bad "kv rows differ: source $src_rows vs fork $fork_rows"
+
+  docker rm -f mysql-pitr-ddl-src mysql-pitr-ddl-restore mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm mysql-ha-e2e-vol-mysql-pitr-ddl-src mysql-ha-e2e-vol-mysql-pitr-ddl-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
 # The target is UTC and the replay's cut-off is `--stop-datetime`, which
 # mysqlbinlog reads in ITS local time zone; the wrapper pins TZ=UTC on that
 # process. A customer's service may well run with TZ set (Railway passes the
@@ -4179,7 +4307,7 @@ t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary() {
   pitr_ha_teardown "$restore"
 }
 
-ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
+ALL_TESTS=(t_group_forms_and_replicates t_failover_on_primary_pause t_cold_restart_preserves_group t_adoption_survives_seed_disadvantaged_race t_conversion_adopts_standalone_volume t_scale_up_to_five t_minority_partition_write_fence t_patch_skew_on_redeploy t_total_outage_after_failover t_first_seed_permanent_loss t_password_variable_edit_does_not_rotate t_haproxy_stats_page_authenticates_remote_clients t_revert_to_standalone_drops_recovery_user t_sigterm_primary_demotes_before_exit t_graceful_double_stop_reforms t_clean_double_stop_keeps_fence t_deleted_peer_unfences_bootstrap t_paused_peer_keeps_the_fence t_split_brain_fork_self_heals t_switchover_promotes_requested_node t_wiped_primary_volume_rejoins_fresh t_restore_identical_datadirs t_boot_wedged_member_self_heals t_stuck_error_member_self_heals t_no_quorum_no_wipe t_pitr_archive_and_restore_to_point_in_time t_pitr_full_backup_holds_ddl_and_stays_consistent t_pitr_restore_honours_utc_targets_under_a_local_timezone t_pitr_disable_then_reenable_ships_the_gap_late t_pitr_rejected_credentials_are_named_in_status t_pitr_restore_reaches_the_fulls_named_instant t_pitr_archive_root_belongs_to_one_service t_pitr_restore_never_serves_the_half_loaded_database t_pitr_restore_replays_a_large_single_statement t_pitr_retention_expires_the_archive_without_breaking_restore t_pitr_restore_silently_stops_short_of_target t_binlog_expiry_silently_loses_unshipped_data t_conversion_cross_version_upgrade t_pitr_ha_archives_from_the_primary_and_follows_switchover t_pitr_ha_scale_up_then_remove_the_archiver t_pitr_ha_revert_to_standalone_keeps_the_archive t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary t_pitr_ha_group_expiry_hole_is_reported_and_refused t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump)
 
 main() {
   ensure_image
