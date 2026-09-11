@@ -27,6 +27,17 @@ MINIO_ROOT_PASSWORD="e2e-minio-password"
 PITR_BUCKET="mysql-pitr-e2e"
 MINIO_HOST_PORT=""
 
+# The server and its mc client, from quay.io — the registry MinIO's own
+# install docs point at. Docker Hub's `minio/minio` and `minio/mc` stopped
+# resolving on 2026-09-11 (the Hub API answers 404 and the registry 401 for
+# both), so every `docker run minio/...` in this file died on the pull and
+# took all sixteen PITR scenarios with it, on every branch at once. Pinned to
+# a release rather than to `latest` so the next thing that moves upstream
+# cannot do it again: these two tags are the images the suite was already
+# running before the removal.
+MINIO_IMAGE="quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+MC_IMAGE="quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z"
+
 PASS=0
 FAIL=0
 FAILED_TESTS=()
@@ -180,6 +191,24 @@ start_reverted_node() {
     "$IMAGE" >/dev/null
 }
 
+# ensure_minio_images — pull the two minio images once, up front, saying what
+# the registry said when a pull fails. Every other `docker run` against them
+# in this file discards stdout and stderr, so a pull that cannot succeed
+# surfaces there as whatever the scenario could not do NEXT — a host port
+# that cannot be read, a bucket listing that comes back empty — which is the
+# same "I could not look" read as "nothing is there" that mc_count below
+# exists to avoid. One pull, one honest error, before any of that.
+ensure_minio_images() {
+  local img err
+  for img in "$MINIO_IMAGE" "$MC_IMAGE"; do
+    docker image inspect "$img" >/dev/null 2>&1 && continue
+    if ! err="$(docker pull -q "$img" 2>&1 >/dev/null)"; then
+      log "could not pull $img: $err"
+      return 1
+    fi
+  done
+}
+
 # start_minio — a minio container standing in for the S3-compatible bucket
 # the PITR env contract points at, on the shared e2e network, with
 # PITR_BUCKET pre-created via the mc client. The wrapper containers reach it
@@ -188,13 +217,18 @@ start_reverted_node() {
 # (`-p 9000` with no host part) rather than a fixed guess, which collided
 # with an unrelated local listener in practice.
 start_minio() {
+  ensure_minio_images || return 1
   docker volume create --label "$LABEL" mysql-ha-e2e-minio-data >/dev/null
-  docker run -d --label "$LABEL" --name mysql-ha-e2e-minio --hostname mysql-ha-e2e-minio \
+  local err
+  if ! err="$(docker run -d --label "$LABEL" --name mysql-ha-e2e-minio --hostname mysql-ha-e2e-minio \
     --network "$NET" --network-alias mysql-ha-e2e-minio \
     -p 9000 \
     -v mysql-ha-e2e-minio-data:/data \
     -e MINIO_ROOT_USER="$MINIO_ROOT_USER" -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
-    minio/minio server /data >/dev/null
+    "$MINIO_IMAGE" server /data 2>&1 >/dev/null)"; then
+    log "minio container did not start: $err"
+    return 1
+  fi
 
   MINIO_HOST_PORT="$(docker port mysql-ha-e2e-minio 9000/tcp | head -1 | awk -F: '{print $NF}')"
   [ -n "$MINIO_HOST_PORT" ] || { log "could not determine minio's assigned host port"; return 1; }
@@ -203,9 +237,9 @@ start_minio() {
     bash -c "curl -sf http://localhost:$MINIO_HOST_PORT/minio/health/live >/dev/null 2>&1" \
     || return 1
 
-  # minio/mc's entrypoint is `mc` itself, not a shell — override it to chain
+  # the mc image's entrypoint is `mc` itself, not a shell — override it to chain
   # the alias-set and bucket-create in one container.
-  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc mb --ignore-existing e2e/$PITR_BUCKET >/dev/null" \
     >/dev/null 2>&1
 }
@@ -219,7 +253,7 @@ start_minio() {
 # corrupted/dropped — which is a deterministic way to punch a hole in the
 # archive without racing the archiver's own ~10s ship-poll timing.
 mc_rm_key() {
-  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc rm e2e/$PITR_BUCKET/$1" \
     >/dev/null 2>&1
 }
@@ -230,7 +264,7 @@ mc_rm_key() {
 # timestamps, which is the only way to exercise a horizon measured in days
 # inside a test run.
 mc_put_key() {
-  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && printf '%s' '$2' | mc pipe e2e/$PITR_BUCKET/$1" \
     >/dev/null 2>&1
 }
@@ -246,7 +280,7 @@ mc_put_key() {
 # when it genuinely holds none; anything else is a broken listing, not zero.
 mc_count() {
   local out rc
-  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc find e2e/$PITR_BUCKET/$1" 2>&1)"
   rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -266,7 +300,7 @@ mc_count() {
 # object this suite checks by exact key (the shared-history marker, one per
 # archive) needs `mc stat` instead, which resolves the key directly.
 mc_exists() {
-  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc stat e2e/$PITR_BUCKET/$1 >/dev/null 2>&1"
 }
 
@@ -274,7 +308,7 @@ mc_exists() {
 # contains a substring. Same fail-loud contract as mc_count.
 mc_count_matching() {
   local out rc
-  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc find e2e/$PITR_BUCKET/$1" 2>&1)"
   rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -304,7 +338,7 @@ prefix_is_empty() {
 # there".
 mc_find_keys() {
   local out rc
-  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc find e2e/$PITR_BUCKET/$1" 2>&1)"
   rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -321,7 +355,7 @@ mc_find_keys() {
 # mc_cat_key <exact-key> — print an object's content; non-zero when it could
 # not be read.
 mc_cat_key() {
-  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc cat e2e/$PITR_BUCKET/$1" 2>/dev/null
 }
 
@@ -330,7 +364,7 @@ mc_cat_key() {
 # timestamps, which is the only way to exercise a horizon measured in days
 # inside a test run.
 mc_put_key() {
-  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && printf '%s' '$2' | mc pipe e2e/$PITR_BUCKET/$1" \
     >/dev/null 2>&1
 }
@@ -3359,7 +3393,7 @@ node_logged() { docker logs "$1" 2>&1 | grep -qF "$2"; }
 # prefix. Fail-loud contract as mc_count.
 mc_lineage_count() {
   local out rc
-  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh minio/mc \
+  out="$(docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc find e2e/$PITR_BUCKET/$1" 2>&1)"
   rc=$?
   if [ "$rc" -eq 0 ]; then
