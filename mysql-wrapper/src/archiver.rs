@@ -649,7 +649,11 @@ async fn take_full_backup(
     location: &S3Location,
     server_uuid: &str,
 ) -> Result<DateTime<Utc>> {
-    let taken_at = Utc::now();
+    // Floored to the millisecond so the meta records exactly the instant the
+    // object name carries: the platform reads that name to offer the oldest
+    // restorable point, and restore judges "at or before" at the same
+    // precision (`pitr::newest_qualifying_full`).
+    let taken_at = pitr::floor_to_millis(Utc::now());
     let rfc = pitr::format_rfc3339_millis(taken_at);
     let dump_key = pitr::full_dump_key(location, server_uuid, &rfc);
     let meta_key = pitr::full_meta_key(location, server_uuid, &rfc);
