@@ -108,6 +108,17 @@ pin: a member redeployed after the edit rejoins the group on the password the
 group enforces, and its `gr_recovery` account is left on it. A distinct
 `GR_REPLICATION_PASSWORD` literal is used as written.
 
+What the pin cannot do: a member that is (re)provisioned while the variable is
+drifted — a scale-up on a fresh volume, a self-heal that discards its datadir,
+a clone, or the HA conversion of a standalone whose variable was edited — has
+no pin to follow. It derives the credential from the edited value, the donors
+refuse it, and it cannot join until `MYSQL_ROOT_PASSWORD` (and with it
+`GR_REPLICATION_PASSWORD`) is set back to the active password and the member is
+redeployed. The wrapper says so, once per episode, as an ERROR line beginning
+`… refused by the donor: it does not accept this node's recovery credential`
+naming that way out, with a `recovery_credential_refused` telemetry event, and
+keeps retrying.
+
 ## The HAProxy stats page
 
 Each edge serves HAProxy's stats page on `8404/stats`. From inside the edge

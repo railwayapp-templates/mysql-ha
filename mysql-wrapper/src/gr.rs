@@ -1412,7 +1412,10 @@ pub async fn orchestrate(
         warn!(
             "GR_REPLICATION_PASSWORD follows MYSQL_ROOT_PASSWORD, which no longer matches the \
              active root password; the recovery credential follows the pinned active password \
-             so this member stays in the group — variable edits do not rotate the live credential"
+             so this member stays in the group — variable edits do not rotate the live credential. \
+             Members redeployed on their own volume rejoin; a member (re)provisioned while the \
+             variable is drifted (scale-up, self-heal wipe, clone, HA conversion) has no pin to \
+             follow and cannot join until MYSQL_ROOT_PASSWORD is set back to the active password"
         );
     }
     if let Err(e) = sql
@@ -1550,6 +1553,9 @@ pub async fn orchestrate(
     let mut last_never_member_note = String::new();
     let mut last_unproven_gone_note = String::new();
     let mut adopted_refusal_reported = false;
+    // A donor refusing this node's recovery credential is reported once per
+    // episode; any clone attempt that ends another way closes the episode.
+    let mut clone_refusal_reported = false;
     let gone_dwell = Duration::from_secs(config.peer_gone_dwell_seconds);
     let dns_deadline = Duration::from_millis(config.peer_query_timeout_ms);
 
@@ -1895,14 +1901,32 @@ pub async fn orchestrate(
                                     )
                                     .await
                                 {
-                                    Ok(()) => info!("divergence reclone completed; server will shut down and rejoin on restart"),
+                                    Ok(()) => {
+                                        clone_refusal_reported = false;
+                                        info!("divergence reclone completed; server will shut down and rejoin on restart")
+                                    }
+                                    // The donor refused the recovery credential
+                                    // (ER_CLONE_DONOR 3862 carrying the donor's
+                                    // 1045): no retry helps until the variable
+                                    // is reverted — say so once, keep retrying.
+                                    Err(e) if crate::sql::is_recovery_credential_refusal(&e) => {
+                                        note_recovery_credential_refused(
+                                            &mut clone_refusal_reported,
+                                            &telemetry,
+                                            "divergence reclone",
+                                            &e,
+                                        )
+                                    }
                                     // A donor already serving another clone
-                                    // returns ER_CLONE_TOO_MANY_CONCURRENT
-                                    // (3862); the next pass retries once it is
+                                    // returns ER_CLONE_TOO_MANY_CONCURRENT_CLONES
+                                    // (3634); the next pass retries once it is
                                     // free. Any other error is the expected
                                     // connection drop of a clone that DID start
                                     // and shut the server down.
-                                    Err(e) => info!(error = %e, "divergence reclone did not complete this pass (donor busy, or the expected shutdown drop); will retry"),
+                                    Err(e) => {
+                                        clone_refusal_reported = false;
+                                        info!(error = %e, "divergence reclone did not complete this pass (donor busy, or the expected shutdown drop); will retry")
+                                    }
                                 }
                             }
                             tokio::time::sleep(POLL_INTERVAL).await;
@@ -2036,9 +2060,22 @@ pub async fn orchestrate(
                         // almost always the dropped connection of that
                         // shutdown, not a failure.
                         Ok(()) => {
+                            clone_refusal_reported = false;
                             info!("clone completed; server will shut down and rejoin on restart")
                         }
+                        // Except a donor that refused the credential: that
+                        // clone never started, and no retry starts it until
+                        // the variable is reverted.
+                        Err(e) if crate::sql::is_recovery_credential_refusal(&e) => {
+                            note_recovery_credential_refused(
+                                &mut clone_refusal_reported,
+                                &telemetry,
+                                "clone from the group",
+                                &e,
+                            )
+                        }
                         Err(e) => {
+                            clone_refusal_reported = false;
                             info!(error = %e, "clone initiated (connection drop on shutdown is expected)")
                         }
                     }
@@ -2447,6 +2484,47 @@ fn wait_log_once(last: &mut String, reason: &str) -> bool {
         return true;
     }
     false
+}
+
+/// A donor refused the recovery credential this node presented for
+/// `purpose` (a clone from the group, a divergence or stuck-member reclone).
+/// In the template's coupled shape (`GR_REPLICATION_PASSWORD` stamped from
+/// `MYSQL_ROOT_PASSWORD`) that means this node derived the credential from
+/// its own boot password — the edited variable, on a volume with no pin to
+/// disagree — while the group stays on the pinned active password. Retrying
+/// cannot change the outcome until the variable is reverted, so the caller
+/// keeps retrying exactly as for a busy donor, and this says why, once per
+/// episode: an ERROR line with the way out and one telemetry event. The flag
+/// is the episode; the caller clears it when a clone attempt ends any other
+/// way. Shared with the stuck-member self-heal (self_heal.rs).
+pub(crate) fn note_recovery_credential_refused(
+    reported: &mut bool,
+    telemetry: &Telemetry,
+    purpose: &str,
+    e: &anyhow::Error,
+) {
+    if *reported {
+        debug!(error = %e, "{purpose} still refused by the donor; the variable has not been reverted");
+        return;
+    }
+    *reported = true;
+    error!(
+        error = %e,
+        "{purpose} refused by the donor: it does not accept this node's recovery credential. \
+         GR_REPLICATION_PASSWORD follows MYSQL_ROOT_PASSWORD, and this node derived the credential \
+         from its own boot password — the edited variable, with no pin on this volume to follow — \
+         while the group enforces the pinned active password. Retrying cannot help until the \
+         variable is reverted. Way out: set MYSQL_ROOT_PASSWORD (and with it GR_REPLICATION_PASSWORD) \
+         back to the active password, then redeploy this member. Retrying until then"
+    );
+    telemetry.send(TelemetryEvent::ComponentError {
+        component: "mysql-wrapper".to_string(),
+        error: format!(
+            "{purpose} refused: the donor does not accept this node's recovery credential \
+             (MYSQL_ROOT_PASSWORD drifted from the active password; revert it and redeploy this member)"
+        ),
+        context: "recovery_credential_refused".to_string(),
+    });
 }
 
 /// The clone donor among the live group's members — the PRIMARY when one is

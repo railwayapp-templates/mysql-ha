@@ -601,6 +601,9 @@ pub async fn stuck_watch(
     // counted ledger so the post-clone re-persist can't regress it.
     let mut mid_heal: Option<HealLedger> = None;
     let mut last_note = String::new();
+    // A donor refusing the recovery credential is reported once per episode
+    // (gr::note_recovery_credential_refused); any other clone outcome ends it.
+    let mut clone_refusal_reported = false;
 
     loop {
         sleep(STUCK_POLL).await;
@@ -800,9 +803,23 @@ pub async fn stuck_watch(
             // shutdown or a busy donor (one clone per donor at a time) —
             // the next pass retries until the donor frees up.
             Ok(()) => {
+                clone_refusal_reported = false;
                 info!("reclone completed; server will shut down and rejoin on restart");
             }
+            // A donor that refused the credential never started the clone;
+            // retrying cannot help until the variable is reverted — say so
+            // once per episode, keep retrying (the attempt cap still paces
+            // this loop exactly as before).
+            Err(e) if crate::sql::is_recovery_credential_refusal(&e) => {
+                gr::note_recovery_credential_refused(
+                    &mut clone_refusal_reported,
+                    &telemetry,
+                    "stuck-member reclone",
+                    &e,
+                );
+            }
             Err(e) => {
+                clone_refusal_reported = false;
                 info!(error = %e, "reclone did not complete this pass (donor busy, or the expected shutdown drop); will retry");
             }
         }
