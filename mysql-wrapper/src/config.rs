@@ -131,6 +131,13 @@ pub struct Config {
     pub binlog_archive_region: Option<String>,
     pub binlog_archive_endpoint: Option<String>,
     pub binlog_archive_path: String,
+    /// Why archiving is refused for this boot although `BINLOG_ARCHIVE_BUCKET`
+    /// is set: a missing sibling or a malformed value, named. Archiving stays
+    /// off (`archive_enabled()` is false), mysqld serves exactly as without
+    /// the archive contract, and the reason reaches `/pitr` as `last_error`
+    /// (see main.rs). Never fatal: an archive setting may cost the backups,
+    /// never the database.
+    pub archive_refusal: Option<String>,
     /// How often a fresh full backup is taken once one already exists
     /// (BINLOG_FULL_BACKUP_INTERVAL_SECONDS).
     pub binlog_full_backup_interval_seconds: u64,
@@ -200,7 +207,7 @@ impl Config {
                 .map(|raw| crate::pitr::parse_target_time(&raw))
                 .transpose()?;
 
-        let config = Self {
+        let mut config = Self {
             mysql_root_password,
             mysql_port: u16::env_parse("MYSQL_PORT", 3306),
             server_id: non_empty(std::env::var("SERVER_ID").ok()).and_then(|v| v.parse().ok()),
@@ -240,6 +247,7 @@ impl Config {
             binlog_archive_region: non_empty(std::env::var("BINLOG_ARCHIVE_REGION").ok()),
             binlog_archive_endpoint: non_empty(std::env::var("BINLOG_ARCHIVE_ENDPOINT").ok()),
             binlog_archive_path: String::env_or("BINLOG_ARCHIVE_PATH", "/binlog"),
+            archive_refusal: None,
             binlog_full_backup_interval_seconds: u64::env_parse(
                 "BINLOG_FULL_BACKUP_INTERVAL_SECONDS",
                 86_400,
@@ -278,17 +286,12 @@ impl Config {
             bail!("GR_REPLICATION_PASSWORD must be set when GR_SEEDS is set");
         }
 
-        if config.binlog_archive_bucket.is_some()
-            && (config.binlog_archive_key.is_none()
-                || config.binlog_archive_secret.is_none()
-                || config.binlog_archive_region.is_none()
-                || config.binlog_archive_endpoint.is_none())
-        {
-            bail!(
-                "BINLOG_ARCHIVE_KEY, BINLOG_ARCHIVE_SECRET, BINLOG_ARCHIVE_REGION, and \
-                 BINLOG_ARCHIVE_ENDPOINT must all be set when BINLOG_ARCHIVE_BUCKET is set"
-            );
-        }
+        // The archive contract is checked here but never refuses the boot: a
+        // database that is already running must not go down because one of
+        // its archive variables is missing or malformed. The refusal is kept,
+        // archiving stays off for this boot, and main.rs surfaces the reason
+        // on /pitr (last_error), in the log and to telemetry.
+        config.archive_refusal = archive_config_refusal(&config);
 
         if config.binlog_recover_from_bucket.is_some()
             != config.mysql_recovery_target_time.is_some()
@@ -308,6 +311,11 @@ impl Config {
             );
         }
 
+        // The recover-from shapes are judged where a restore actually runs
+        // (restore::run → a `recover-config` refusal on the verdict line), so
+        // a serving database that still carries its fork's recover variables
+        // is never stopped by them.
+
         Ok(config)
     }
 
@@ -315,10 +323,17 @@ impl Config {
         self.gr_enabled_flag && self.gr_seeds.is_some()
     }
 
-    /// The archive gate: BINLOG_ARCHIVE_BUCKET (and its required siblings,
-    /// already validated in `from_env`) are set.
-    pub fn archive_enabled(&self) -> bool {
+    /// The archive contract is present: BINLOG_ARCHIVE_BUCKET is set, well
+    /// formed or not. What `/pitr` reports as `archive_configured`.
+    pub fn archive_configured(&self) -> bool {
         self.binlog_archive_bucket.is_some()
+    }
+
+    /// The archive gate: the contract is present AND usable (every sibling
+    /// set, bucket and endpoint well formed). False with `archive_refusal`
+    /// naming why when the contract is present but not usable.
+    pub fn archive_enabled(&self) -> bool {
+        self.archive_configured() && self.archive_refusal.is_none()
     }
 
     /// The restore gate: BINLOG_RECOVER_FROM_BUCKET + MYSQL_RECOVERY_TARGET_TIME
@@ -416,6 +431,71 @@ impl Config {
 /// meant the same as unset for every optional field here.
 fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.is_empty())
+}
+
+/// A bucket is one name. Under path-style addressing a slash would quietly
+/// turn the rest into a key prefix inside some other bucket, and whitespace
+/// never reaches S3 at all; both come from a hand-edited variable, so the
+/// refusal names the variable and where a prefix belongs.
+/// Why the archive contract, present, cannot be used: the first of a missing
+/// sibling, a malformed bucket, a malformed endpoint. `None` when the
+/// contract is absent or usable.
+fn archive_config_refusal(config: &Config) -> Option<String> {
+    let bucket = config.binlog_archive_bucket.as_deref()?;
+    if config.binlog_archive_key.is_none()
+        || config.binlog_archive_secret.is_none()
+        || config.binlog_archive_region.is_none()
+        || config.binlog_archive_endpoint.is_none()
+    {
+        return Some(
+            "BINLOG_ARCHIVE_KEY, BINLOG_ARCHIVE_SECRET, BINLOG_ARCHIVE_REGION, and \
+             BINLOG_ARCHIVE_ENDPOINT must all be set when BINLOG_ARCHIVE_BUCKET is set"
+                .to_string(),
+        );
+    }
+    if let Err(e) = check_bucket_shape("BINLOG_ARCHIVE_BUCKET", bucket) {
+        return Some(e.to_string());
+    }
+    if let Some(endpoint) = config.binlog_archive_endpoint.as_deref() {
+        if let Err(e) = check_endpoint_shape("BINLOG_ARCHIVE_ENDPOINT", endpoint) {
+            return Some(e.to_string());
+        }
+    }
+    None
+}
+
+pub(crate) fn check_bucket_shape(var: &str, value: &str) -> Result<()> {
+    if value.contains('/') || value.chars().any(char::is_whitespace) {
+        let path_var = var.replace("_BUCKET", "_PATH");
+        bail!(
+            "{var} must be a bare bucket name - got {value} - a prefix inside the bucket \
+             belongs in {path_var}"
+        );
+    }
+    Ok(())
+}
+
+/// An endpoint the S3 SDK can dial is an absolute http(s) URL with a host. A
+/// bare host (the pgBackRest convention) fails inside the SDK on every request
+/// with a construction error that names no variable; refusing it at boot names
+/// the fix.
+pub(crate) fn check_endpoint_shape(var: &str, value: &str) -> Result<()> {
+    let lower = value.to_ascii_lowercase();
+    let Some(rest) = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+    else {
+        // No comma and no quotes in the message: it travels as /pitr's
+        // last_error, and readers that cut the JSON value at the first comma
+        // (the fleet monitor's banner, the e2e's pitr_field) must still see
+        // the variable AND the fix.
+        bail!("{var} must be an absolute http(s) URL - got {value} - set it to https://{value}");
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        bail!("{var} has no host, got {value:?}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -677,12 +757,18 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         base_env();
         env::set_var("BINLOG_ARCHIVE_BUCKET", "my-bucket");
-        let err = Config::from_env().err().expect("should fail");
-        assert!(err.to_string().contains("BINLOG_ARCHIVE_KEY"));
+        // A missing sibling never stops the database: the config is built,
+        // archiving is off, and the refusal names the variable.
+        let config = Config::from_env().expect("a missing archive sibling is not fatal");
+        assert!(config.archive_configured());
+        assert!(!config.archive_enabled());
+        let refusal = config.archive_refusal.as_deref().expect("refusal recorded");
+        assert!(refusal.contains("BINLOG_ARCHIVE_KEY"), "{refusal}");
 
         set_archive_env();
         let config = Config::from_env().unwrap();
         assert!(config.archive_enabled());
+        assert!(config.archive_refusal.is_none());
         let loc = config.archive_s3_location().unwrap();
         assert_eq!(loc.bucket, "my-bucket");
         assert_eq!(loc.access_key, "ak");
@@ -690,6 +776,90 @@ mod tests {
         assert_eq!(loc.region, "auto");
         assert_eq!(loc.endpoint, "https://s3.example.com");
         assert_eq!(loc.path, "/binlog");
+    }
+
+    #[test]
+    fn archive_endpoint_without_a_scheme_refuses_archiving_not_the_boot() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        set_archive_env();
+        env::set_var("BINLOG_ARCHIVE_ENDPOINT", "s3.example.com");
+        let config = Config::from_env().expect("a malformed endpoint is not fatal");
+        assert!(config.archive_configured());
+        assert!(!config.archive_enabled());
+        let refusal = config.archive_refusal.clone().expect("refusal recorded");
+        assert!(refusal.contains("BINLOG_ARCHIVE_ENDPOINT"), "{refusal}");
+        assert!(refusal.contains("https://s3.example.com"), "{refusal}");
+
+        env::set_var("BINLOG_ARCHIVE_ENDPOINT", "https://");
+        let config = Config::from_env().expect("a host-less endpoint is not fatal");
+        assert!(!config.archive_enabled());
+        assert!(config
+            .archive_refusal
+            .as_deref()
+            .unwrap_or("")
+            .contains("no host"));
+
+        env::set_var("BINLOG_ARCHIVE_ENDPOINT", "HTTP://minio:9000/");
+        let config = Config::from_env().expect("an http URL with a port is a valid endpoint");
+        assert!(config.archive_enabled());
+    }
+
+    #[test]
+    fn archive_bucket_with_a_path_refuses_archiving_not_the_boot() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        set_archive_env();
+        env::set_var("BINLOG_ARCHIVE_BUCKET", "my-bucket/binlog");
+        let config = Config::from_env().expect("a malformed bucket is not fatal");
+        assert!(!config.archive_enabled());
+        let refusal = config.archive_refusal.clone().expect("refusal recorded");
+        assert!(refusal.contains("BINLOG_ARCHIVE_BUCKET"), "{refusal}");
+        assert!(refusal.contains("BINLOG_ARCHIVE_PATH"), "{refusal}");
+
+        env::set_var("BINLOG_ARCHIVE_BUCKET", "my bucket");
+        let config = Config::from_env().expect("whitespace in the bucket is not fatal");
+        assert!(!config.archive_enabled());
+        assert!(config.archive_refusal.is_some());
+    }
+
+    #[test]
+    fn recover_from_shapes_never_refuse_the_boot() {
+        // A serving database may still carry its fork's recover variables;
+        // their shape is judged only where a restore runs (restore::run).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        set_restore_env();
+        env::set_var("BINLOG_RECOVER_FROM_BUCKET", "src/bucket");
+        env::set_var("BINLOG_RECOVER_FROM_ENDPOINT", "s3.example.com");
+        let config = Config::from_env().expect("malformed recover-from shapes are not fatal");
+        assert!(config.restore_enabled());
+        let loc = config.restore_s3_location().unwrap();
+        assert_eq!(loc.bucket, "src/bucket");
+        assert_eq!(loc.endpoint, "s3.example.com");
+    }
+
+    #[test]
+    fn shape_checks_name_the_variable_and_the_fix() {
+        let err = check_bucket_shape("BINLOG_RECOVER_FROM_BUCKET", "src/bucket")
+            .err()
+            .expect("a slash is refused")
+            .to_string();
+        assert!(err.contains("BINLOG_RECOVER_FROM_BUCKET"), "{err}");
+        assert!(err.contains("BINLOG_RECOVER_FROM_PATH"), "{err}");
+        assert!(check_bucket_shape("BINLOG_RECOVER_FROM_BUCKET", "src-bucket").is_ok());
+
+        let err = check_endpoint_shape("BINLOG_RECOVER_FROM_ENDPOINT", "s3.example.com")
+            .err()
+            .expect("a bare host is refused")
+            .to_string();
+        assert!(err.contains("https://s3.example.com"), "{err}");
+        let err = check_endpoint_shape("BINLOG_RECOVER_FROM_ENDPOINT", "https://")
+            .err()
+            .expect("a host-less URL is refused")
+            .to_string();
+        assert!(err.contains("no host"), "{err}");
+        assert!(check_endpoint_shape("BINLOG_RECOVER_FROM_ENDPOINT", "HTTP://minio:9000/").is_ok());
     }
 
     #[test]
