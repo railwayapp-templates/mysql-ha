@@ -53,7 +53,9 @@
 use crate::config::Config;
 use crate::pitr::{self, FullBackupMeta, S3Location};
 use crate::s3::S3Client;
-use crate::sql::{role_is_writable_primary, Sql};
+use crate::sql::{
+    role_is_writable_primary, ReadLockAttempt, RunningStatement, Sql, GLOBAL_READ_LOCK_WAIT,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use common::{Telemetry, TelemetryEvent};
@@ -63,7 +65,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tokio::process::Command;
@@ -169,6 +171,22 @@ impl PitrStatus {
         // harness read the rejection off this field.
         let text = format!("{error:#}");
         self.update(|s| s.last_error = Some(text));
+    }
+
+    /// A fault named in words rather than carried by an error value (the
+    /// reclaim deferral that outlived its excuse).
+    fn note_text(&self, text: String) {
+        self.update(|s| s.last_error = Some(text));
+    }
+
+    /// Clear `last_error` when the text it holds satisfies `ours` — so a
+    /// fault that is over goes away without wiping a different, live one.
+    fn clear_error_if(&self, ours: impl FnOnce(&str) -> bool) {
+        self.update(|s| {
+            if s.last_error.as_deref().is_some_and(ours) {
+                s.last_error = None;
+            }
+        });
     }
 }
 
@@ -622,7 +640,14 @@ async fn full_backup_loop(
             "scheduled"
         };
         match take_full_backup(&config, &sql, &s3, &location, &server_uuid).await {
-            Ok(taken_at) => {
+            Ok(FullBackupOutcome::Deferred(reason)) => {
+                // The server was busy in a way the dump would have made the
+                // customer pay for. Nothing failed: ask again after the retry
+                // delay, and nothing lands on /pitr or reaches the monitor.
+                info!(reason, kind, "full backup deferred; retrying");
+                tokio::time::sleep(FULL_BACKUP_RETRY_DELAY).await;
+            }
+            Ok(FullBackupOutcome::Taken(taken_at)) => {
                 status.update(|s| {
                     s.last_full_backup_at = Some(pitr::format_rfc3339_millis(taken_at));
                     // A full that landed proves the bucket, the credentials
@@ -660,6 +685,26 @@ async fn full_backup_loop(
 /// retries) rather than holding the customer's writes any longer.
 const SNAPSHOT_OPEN_WAIT: Duration = Duration::from_secs(60);
 
+/// What one pass of the full-backup loop did.
+enum FullBackupOutcome {
+    Taken(DateTime<Utc>),
+    /// The server was busy in a way a dump would have made the customer pay
+    /// for: a statement the global read lock would have stalled every write
+    /// behind, or that lock's own wait running out. Nothing is wrong — the
+    /// loop asks again after the retry delay, and nothing lands on /pitr.
+    Deferred(String),
+}
+
+/// Would `FLUSH TABLES WITH READ LOCK` wait on this statement past its own
+/// bound? The lock waits for every statement already running, and every new
+/// write queues behind it while it waits: a statement that has already run
+/// as long as the lock is willing to wait is one the lock will time out on —
+/// after stalling writes for the whole wait. Stepping aside beforehand costs
+/// no one anything.
+fn read_lock_would_wait(running: &RunningStatement, wait: Duration) -> bool {
+    running.seconds >= wait.as_secs()
+}
+
 /// `mysqldump --single-transaction --routines --events --triggers
 /// --all-databases`, gzipped, streamed to S3 as it's produced — nothing here
 /// buffers the whole (potentially huge) dump.
@@ -673,30 +718,45 @@ const SNAPSHOT_OPEN_WAIT: Duration = Duration::from_secs(60);
 /// The lock order is the one MySQL Shell's dump utility uses, and it is not
 /// interchangeable:
 ///
-///   1. `FLUSH TABLES WITH READ LOCK` — waits only for statements already
-///      running; a DDL that arrives while it stands queues on the global
-///      lock holding no table.
+///   0. No statement has been running longer than the read lock would wait
+///      (`Sql::longest_running_statement`); otherwise this attempt is
+///      deferred before anyone is made to wait.
+///   1. `FLUSH TABLES WITH READ LOCK` — waits (at most
+///      [`GLOBAL_READ_LOCK_WAIT`]) for statements already running; while it
+///      waits, and until it is released, every new write queues behind it.
+///      A wait that runs out defers the attempt.
 ///   2. `LOCK INSTANCE FOR BACKUP` — immediate under the read lock (no DDL
-///      can be in flight), held across the whole dump: DDL waits, DML flows,
-///      and `--single-transaction` reads one consistent snapshot.
+///      can be in flight), held across the whole dump AND its upload, since
+///      the dump is streamed and mysqldump cannot finish before the bucket
+///      has taken its output: DDL, `TRUNCATE`, account statements and
+///      `PURGE BINARY LOGS` wait, DML flows, and `--single-transaction`
+///      reads one consistent snapshot. Every multipart call is bounded
+///      (s3.rs), so the hold is bounded by a throughput floor, not by the
+///      bucket's goodwill; the hold's length is logged on release.
 ///   3. `SHOW BINARY LOG STATUS` on the read-locking session: nothing
 ///      commits while it stands, so these are the coordinates of the
 ///      snapshot mysqldump opens next.
 ///   4. mysqldump starts; the read lock is released the moment its output
-///      shows the snapshot is open (its first per-database line).
+///      shows the snapshot is open (its first per-database line). Writes
+///      flow again from here — normally well under a second after step 1.
 ///
-/// The other order — the backup lock first, then mysqldump's own FLUSH
-/// TABLES WITH READ LOCK for `--source-data` — deadlocked under a DDL storm
-/// (e2e, 2026-09-11): an ALTER queued on the backup lock already held its
-/// table open, FLUSH TABLES waited for that table, and the dump never
-/// started while the storm's DDL waited on the dump.
+/// INVARIANT: mysqldump 8.4 takes a `FLUSH TABLES WITH READ LOCK` of its own
+/// on any GTID server under `--single-transaction`, `--source-data` or not.
+/// That is harmless ONLY because the wrapper's read lock is already held
+/// when mysqldump starts: no DDL can be holding a table open, so mysqldump's
+/// flush has nothing to wait for. The other order — the backup lock first,
+/// then a read lock — deadlocked under a DDL storm (e2e, 2026-09-11): an
+/// ALTER queued on the backup lock already held its table open, FLUSH TABLES
+/// waited for that table, and the dump never started while the storm's DDL
+/// waited on the dump. Never release the wrapper's read lock before
+/// mysqldump has opened its snapshot.
 async fn take_full_backup(
     config: &Config,
     sql: &Sql,
     s3: &S3Client,
     location: &S3Location,
     server_uuid: &str,
-) -> Result<DateTime<Utc>> {
+) -> Result<FullBackupOutcome> {
     // Floored to the millisecond so the meta records exactly the instant the
     // object name carries: the platform reads that name to offer the oldest
     // restorable point, and restore judges "at or before" at the same
@@ -707,22 +767,42 @@ async fn take_full_backup(
     let meta_key = pitr::full_meta_key(location, server_uuid, &rfc);
 
     info!(%dump_key, "starting full backup");
+    // Step 0: step aside before making anyone wait. The check is a courtesy
+    // to the customer's traffic, not a gate on the backup — if it cannot be
+    // read, the read lock's own bounded wait still holds.
+    match sql.longest_running_statement().await {
+        Ok(Some(running)) if read_lock_would_wait(&running, GLOBAL_READ_LOCK_WAIT) => {
+            return Ok(FullBackupOutcome::Deferred(format!(
+                "a {} statement has been running for {} s ({}); the global read lock would stall every write behind it",
+                running.command, running.seconds, running.info_head
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = %e, "could not look for long-running statements before the global read lock; asking for it anyway")
+        }
+    }
     // Step 1: the global read lock, on a session of its own (see the order
     // above). Dropping the guard on any early exit below releases it.
-    let mut read_lock = sql
+    let mut read_lock = match sql
         .flush_tables_with_read_lock()
         .await
-        .context("could not take the global read lock for the full backup's snapshot")?;
-    // Step 2: held across the dump (released the moment mysqldump exits,
-    // before the meta upload): a concurrent ALTER/CREATE/DROP/RENAME/TRUNCATE
+        .context("could not take the global read lock for the full backup's snapshot")?
+    {
+        ReadLockAttempt::Locked(lock) => lock,
+        ReadLockAttempt::Busy(reason) => return Ok(FullBackupOutcome::Deferred(reason)),
+    };
+    // Step 2: held across the dump and its upload (the dump is streamed, so
+    // the two end together): a concurrent ALTER/CREATE/DROP/RENAME/TRUNCATE
     // on a table being dumped makes `--single-transaction` read wrong
     // contents or fail, and a restore from such a full is wrong from its
-    // base. DDL waits for the dump; DML never waits. See
+    // base. DDL waits for the dump; DML does not wait on this lock. See
     // Sql::lock_instance_for_backup.
     let backup_lock = sql
         .lock_instance_for_backup()
         .await
         .context("could not take the instance backup lock for the full backup")?;
+    let lock_taken = Instant::now();
     // Step 3: the coordinates of the snapshot about to open.
     let (binlog_file, binlog_pos) = read_lock
         .binary_log_status()
@@ -737,6 +817,65 @@ async fn take_full_backup(
     // not the binlogs the dump itself generates while running.
     let datadir_bytes = dir_size_bytes(&config.data_dir).await;
 
+    let outcome = dump_and_upload(config, s3, &dump_key, read_lock).await;
+    drop(backup_lock);
+    let held_secs = lock_taken.elapsed().as_secs();
+    let (scanned, dump_bytes) = match outcome {
+        Ok(dumped) => {
+            info!(held_secs, %dump_key, "instance backup lock released; the dump is in the bucket");
+            dumped
+        }
+        Err(e) => {
+            warn!(held_secs, %dump_key, "instance backup lock released; the dump did not complete");
+            return Err(e);
+        }
+    };
+
+    let dump_head = String::from_utf8_lossy(&scanned);
+    // Present exactly when the source runs with GTIDs (every Group
+    // Replication member does): the set of transactions the dump already
+    // holds, by identity. Restore replays other lineages against it.
+    let gtid_purged = pitr::parse_gtid_purged(&dump_head);
+    let mysql_version = sql
+        .mysql_version()
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let meta = FullBackupMeta {
+        taken_at,
+        binlog_file,
+        binlog_pos,
+        server_uuid: server_uuid.to_string(),
+        mysql_version,
+        gtid_purged,
+        dump_bytes: Some(dump_bytes),
+        datadir_bytes,
+    };
+    let meta_json = serde_json::to_vec_pretty(&meta).context("serializing full-backup meta")?;
+    s3.put_object_bytes(&meta_key, meta_json)
+        .await
+        .context("uploading full-backup meta.json")?;
+    info!(
+        dump_bytes,
+        datadir_bytes = ?datadir_bytes,
+        "full backup sizes recorded in the meta (the platform's restore disk estimate reads them)"
+    );
+
+    Ok(FullBackupOutcome::Taken(taken_at))
+}
+
+/// Steps 4 onward of [`take_full_backup`]: run mysqldump under the locks the
+/// caller holds, release the read lock the moment the snapshot is open, and
+/// stream the gzipped dump to the bucket. Returns the scanned head of the
+/// dump and its plaintext size. The caller owns the instance backup lock
+/// for the whole call and releases it right after — on success and on every
+/// error alike, with the hold's length logged.
+async fn dump_and_upload(
+    config: &Config,
+    s3: &S3Client,
+    dump_key: &str,
+    read_lock: crate::sql::GlobalReadLock,
+) -> Result<(Vec<u8>, u64)> {
     // mysqldump is a separate process and cannot ride the pool's
     // resolved credential: a drifted MYSQL_ROOT_PASSWORD edit would keep
     // the pool working (it starts on the pinned password) while every
@@ -807,7 +946,7 @@ async fn take_full_backup(
                 .release()
                 .await
                 .context("releasing the global read lock once the dump's snapshot was open")?;
-            info!("dump snapshot open at the recorded coordinates; global read lock released (DML flows)");
+            info!("dump snapshot open at the recorded coordinates; global read lock released (writes flow)");
         }
         // The tee ended before any per-database line: mysqldump exited early.
         // Release the lock now; its exit status below says why.
@@ -822,20 +961,23 @@ async fn take_full_backup(
             let _ = mysqldump.kill().await;
             let _ = gzip.kill().await;
             drop(read_lock);
-            drop(backup_lock);
             anyhow::bail!(
                 "mysqldump did not open its snapshot within {SNAPSHOT_OPEN_WAIT:?}; the global read lock was released and this full is abandoned"
             );
         }
     }
-    let upload_result = s3.upload_multipart(&dump_key, gzip_stdout).await;
+    // A failed upload drops gzip's stdout reader: gzip dies on the broken
+    // pipe, the tee's write into it fails, and the `?` below ends this call
+    // — mysqldump and gzip are killed on drop, and the caller releases the
+    // backup lock. Nothing here can wait on a bucket that stopped answering
+    // (every multipart call is bounded, s3.rs).
+    let upload_result = s3.upload_multipart(dump_key, gzip_stdout).await;
 
     let (scanned, dump_bytes) = tee_task
         .await
         .context("tee/scan task panicked")?
         .context("copying mysqldump output into gzip")?;
     let mysqldump_status = mysqldump.wait().await.context("waiting for mysqldump")?;
-    drop(backup_lock);
     let gzip_status = gzip.wait().await.context("waiting for gzip")?;
     upload_result.context("uploading the full backup to S3")?;
 
@@ -845,38 +987,7 @@ async fn take_full_backup(
     if !gzip_status.success() {
         anyhow::bail!("gzip exited with {gzip_status}");
     }
-
-    let dump_head = String::from_utf8_lossy(&scanned);
-    // Present exactly when the source runs with GTIDs (every Group
-    // Replication member does): the set of transactions the dump already
-    // holds, by identity. Restore replays other lineages against it.
-    let gtid_purged = pitr::parse_gtid_purged(&dump_head);
-    let mysql_version = sql
-        .mysql_version()
-        .await
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    let meta = FullBackupMeta {
-        taken_at,
-        binlog_file,
-        binlog_pos,
-        server_uuid: server_uuid.to_string(),
-        mysql_version,
-        gtid_purged,
-        dump_bytes: Some(dump_bytes),
-        datadir_bytes,
-    };
-    let meta_json = serde_json::to_vec_pretty(&meta).context("serializing full-backup meta")?;
-    s3.put_object_bytes(&meta_key, meta_json)
-        .await
-        .context("uploading full-backup meta.json")?;
-    info!(
-        dump_bytes,
-        datadir_bytes = ?datadir_bytes,
-        "full backup sizes recorded in the meta (the platform's restore disk estimate reads them)"
-    );
-
-    Ok(taken_at)
+    Ok((scanned, dump_bytes))
 }
 
 /// The first line mysqldump writes AFTER it has opened its snapshot: it
@@ -977,8 +1088,20 @@ async fn binlog_shipping_loop(
     mode: ArchiveMode,
     status: Arc<PitrStatus>,
 ) {
+    let mut reclaim_watch = ReclaimWatch::default();
     loop {
-        if let Err(e) = ship_once(&config, &sql, &s3, &location, &server_uuid, mode, &status).await
+        if let Err(e) = ship_once(
+            &config,
+            &sql,
+            &s3,
+            &location,
+            &server_uuid,
+            mode,
+            &status,
+            &telemetry,
+            &mut reclaim_watch,
+        )
+        .await
         {
             warn!(error = %e, "binlog shipping pass failed; retrying next cycle");
             status.note_error(&e);
@@ -1276,6 +1399,7 @@ async fn read_archive_lineages(
 /// reclaim local disk by the mode's rule — everything uploaded standalone,
 /// everything uploaded AND past the group's recovery window on a primary
 /// (module doc).
+#[allow(clippy::too_many_arguments)]
 async fn ship_once(
     config: &Config,
     sql: &Sql,
@@ -1284,7 +1408,10 @@ async fn ship_once(
     server_uuid: &str,
     mode: ArchiveMode,
     status: &PitrStatus,
+    telemetry: &Telemetry,
+    reclaim_watch: &mut ReclaimWatch,
 ) -> Result<()> {
+    let full_interval = Duration::from_secs(config.binlog_full_backup_interval_seconds);
     let (active, _pos) = sql
         .binary_log_status()
         .await
@@ -1350,19 +1477,28 @@ async fn ship_once(
         ),
     };
     let cut = match reclaim_decision(cut, sql.backup_lock_held()) {
-        Reclaim::Nothing => return Ok(()),
+        Reclaim::Nothing => {
+            end_reclaim_deferral(reclaim_watch, status);
+            return Ok(());
+        }
         Reclaim::Defer(cut) => {
             // Our own full backup is dumping under LOCK INSTANCE FOR BACKUP,
             // which refuses PURGE BINARY LOGS outright (manual §15.3.5;
             // server error 4085). Everything above already shipped; the files
             // stay on disk until the next pass, which is not a failure and
             // must not be reported as one — a shipping-loop Err lands on
-            // /pitr's last_error and reaches the platform monitor.
+            // /pitr's last_error and reaches the platform monitor. Only a
+            // dump older than the interval between fulls is named (below).
             info!(
                 cut = %cut,
                 "binlog reclaim deferred: this node's full backup holds the instance \
                  backup lock; the next shipping pass reclaims"
             );
+            if let Some(reason) =
+                reclaim_watch.deferred(DeferralCause::OwnFull, full_interval, Instant::now())
+            {
+                report_reclaim_fault(&reason, status, telemetry);
+            }
             return Ok(());
         }
         Reclaim::Purge(cut) => cut,
@@ -1373,16 +1509,26 @@ async fn ship_once(
         .with_context(|| format!("PURGE BINARY LOGS TO {cut}"))?
     {
         crate::sql::PurgeOutcome::DeferredByBackupLock => {
-            // Another session's backup lock (a customer-run backup tool, or a
-            // full of ours whose unlock is still in flight). Same verdict.
+            // Another session's backup lock: `backup_lock_held` reads false
+            // only once our own UNLOCK INSTANCE has run, so this is a lock
+            // that is not this node's full — a customer-run backup tool, or
+            // (rarely) a full of ours that started between the flag read and
+            // the PURGE. One pass is given the benefit of the doubt; a second
+            // in a row is a fault worth naming, because nothing else would
+            // ever say why the volume keeps growing.
             info!(
                 cut = %cut,
                 "binlog reclaim deferred: a session holds the instance backup lock; \
                  the next shipping pass reclaims"
             );
+            if let Some(reason) =
+                reclaim_watch.deferred(DeferralCause::Foreign, full_interval, Instant::now())
+            {
+                report_reclaim_fault(&reason, status, telemetry);
+            }
             return Ok(());
         }
-        crate::sql::PurgeOutcome::Purged => {}
+        crate::sql::PurgeOutcome::Purged => end_reclaim_deferral(reclaim_watch, status),
     }
     {
         // The purged names are gone from disk — nothing left to verify on a
@@ -1421,6 +1567,111 @@ fn reclaim_decision(cut: Option<String>, backup_lock_held: bool) -> Reclaim {
         None => Reclaim::Nothing,
         Some(cut) if backup_lock_held => Reclaim::Defer(cut),
         Some(cut) => Reclaim::Purge(cut),
+    }
+}
+
+/// Why a reclaim was deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferralCause {
+    /// This node's own full backup holds the lock (`Sql::backup_lock_held`).
+    OwnFull,
+    /// Some other session's `LOCK INSTANCE FOR BACKUP`: server error 4085
+    /// with no full of ours holding the lock.
+    Foreign,
+}
+
+/// The first words of the `last_error` a deferral that outlived its excuse
+/// writes to /pitr — and the key by which the next successful reclaim
+/// clears it, and nothing else.
+const RECLAIM_DEFERRED_ERROR_PREFIX: &str = "binlog reclaim deferred";
+
+/// One episode of deferred reclaims, across shipping passes. A deferral is
+/// nothing to report while it is this node's own full doing the deferring
+/// and that full is younger than the interval fulls are due at. It becomes
+/// a fault to name — on /pitr, where the platform reads archive trouble —
+/// when a session that is NOT this node's full holds the lock for two
+/// passes in a row (a customer's backup tool that never unlocked), or when
+/// even our own full has held it past the interval between fulls. Uploaded
+/// binlogs are safe either way; what grows is the volume, silently, and
+/// this is the only place that would ever say why.
+#[derive(Debug, Default)]
+struct ReclaimWatch {
+    since: Option<Instant>,
+    passes: u32,
+    escalated: bool,
+}
+
+impl ReclaimWatch {
+    /// Record one deferred pass. `Some(reason)` exactly once per episode,
+    /// the pass it crosses from "expected" into "a fault to name".
+    fn deferred(
+        &mut self,
+        cause: DeferralCause,
+        full_interval: Duration,
+        now: Instant,
+    ) -> Option<String> {
+        let since = *self.since.get_or_insert(now);
+        self.passes += 1;
+        if self.escalated {
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(since);
+        let fault = match cause {
+            DeferralCause::Foreign => self.passes >= 2,
+            DeferralCause::OwnFull => elapsed > full_interval,
+        };
+        if !fault {
+            return None;
+        }
+        self.escalated = true;
+        Some(match cause {
+            DeferralCause::Foreign => format!(
+                "{RECLAIM_DEFERRED_ERROR_PREFIX} for {} passes ({} s): a session other than this node's \
+                 full backup holds LOCK INSTANCE FOR BACKUP, under which PURGE BINARY LOGS is refused \
+                 (server error 4085); uploaded binlogs stay on the volume until it is released",
+                self.passes,
+                elapsed.as_secs()
+            ),
+            DeferralCause::OwnFull => format!(
+                "{RECLAIM_DEFERRED_ERROR_PREFIX} for {} s: this node's own full backup has held LOCK \
+                 INSTANCE FOR BACKUP longer than the interval between fulls ({} s); uploaded binlogs \
+                 stay on the volume until the dump ends",
+                elapsed.as_secs(),
+                full_interval.as_secs()
+            ),
+        })
+    }
+
+    /// A pass that reclaimed, or found nothing left to reclaim, ends the
+    /// episode. `true` when a fault had been named and is now over.
+    fn resolved(&mut self) -> bool {
+        let named = self.escalated;
+        *self = Self::default();
+        named
+    }
+}
+
+/// The deferral crossed into a fault: say so once, where the platform reads
+/// archive trouble (`/pitr.last_error`, telemetry) and in the log.
+fn report_reclaim_fault(reason: &str, status: &PitrStatus, telemetry: &Telemetry) {
+    warn!(
+        reason,
+        "binlog reclaim deferred past what a full backup of ours explains"
+    );
+    status.note_text(reason.to_string());
+    telemetry.send(TelemetryEvent::ComponentError {
+        component: "mysql-wrapper".to_string(),
+        error: reason.to_string(),
+        context: "pitr_binlog_reclaim".to_string(),
+    });
+}
+
+/// The episode is over: if it had been named on /pitr, take the name back —
+/// and only that name, never a different live fault.
+fn end_reclaim_deferral(watch: &mut ReclaimWatch, status: &PitrStatus) {
+    if watch.resolved() {
+        info!("binlog reclaim resumed; the deferral named on /pitr is over");
+        status.clear_error_if(|text| text.starts_with(RECLAIM_DEFERRED_ERROR_PREFIX));
     }
 }
 
@@ -1577,6 +1828,87 @@ mod tests {
     fn no_reclaim_cut_means_nothing_to_do_lock_or_not() {
         assert_eq!(reclaim_decision(None, true), Reclaim::Nothing);
         assert_eq!(reclaim_decision(None, false), Reclaim::Nothing);
+    }
+
+    #[test]
+    fn our_own_full_defers_reclaim_silently_within_the_interval_between_fulls() {
+        let mut watch = ReclaimWatch::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let interval = Duration::from_secs(3600);
+        for pass in 0..6u64 {
+            let verdict = watch.deferred(DeferralCause::OwnFull, interval, at(pass * 10));
+            assert_eq!(verdict, None);
+        }
+        // Nothing was named, so nothing is taken back.
+        assert!(!watch.resolved());
+    }
+
+    #[test]
+    fn our_own_full_holding_the_lock_past_the_interval_is_named_once() {
+        let mut watch = ReclaimWatch::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let interval = Duration::from_secs(60);
+        let own = DeferralCause::OwnFull;
+        assert_eq!(watch.deferred(own, interval, at(0)), None);
+        assert_eq!(watch.deferred(own, interval, at(30)), None);
+        let named = watch
+            .deferred(own, interval, at(61))
+            .expect("past the interval the deferral is a fault");
+        assert!(named.starts_with(RECLAIM_DEFERRED_ERROR_PREFIX));
+        assert!(named.contains("own full backup"));
+        // Once per episode: the next pass says nothing new.
+        assert_eq!(watch.deferred(own, interval, at(70)), None);
+        // A named fault is taken back when reclaim resumes.
+        assert!(watch.resolved());
+    }
+
+    #[test]
+    fn a_foreign_backup_lock_gets_one_pass_of_doubt_then_is_named() {
+        let mut watch = ReclaimWatch::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let interval = Duration::from_secs(86400);
+        let foreign = DeferralCause::Foreign;
+        // The first refused PURGE may be our own full that started between the
+        // flag read and the statement — not a fault yet.
+        assert_eq!(watch.deferred(foreign, interval, at(0)), None);
+        let named = watch
+            .deferred(foreign, interval, at(10))
+            .expect("a second refused pass in a row names the foreign lock");
+        assert!(named.starts_with(RECLAIM_DEFERRED_ERROR_PREFIX));
+        assert!(named.contains("other than this node's full backup"));
+        assert!(named.contains("4085"));
+        assert_eq!(watch.deferred(foreign, interval, at(20)), None);
+    }
+
+    #[test]
+    fn a_reclaim_that_succeeds_ends_the_episode_and_a_new_one_starts_clean() {
+        let mut watch = ReclaimWatch::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let interval = Duration::from_secs(86400);
+        let foreign = DeferralCause::Foreign;
+        assert_eq!(watch.deferred(foreign, interval, at(0)), None);
+        // A purge went through: one refused pass was never a fault.
+        assert!(!watch.resolved());
+        // The next episode starts from zero — again one pass of doubt.
+        assert_eq!(watch.deferred(foreign, interval, at(100)), None);
+    }
+
+    #[test]
+    fn the_read_lock_steps_aside_for_a_statement_as_old_as_its_own_wait() {
+        let wait = Duration::from_secs(5);
+        let running = |seconds| RunningStatement {
+            seconds,
+            command: "Query".to_string(),
+            info_head: "ALTER TABLE t.big ADD COLUMN c INT".to_string(),
+        };
+        assert!(!read_lock_would_wait(&running(0), wait));
+        assert!(!read_lock_would_wait(&running(4), wait));
+        assert!(read_lock_would_wait(&running(5), wait));
+        assert!(read_lock_would_wait(&running(3600), wait));
     }
 
     fn temp_dir(tag: &str) -> String {

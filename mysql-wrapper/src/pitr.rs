@@ -459,66 +459,6 @@ pub fn describe_fallback_fulls(fulls: &[FullBackupRef], selected: &FullBackupRef
         .join(", ")
 }
 
-/// Which `mysqldump` coordinate flag to use: MySQL 8.0.23+ renamed
-/// `--master-data` to `--source-data` (and the emitted comment from
-/// `CHANGE MASTER TO` to `CHANGE REPLICATION SOURCE TO`) as part of the
-/// replication-terminology modernization. Probing the installed binary's
-/// `--help` output at runtime (this function's input) is what actually
-/// decides it; `dump_data_flag_by_major` below is only the fallback for when
-/// the probe itself can't run.
-pub fn pick_dump_data_flag(mysqldump_help: &str) -> &'static str {
-    if mysqldump_help.contains("--source-data") {
-        "--source-data=2"
-    } else {
-        "--master-data=2"
-    }
-}
-
-/// Fallback when `mysqldump --help` itself couldn't be run: every MySQL 8.x
-/// build the wrapper ships (8.0.23+, since the image floors at 8.0/8.4/9.x
-/// series) understands `--source-data`; only a pre-8.0.23 server would need
-/// the old spelling, which this image line never bundles — kept as a
-/// defensive floor, not a live code path.
-pub fn dump_data_flag_by_major(mysql_major: u32) -> &'static str {
-    if mysql_major >= 8 {
-        "--source-data=2"
-    } else {
-        "--master-data=2"
-    }
-}
-
-/// The leading major version number out of `@@version` (e.g. "8" from
-/// "8.4.3" or "8.0.39-standard"). Only consulted when the `mysqldump --help`
-/// probe itself couldn't run (see `dump_data_flag_by_major`).
-pub fn mysql_major_version(version: &str) -> Option<u32> {
-    version.split(['.', '-']).next()?.parse().ok()
-}
-
-/// Parse the coordinate line `mysqldump --source-data=2` (or the older
-/// `--master-data=2`) emits, commented out, near the top of the dump:
-///
-/// ```text
-/// -- CHANGE MASTER TO MASTER_LOG_FILE='binlog.000003', MASTER_LOG_POS=157;
-/// -- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='binlog.000003', SOURCE_LOG_POS=157;
-/// ```
-///
-/// Handles both spellings; `None` when neither is present (e.g. the flag
-/// wasn't actually applied, or `dump_head` didn't reach far enough into the
-/// file — see the archiver's scan cap).
-pub fn parse_change_master_coords(dump_head: &str) -> Option<(String, u64)> {
-    for line in dump_head.lines() {
-        if !(line.contains("CHANGE MASTER TO") || line.contains("CHANGE REPLICATION SOURCE TO")) {
-            continue;
-        }
-        let file = extract_quoted(line, "MASTER_LOG_FILE=")
-            .or_else(|| extract_quoted(line, "SOURCE_LOG_FILE="))?;
-        let pos = extract_number(line, "MASTER_LOG_POS=")
-            .or_else(|| extract_number(line, "SOURCE_LOG_POS="))?;
-        return Some((file, pos));
-    }
-    None
-}
-
 /// Pull the GTID set a mysqldump embeds out of the head of its output:
 ///
 /// ```text
@@ -709,25 +649,6 @@ fn format_binlog_uuid(bytes: &[u8]) -> String {
 /// and is not consulted.
 pub fn binlog_opened_before_cutoff(created_at: DateTime<Utc>, target: DateTime<Utc>) -> bool {
     created_at.timestamp() < target.timestamp()
-}
-
-fn extract_quoted(line: &str, key: &str) -> Option<String> {
-    let idx = line.find(key)? + key.len();
-    let rest = line[idx..].strip_prefix('\'')?;
-    let end = rest.find('\'')?;
-    Some(rest[..end].to_string())
-}
-
-fn extract_number(line: &str, key: &str) -> Option<u64> {
-    let idx = line.find(key)? + key.len();
-    let rest = &line[idx..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    if end == 0 {
-        return None;
-    }
-    rest[..end].parse().ok()
 }
 
 /// mysqld binlog file names are a fixed basename plus a zero-padded numeric
@@ -1753,81 +1674,6 @@ mod tests {
     }
 
     #[test]
-    fn dump_data_flag_prefers_source_data_when_supported() {
-        assert_eq!(
-            pick_dump_data_flag("Usage: mysqldump ...\n  --source-data[=name]"),
-            "--source-data=2"
-        );
-        assert_eq!(
-            pick_dump_data_flag("Usage: mysqldump ...\n  --master-data[=name]"),
-            "--master-data=2"
-        );
-        assert_eq!(pick_dump_data_flag(""), "--master-data=2");
-    }
-
-    #[test]
-    fn dump_data_flag_by_major_floors_at_8() {
-        assert_eq!(dump_data_flag_by_major(9), "--source-data=2");
-        assert_eq!(dump_data_flag_by_major(8), "--source-data=2");
-        assert_eq!(dump_data_flag_by_major(5), "--master-data=2");
-    }
-
-    #[test]
-    fn mysql_major_version_parses_the_leading_number() {
-        assert_eq!(mysql_major_version("8.4.3"), Some(8));
-        assert_eq!(mysql_major_version("8.0.39-standard"), Some(8));
-        assert_eq!(mysql_major_version("9.1.0"), Some(9));
-        assert_eq!(mysql_major_version(""), None);
-        assert_eq!(mysql_major_version("not-a-version"), None);
-    }
-
-    #[test]
-    fn parses_change_master_to_spelling() {
-        let head = "-- some header\n\
-                     --\n\
-                     -- Position to start replication or point-in-time recovery from\n\
-                     --\n\
-                     -- CHANGE MASTER TO MASTER_LOG_FILE='binlog.000003', MASTER_LOG_POS=157;\n\
-                     -- more stuff\n";
-        assert_eq!(
-            parse_change_master_coords(head),
-            Some(("binlog.000003".to_string(), 157))
-        );
-    }
-
-    #[test]
-    fn parses_change_replication_source_to_spelling() {
-        let head = "-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='binlog.000012', SOURCE_LOG_POS=98765;\n";
-        assert_eq!(
-            parse_change_master_coords(head),
-            Some(("binlog.000012".to_string(), 98765))
-        );
-    }
-
-    #[test]
-    fn parses_coords_without_a_comment_prefix() {
-        // Defensive: some mysqldump builds/flags don't comment the line.
-        let head = "CHANGE MASTER TO MASTER_LOG_FILE='binlog.000001', MASTER_LOG_POS=4;\n";
-        assert_eq!(
-            parse_change_master_coords(head),
-            Some(("binlog.000001".to_string(), 4))
-        );
-    }
-
-    #[test]
-    fn coords_absent_reads_as_none() {
-        assert_eq!(
-            parse_change_master_coords("-- just a regular header\n"),
-            None
-        );
-        assert_eq!(parse_change_master_coords(""), None);
-        // A line that names the statement but is missing a coordinate is
-        // still None, not a false partial match.
-        let malformed = "-- CHANGE MASTER TO MASTER_LOG_FILE='binlog.000001';\n";
-        assert_eq!(parse_change_master_coords(malformed), None);
-    }
-
-    #[test]
     fn meta_json_round_trips() {
         let m = meta("2026-08-13T14:00:00.000Z", "uuid-1");
         let json = serde_json::to_string(&m).unwrap();
@@ -2703,11 +2549,6 @@ mod tests {
             Some(
                 "8f0e1c2a-0000-0000-0000-000000000001:1-13,9a110000-0000-0000-0000-000000000002:1-2"
             )
-        );
-        // The coordinate parser is untouched by the GTID line ahead of it.
-        assert_eq!(
-            parse_change_master_coords(head),
-            Some(("binlog.000004".to_string(), 197))
         );
     }
 

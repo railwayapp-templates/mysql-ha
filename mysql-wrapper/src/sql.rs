@@ -22,13 +22,20 @@ const SHORT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKUP_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// How long a full backup waits for `FLUSH TABLES WITH READ LOCK` before
-/// giving this attempt up (the loop retries). The lock waits for statements
-/// already running to finish, and while it waits new writes queue behind it
-/// — so this bound is also the longest stall a customer's traffic can see
-/// from a backup, the same bound as the instance backup lock. mysqldump's
-/// own `--source-data` used to take this very lock with the server default
-/// of a year.
-const GLOBAL_READ_LOCK_WAIT: Duration = Duration::from_secs(60);
+/// stepping aside (the attempt is deferred, not failed; the loop retries).
+/// The lock waits for statements already running to finish, and while it
+/// waits EVERY new write queues behind it — so this bound is the longest
+/// stall a customer's writes can see from a backup. Kept to seconds: the
+/// archiver looks for long-running statements before asking (see
+/// `Sql::longest_running_statement`), so the lock is normally granted at
+/// once, and a statement that slips in just before costs at most this.
+/// mysqldump's own `--source-data` used to take this very lock with the
+/// server default of a year.
+pub const GLOBAL_READ_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// `ER_LOCK_WAIT_TIMEOUT`: the wait above ran out. The server was busy, not
+/// broken — the one error the read lock turns into a deferral.
+pub const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
 
 /// The global read lock (`FLUSH TABLES WITH READ LOCK`), alive while this
 /// value is — for the instant a dump needs to open its snapshot at the
@@ -74,6 +81,34 @@ impl Drop for GlobalReadLock {
             });
         }
     }
+}
+
+/// What asking for the global read lock came to.
+pub enum ReadLockAttempt {
+    Locked(GlobalReadLock),
+    /// The wait ran out: a statement already running outlived it. Not a
+    /// failure of anything — the caller steps aside and asks again later.
+    Busy(String),
+}
+
+/// A statement some other session is running right now — what a `FLUSH
+/// TABLES WITH READ LOCK` would wait for, stalling every new write meanwhile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningStatement {
+    pub seconds: u64,
+    pub command: String,
+    /// The statement's first characters, for the log — never the whole text.
+    pub info_head: String,
+}
+
+fn lock_wait_ran_out(error: &mysql_async::Error) -> bool {
+    matches!(error, mysql_async::Error::Server(e) if e.code == ER_LOCK_WAIT_TIMEOUT)
+}
+
+fn disconnect_in_background(conn: mysql_async::Conn) {
+    tokio::spawn(async move {
+        let _ = conn.disconnect().await;
+    });
 }
 
 /// `SHOW BINARY LOG STATUS` (8.4+), falling back to `SHOW MASTER STATUS` on
@@ -260,11 +295,12 @@ impl Sql {
     /// within the bound fails loudly and is retried by its loop rather than
     /// queueing behind a migration for an hour.
     /// `FLUSH TABLES WITH READ LOCK` on a connection of its own, for as long
-    /// as the returned guard lives (see GlobalReadLock). Bounded wait, like
-    /// the backup lock: a statement still running when the lock is asked for
-    /// holds it up, and a backup that cannot start within the bound fails
-    /// loudly and is retried by its loop rather than stalling writes.
-    pub async fn flush_tables_with_read_lock(&self) -> Result<GlobalReadLock> {
+    /// as the returned guard lives (see GlobalReadLock). Bounded wait
+    /// (`GLOBAL_READ_LOCK_WAIT`): a statement still running when the lock is
+    /// asked for holds it up, and while it does every new write queues — so
+    /// a wait that runs out is answered `Busy`, for the caller to step aside
+    /// and try again later, never as a failure of the backup.
+    pub async fn flush_tables_with_read_lock(&self) -> Result<ReadLockAttempt> {
         let pool = self.pool.read().await.clone();
         let mut conn = tokio::time::timeout(SHORT_QUERY_TIMEOUT, pool.get_conn())
             .await
@@ -279,22 +315,55 @@ impl Sql {
                 ))
                 .await?;
                 conn.query_drop("FLUSH TABLES WITH READ LOCK").await?;
-                Ok::<(), anyhow::Error>(())
+                Ok::<(), mysql_async::Error>(())
             })
-            .await
-            .map_err(|_| {
-                anyhow!("FLUSH TABLES WITH READ LOCK did not return within {GLOBAL_READ_LOCK_WAIT:?}")
-            })
-            .and_then(|r| r);
-        if let Err(e) = acquired {
-            tokio::spawn(async move {
-                let _ = conn.disconnect().await;
-            });
-            return Err(e).context(
-                "taking the global read lock for the dump's snapshot (a long statement may be running)",
-            );
+            .await;
+        match acquired {
+            Ok(Ok(())) => Ok(ReadLockAttempt::Locked(GlobalReadLock { conn: Some(conn) })),
+            Ok(Err(e)) if lock_wait_ran_out(&e) => {
+                disconnect_in_background(conn);
+                Ok(ReadLockAttempt::Busy(format!(
+                    "FLUSH TABLES WITH READ LOCK waited {GLOBAL_READ_LOCK_WAIT:?} for a running statement and stepped aside ({e})"
+                )))
+            }
+            Ok(Err(e)) => {
+                disconnect_in_background(conn);
+                Err(e).context("taking the global read lock for the dump's snapshot")
+            }
+            Err(_) => {
+                disconnect_in_background(conn);
+                Ok(ReadLockAttempt::Busy(format!(
+                    "FLUSH TABLES WITH READ LOCK did not return within {GLOBAL_READ_LOCK_WAIT:?}; stepped aside"
+                )))
+            }
         }
-        Ok(GlobalReadLock { conn: Some(conn) })
+    }
+
+    /// The longest-running statement of any other user session, if one is
+    /// running at all — what a global read lock would wait for. Replication
+    /// and Group Replication threads (`system user`), the event scheduler's
+    /// daemon, idle sessions and binlog dump threads run indefinitely by
+    /// design and are not statements the lock waits on; they are left out.
+    pub async fn longest_running_statement(&self) -> Result<Option<RunningStatement>> {
+        self.short(async {
+            let mut conn = self.conn().await?;
+            let row: Option<(i64, String, String)> = conn
+                .query_first(
+                    "SELECT TIME, COMMAND, LEFT(COALESCE(INFO, ''), 120) \
+                     FROM information_schema.PROCESSLIST \
+                     WHERE ID <> CONNECTION_ID() \
+                       AND COMMAND NOT IN ('Sleep', 'Daemon', 'Connect', 'Binlog Dump', 'Binlog Dump GTID') \
+                       AND USER NOT IN ('system user', 'event_scheduler') \
+                     ORDER BY TIME DESC LIMIT 1",
+                )
+                .await?;
+            Ok(row.map(|(seconds, command, info_head)| RunningStatement {
+                seconds: seconds.max(0) as u64,
+                command,
+                info_head,
+            }))
+        })
+        .await
     }
 
     pub async fn lock_instance_for_backup(&self) -> Result<BackupLock> {

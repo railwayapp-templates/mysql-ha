@@ -10,6 +10,8 @@
 
 use crate::pitr::S3Location;
 use anyhow::{anyhow, Context, Result};
+use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
@@ -17,6 +19,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Multipart part size for the unbounded-length archive stream (mysqldump
@@ -24,6 +27,39 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 /// PutObject requires) — 8MB keeps the in-flight buffer small while staying
 /// comfortably above S3's 5MB minimum part size for every part but the last.
 const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// The longest ONE attempt at a multipart call may take before the SDK gives
+/// it up and retries. The full backup is streamed, so the archiver's `LOCK
+/// INSTANCE FOR BACKUP` stays held until the last part is acknowledged: this
+/// bound is what keeps a throttled bucket from holding the customer's DDL for
+/// as long as it pleases. The SDK's stalled-stream protection already fails a
+/// part that moves nothing at all for 5 s; this covers the endpoint that
+/// trickles. One [`MULTIPART_PART_SIZE`] part in this long is a floor of
+/// roughly 70 KiB/s.
+const PART_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Connecting is bounded separately (the attempt timeout would otherwise be
+/// the only bound on a black-holed endpoint).
+const PART_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Attempts per multipart call — the first plus two retries — before the
+/// upload, and the full behind it, fails and the archiver's locks go.
+const PART_ATTEMPTS: u32 = 3;
+
+/// Per-request override for the multipart upload's calls (`create`, every
+/// `upload_part`, `complete`, `abort`): each attempt bounded by
+/// [`PART_ATTEMPT_TIMEOUT`], at most [`PART_ATTEMPTS`] attempts. Scoped to
+/// the multipart calls on purpose — a PutObject of a large closed binlog or a
+/// GetObject of a full has no lock behind it and keeps the client's defaults,
+/// where a bound sized for an 8 MiB part would fail a legitimate transfer.
+fn multipart_call_override() -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::Config::builder()
+        .timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(PART_CONNECT_TIMEOUT)
+                .operation_attempt_timeout(PART_ATTEMPT_TIMEOUT)
+                .build(),
+        )
+        .retry_config(RetryConfig::standard().with_max_attempts(PART_ATTEMPTS))
+}
 
 #[derive(Clone)]
 pub struct S3Client {
@@ -263,6 +299,8 @@ impl S3Client {
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
+            .customize()
+            .config_override(multipart_call_override())
             .send()
             .await
             .with_context(|| format!("create_multipart_upload {key}"))?;
@@ -282,6 +320,8 @@ impl S3Client {
                     .key(key)
                     .upload_id(&upload_id)
                     .multipart_upload(completed)
+                    .customize()
+                    .config_override(multipart_call_override())
                     .send()
                     .await
                     .with_context(|| format!("complete_multipart_upload {key}"))?;
@@ -308,6 +348,8 @@ impl S3Client {
             .bucket(&self.bucket)
             .key(key)
             .upload_id(upload_id)
+            .customize()
+            .config_override(multipart_call_override())
             .send()
             .await
         {
@@ -348,6 +390,8 @@ impl S3Client {
                 .upload_id(upload_id)
                 .part_number(part_number)
                 .body(ByteStream::from(buf))
+                .customize()
+                .config_override(multipart_call_override())
                 .send()
                 .await
                 .with_context(|| format!("upload_part {part_number} for {key}"))?;
@@ -381,4 +425,30 @@ fn head_failure(key: &str, e: SdkError<HeadObjectError>) -> anyhow::Error {
         None => format!("HEAD {key}"),
     };
     anyhow::Error::new(e).context(context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_multipart_calls_bound_every_attempt_and_the_attempt_count() {
+        // The override is what the streamed full's parts travel under; a
+        // client built from it must carry the bounds it promises.
+        let config = multipart_call_override()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
+        let timeouts = config
+            .timeout_config()
+            .expect("the override sets a timeout config");
+        assert_eq!(
+            timeouts.operation_attempt_timeout(),
+            Some(PART_ATTEMPT_TIMEOUT)
+        );
+        assert_eq!(timeouts.connect_timeout(), Some(PART_CONNECT_TIMEOUT));
+        let retries = config
+            .retry_config()
+            .expect("the override sets a retry config");
+        assert_eq!(retries.max_attempts(), PART_ATTEMPTS);
+    }
 }
