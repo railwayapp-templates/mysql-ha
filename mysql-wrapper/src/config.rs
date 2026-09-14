@@ -111,7 +111,9 @@ pub struct Config {
     pub self_heal_attempt_cap: u32,
     /// Base of the exponential backoff between self-heal attempts, seconds
     /// (SELF_HEAL_BACKOFF_BASE_SECONDS): attempt N+1 waits base * 2^(N-1).
-    /// A clone is heavy on the donor — repeated attempts must space out.
+    /// A clone is heavy on the donor — repeated attempts must space out. The
+    /// point-in-time restore's wipe-and-retry paces itself on the same
+    /// schedule (restore::retry_backoff_seconds), for the same reason.
     pub self_heal_backoff_base_seconds: u64,
     /// TEST-ONLY fault injection, default 0/off
     /// (RAILWAY_TEST_ADOPTION_DETECTION_DELAY_MS): artificially widens the

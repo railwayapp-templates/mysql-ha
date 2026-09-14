@@ -3585,7 +3585,10 @@ t_pitr_restore_silently_stops_short_of_target() {
     -e "BINLOG_RECOVER_FROM_PATH=/e2e-pitr-gap"
     -e "MYSQL_RECOVERY_TARGET_TIME=$t_target"
   )
-  start_standalone mysql-pitr-gap-restore "${recover_env[@]}"
+  # The wipe-and-retry between attempts is paced on SELF_HEAL_BACKOFF_BASE_SECONDS
+  # (production default 60: attempt 2 waits 60 s, attempt 3 waits 120 s). Base
+  # 1 keeps the three bounded attempts of this scenario within seconds.
+  start_standalone mysql-pitr-gap-restore "${recover_env[@]}" -e SELF_HEAL_BACKOFF_BASE_SECONDS=1
 
   # THE decisive assertions. Row B is unrecoverable by construction (its
   # binlog was deleted from the bucket), so "reach the target in full" is
@@ -3616,6 +3619,15 @@ t_pitr_restore_silently_stops_short_of_target() {
   [ "$verdicts" -eq 3 ] \
     && ok "exactly 3 verdict lines before giving up (one per attempt)" \
     || bad "expected exactly 3 verdict lines (one per bounded attempt), saw $verdicts"
+  # Each line says which attempt it was: 1, 2 and 3 of 3, once each. A counter
+  # stuck at 1 (or one that skipped the attempts that died early) fails here.
+  local n attempt_lines
+  for n in 1 2 3; do
+    attempt_lines="$(docker logs mysql-pitr-gap-restore 2>&1 | grep '"message":"point-in-time restore verdict"' | grep '"max_attempts":3' | grep -c "\"attempt\":$n[,}]")"
+    [ "$attempt_lines" -eq 1 ] \
+      && ok "the verdict line for attempt $n/3 appears exactly once" \
+      || bad "expected exactly one verdict line with \"attempt\":$n and \"max_attempts\":3, saw $attempt_lines"
+  done
 
   if docker logs mysql-pitr-gap-restore 2>&1 | grep -q "point-in-time restore completed"; then
     bad "restore claimed completion despite the lineage gap"
