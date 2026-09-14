@@ -146,6 +146,24 @@ async fn main() -> Result<()> {
                      the target, the recovery configuration) and restore onto a fresh volume"
                 );
             }
+            // Paced, not immediate: the restart policy brings this boot up
+            // seconds after the last one died, and every attempt counts —
+            // including one that never reached its InProgress write because
+            // the bucket did not answer. Without a wait the whole attempt
+            // budget is spent inside one transient outage. Same schedule and
+            // knob as the self-heal reprovision (SELF_HEAL_BACKOFF_BASE_SECONDS).
+            let wait_seconds =
+                restore::retry_backoff_seconds(config.self_heal_backoff_base_seconds, attempts);
+            if wait_seconds > 0 {
+                info!(
+                    attempt = attempts + 1,
+                    max_attempts = restore::MAX_RESTORE_ATTEMPTS,
+                    wait_seconds,
+                    "pacing the point-in-time restore retry before wiping the \
+                     partially-restored data directory"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)).await;
+            }
             warn!(
                 attempt = attempts + 1,
                 max_attempts = restore::MAX_RESTORE_ATTEMPTS,

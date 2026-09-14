@@ -169,6 +169,24 @@ pub struct RestoreMarker {
 /// a `failed` attempt the restore's outcome.
 pub const MAX_RESTORE_ATTEMPTS: u32 = 3;
 
+/// Seconds a boot waits before wiping and retrying when the marker already
+/// records `attempts` attempts: none before the first, `base * 2^(attempts-1)`
+/// after that, the shift capped so a corrupt marker cannot wait "forever".
+/// The same schedule, on the same knob (`SELF_HEAL_BACKOFF_BASE_SECONDS`), as
+/// the self-heal reprovision: both discard derived state and rebuild it from
+/// a source that may be having a bad minute. Every attempt counts, including
+/// one that ends before its InProgress write (an S3 dial error, a `no-full`,
+/// the restore-phase mysqld exiting in init), and the restart policy paces
+/// boots seconds apart — unpaced, the three attempts of a fork created during
+/// a transient outage would all land inside that outage, and the cap would
+/// park it for good.
+pub fn retry_backoff_seconds(base: u64, attempts: u32) -> u64 {
+    if attempts == 0 {
+        return 0;
+    }
+    base.saturating_mul(1u64 << u32::min(attempts - 1, 16))
+}
+
 /// How many attempts the marker on this volume records so far (0 when there
 /// is no readable marker).
 pub fn recorded_attempts(data_dir: &str) -> u32 {
@@ -1794,6 +1812,27 @@ mod tests {
         .unwrap();
         assert_eq!(recorded_attempts(&dir), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retry_backoff_is_immediate_first_then_doubles_and_never_overflows() {
+        // Attempt 1 (nothing recorded yet) never waits.
+        assert_eq!(retry_backoff_seconds(60, 0), 0);
+        // Production default (SELF_HEAL_BACKOFF_BASE_SECONDS=60): attempt 2
+        // waits a minute, attempt 3 two — three attempts span minutes, not
+        // the seconds the restart policy leaves between boots.
+        assert_eq!(retry_backoff_seconds(60, 1), 60);
+        assert_eq!(retry_backoff_seconds(60, 2), 120);
+        // The e2e knob: base 1 keeps a three-attempt scenario within seconds.
+        assert_eq!(retry_backoff_seconds(1, 1), 1);
+        assert_eq!(retry_backoff_seconds(1, 2), 2);
+        // A corrupt marker cannot turn into "wait forever": the shift is
+        // capped and the multiplication saturates.
+        assert_eq!(
+            retry_backoff_seconds(60, u32::MAX),
+            retry_backoff_seconds(60, 17)
+        );
+        assert_eq!(retry_backoff_seconds(u64::MAX, 5), u64::MAX);
     }
 
     #[test]
