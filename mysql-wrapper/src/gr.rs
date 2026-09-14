@@ -2922,6 +2922,8 @@ mod tests {
             gr_group_name: None,
             gr_replication_password: Some("rp".to_string()),
             health_port: 8080,
+            health_api_username: crate::health_auth::DEFAULT_USERNAME.to_string(),
+            health_api_password: None,
             private_domain: "mysql-1.railway.internal".to_string(),
             socket_path: "/tmp/nonexistent.sock".to_string(),
             data_dir: "/tmp".to_string(),

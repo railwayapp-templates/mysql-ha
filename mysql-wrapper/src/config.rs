@@ -55,6 +55,14 @@ pub struct Config {
     /// Required in HA mode.
     pub gr_replication_password: Option<String>,
     pub health_port: u16,
+    /// Username the health server's mutating routes expect
+    /// (HEALTH_API_USERNAME, default `railway`). Only meaningful together
+    /// with `health_api_password`.
+    pub health_api_username: String,
+    /// Password the health server's mutating routes (`POST /switchover`)
+    /// require via HTTP Basic auth (HEALTH_API_PASSWORD). Unset leaves them
+    /// open; reads are never gated. See health_auth.rs.
+    pub health_api_password: Option<String>,
     /// This node's private Railway hostname.
     pub private_domain: String,
     /// Unix socket the wrapper uses for its own root connection.
@@ -210,6 +218,11 @@ impl Config {
             gr_group_name: non_empty(std::env::var("GR_GROUP_NAME").ok()),
             gr_replication_password: non_empty(std::env::var("GR_REPLICATION_PASSWORD").ok()),
             health_port: u16::env_parse("HEALTH_PORT", 8080),
+            health_api_username: String::env_or(
+                crate::health_auth::USERNAME_ENV,
+                crate::health_auth::DEFAULT_USERNAME,
+            ),
+            health_api_password: non_empty(std::env::var(crate::health_auth::PASSWORD_ENV).ok()),
             private_domain: RailwayEnv::private_domain(),
             socket_path: String::env_or("MYSQL_SOCKET", "/var/run/mysqld/mysqld.sock"),
             data_dir: non_empty(std::env::var("DATA_DIR").ok())
@@ -309,6 +322,16 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// The credential `POST /switchover` must carry, or `None` when
+    /// HEALTH_API_PASSWORD is unset/blank and the route stays open.
+    pub fn health_api_credential(&self) -> crate::health_auth::Guard {
+        crate::health_auth::Credential::from_env_values(
+            Some(&self.health_api_username),
+            self.health_api_password.as_deref(),
+        )
+        .map(std::sync::Arc::new)
     }
 
     pub fn gr_enabled(&self) -> bool {
@@ -438,6 +461,8 @@ mod tests {
             "GR_GROUP_NAME",
             "GR_REPLICATION_PASSWORD",
             "HEALTH_PORT",
+            "HEALTH_API_USERNAME",
+            "HEALTH_API_PASSWORD",
             "MYSQL_SOCKET",
             "DATA_DIR",
             "RAILWAY_VOLUME_MOUNT_PATH",
@@ -507,6 +532,7 @@ mod tests {
         let config = Config::from_env().unwrap();
         assert_eq!(config.mysql_port, 3306);
         assert_eq!(config.health_port, 8080);
+        assert!(config.health_api_credential().is_none());
         assert_eq!(config.socket_path, "/var/run/mysqld/mysqld.sock");
         assert_eq!(config.data_dir, "/var/lib/mysql");
         assert_eq!(config.conf_dir, "/etc/mysql/conf.d");
@@ -528,6 +554,28 @@ mod tests {
         env::set_var("GR_SEEDS", "mysql-1.railway.internal:3306");
         let err = Config::from_env().err().expect("should fail");
         assert!(err.to_string().contains("GR_REPLICATION_PASSWORD"));
+    }
+
+    #[test]
+    fn health_api_credential_follows_the_password_variable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        // A blank password is "unset": the mutating routes stay open.
+        env::set_var("HEALTH_API_PASSWORD", "   ");
+        assert!(Config::from_env()
+            .unwrap()
+            .health_api_credential()
+            .is_none());
+
+        env::set_var("HEALTH_API_PASSWORD", " api-pw ");
+        let cred = Config::from_env().unwrap().health_api_credential().unwrap();
+        assert_eq!(cred.username, "railway");
+        assert_eq!(cred.password, "api-pw");
+
+        env::set_var("HEALTH_API_USERNAME", "ops");
+        let cred = Config::from_env().unwrap().health_api_credential().unwrap();
+        assert_eq!(cred.username, "ops");
+        assert_eq!(cred.password, "api-pw");
     }
 
     #[test]
