@@ -246,6 +246,30 @@ pub async fn probe_root_password(socket_path: &str, password: &str) -> RootPassw
     }
 }
 
+/// Did a `CLONE INSTANCE` fail because the donor refused the recovery
+/// credential this node presented?
+///
+/// The recipient's own connection is already authenticated as root, so a
+/// donor that turns the credential down reaches us as `ER_CLONE_DONOR`
+/// (3862) carrying the donor's own error in its text — `Clone Donor Error:
+/// 1045 : Access denied for user 'gr_recovery'@'…' (using password: YES)` —
+/// and, on a direct connection, as `ER_ACCESS_DENIED_ERROR` (1045) itself.
+/// Anything else — a donor already serving a clone
+/// (`ER_CLONE_TOO_MANY_CONCURRENT_CLONES`, 3634), the connection drop of a
+/// clone that DID start and shut the server down — is not a refusal and
+/// keeps its "busy donor / expected drop" reading. Looks through `anyhow`
+/// context layers.
+pub fn is_recovery_credential_refusal(e: &anyhow::Error) -> bool {
+    let Some(mysql_async::Error::Server(server)) = e.downcast_ref::<mysql_async::Error>() else {
+        return false;
+    };
+    match server.code {
+        1045 => true,
+        3862 => server.message.contains("1045") || server.message.contains("Access denied"),
+        _ => false,
+    }
+}
+
 impl Sql {
     pub fn connect_root_over_socket(socket_path: &str, root_password: &str) -> Self {
         Self {
@@ -1181,5 +1205,79 @@ mod tests {
         assert_eq!(sql_string_literal("plain"), "'plain'");
         assert_eq!(sql_string_literal("o'brien"), "'o\\'brien'");
         assert_eq!(sql_string_literal("back\\slash"), "'back\\\\slash'");
+    }
+}
+
+#[cfg(test)]
+mod recovery_credential_refusal_tests {
+    use super::is_recovery_credential_refusal;
+
+    fn server_error(code: u16, message: &str) -> anyhow::Error {
+        anyhow::Error::from(mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: message.to_string(),
+            state: "HY000".to_string(),
+        }))
+    }
+
+    #[test]
+    fn a_donor_that_denies_the_credential_is_a_refusal() {
+        // The shape CLONE INSTANCE reports when the donor's gr_recovery
+        // does not hold the password the recipient presented.
+        let e = server_error(
+            3862,
+            "Clone Donor Error: 1045 : Access denied for user 'gr_recovery'@'10.0.0.7' (using password: YES).",
+        );
+        assert!(is_recovery_credential_refusal(&e));
+    }
+
+    #[test]
+    fn a_direct_access_denied_is_a_refusal() {
+        let e = server_error(
+            1045,
+            "Access denied for user 'gr_recovery'@'%' (using password: YES)",
+        );
+        assert!(is_recovery_credential_refusal(&e));
+    }
+
+    #[test]
+    fn the_refusal_is_seen_through_anyhow_context() {
+        let e = server_error(
+            3862,
+            "Clone Donor Error: 1045 : Access denied for user 'gr_recovery'@'x'.",
+        )
+        .context("CLONE INSTANCE FROM mysql-1");
+        assert!(is_recovery_credential_refusal(&e));
+    }
+
+    #[test]
+    fn a_busy_donor_is_not_a_refusal() {
+        let e = server_error(
+            3634,
+            "Too many concurrent clone operations. Maximum allowed - 1.",
+        );
+        assert!(!is_recovery_credential_refusal(&e));
+    }
+
+    #[test]
+    fn a_donor_error_that_is_not_access_denied_is_not_a_refusal() {
+        // ER_CLONE_DONOR wraps every donor-side failure; only the donor's
+        // 1045 is the credential.
+        let e = server_error(3862, "Clone Donor Error: 3874 : Concurrent clone in progress. Please try after clone is complete.");
+        assert!(!is_recovery_credential_refusal(&e));
+    }
+
+    #[test]
+    fn the_shutdown_drop_is_not_a_refusal() {
+        let e = anyhow::Error::from(mysql_async::Error::Io(mysql_async::IoError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ),
+        )));
+        assert!(!is_recovery_credential_refusal(&e));
+        assert!(!is_recovery_credential_refusal(&anyhow::anyhow!(
+            "donor list unavailable"
+        )));
     }
 }
