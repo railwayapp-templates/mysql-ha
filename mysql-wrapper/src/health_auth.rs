@@ -81,17 +81,14 @@ fn parse_basic(header: &HeaderValue) -> Option<(String, String)> {
     Some((user.to_string(), pass.to_string()))
 }
 
-/// Constant-time byte equality: every position of the longer input is
-/// visited and the length difference is folded into the same accumulator,
-/// so neither a length mismatch nor an early differing byte returns sooner.
+/// Constant-time byte equality, `subtle`'s — the same primitive redis-ha's
+/// and mongo-ha's guards use, so the three images share one compare instead
+/// of three hand-rolled loops the optimizer is free to short-circuit. Inputs
+/// of different lengths compare unequal without visiting the bytes; the
+/// length of the configured credential is not what the compare protects.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= usize::from(x ^ y);
-    }
-    diff == 0
+    use subtle::ConstantTimeEq as _;
+    a.ct_eq(b).into()
 }
 
 fn unauthorized() -> Response {
