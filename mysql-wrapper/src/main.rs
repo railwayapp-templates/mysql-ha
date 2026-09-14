@@ -61,7 +61,7 @@ use common::{init_logging, Telemetry, TelemetryEvent};
 use config::Config;
 use health_server::AppState;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -199,7 +199,37 @@ async fn main() -> Result<()> {
 
     // Behind /pitr in both modes; the archiver (or its role supervisor)
     // writes it, the health server reads it.
-    let pitr_status = archiver::PitrStatus::new(config.archive_enabled());
+    let pitr_status = archiver::PitrStatus::new(config.archive_configured());
+    // The archive contract is present but unusable (a sibling missing, a
+    // malformed bucket or endpoint): archiving is off for this boot and
+    // mysqld serves exactly as it would without the contract — which, on a
+    // standalone, means the archive conf (zz-railway-pitr-archive.cnf:
+    // cgroup-sized innodb_buffer_pool_size, binlog_expire_logs_seconds=0,
+    // performance_schema=OFF) is not rendered, so a node that archived with
+    // this exact value on an older image now serves on the no-contract
+    // server settings. Said in the line, because a serving database changing
+    // its buffer pool and binlog retention is something its owner must be
+    // able to read. Loud and where the platform reads it — the log,
+    // telemetry, and /pitr's last_error (the field the PITR monitor's banner
+    // and the enable workflow read) — never fatal: a bad archive setting may
+    // cost the customer their backups, not their database.
+    if let Some(reason) = config.archive_refusal.as_deref() {
+        error!(
+            reason,
+            "PITR archiving refused: the archive configuration is not usable; archiving is \
+             disabled for this boot and mysqld serves with the no-archive-contract server \
+             settings (the archive conf is not rendered: innodb_buffer_pool_size is the \
+             server default instead of the container-sized value and closed binlogs expire \
+             on the server default instead of being kept for the archiver) until the variable \
+             named is fixed and the service redeployed"
+        );
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "mysql-wrapper".to_string(),
+            error: reason.to_string(),
+            context: "pitr_archive_config".to_string(),
+        });
+        pitr_status.note_refusal(reason);
+    }
 
     let mut boot_note = None;
     if config.gr_enabled() {

@@ -145,7 +145,16 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     every `BINLOG_FULL_BACKUP_INTERVAL_SECONDS` after the newest, default a
     day) and continuously ships closed binlogs to an S3-compatible bucket,
     rotating every `BINLOG_ROTATE_INTERVAL_SECONDS` (default 60s) to bound
-    the recovery point objective.
+    the recovery point objective. A contract that is present but unusable
+    (a sibling missing or blank, a bucket that is not a bare name, an
+    endpoint that is not an absolute `http(s)://` URL) never stops the
+    database: archiving is refused for the boot, the refusal names exactly
+    the variable(s) at fault in the log, telemetry and `/pitr`'s
+    `last_error`, and the server runs as it would without the contract —
+    on a standalone that means the archive conf is not rendered, so the
+    buffer pool is the server default rather than the container-sized value
+    and closed binlogs expire on the server default instead of being kept
+    for the archiver, until the variable is fixed and the service redeployed.
     - *Standalone*: the archive conf turns the binlog on (the plain
       rendering leaves it off), and a binlog is only purged locally once its
       upload is confirmed — the volume is the spool during a bucket outage.
