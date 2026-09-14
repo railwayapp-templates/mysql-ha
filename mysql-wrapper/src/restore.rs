@@ -148,7 +148,8 @@ pub struct RestoreMarker {
     /// chain — so a later boot can say what happened before it retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// How many restore attempts this volume has seen, counting this one. The
+    /// How many restore attempts this volume has seen, counting this one —
+    /// including attempts that ended before their InProgress write. The
     /// marker survives `reset_partial_restore` precisely so this survives the
     /// wipe: it is what bounds the wipe-and-retry loop (see
     /// `MAX_RESTORE_ATTEMPTS`). Older markers carry none and read as 0.
@@ -163,8 +164,9 @@ pub struct RestoreMarker {
 /// dump and downloading the binlog run again — until someone deleted the
 /// fork. Three attempts cover a transient (a bucket blip, a client dropping
 /// mid-load) without turning a refused restore into a standing egress bill;
-/// the workflow that started the restore fails on the FIRST verdict anyway
-/// (mono #38619), so nothing waits on the later ones.
+/// the workflow that started the restore reads the verdict line's `attempt`
+/// / `max_attempts` (and waits out a retry it sees starting) before it calls
+/// a `failed` attempt the restore's outcome.
 pub const MAX_RESTORE_ATTEMPTS: u32 = 3;
 
 /// How many attempts the marker on this volume records so far (0 when there
@@ -327,27 +329,25 @@ fn write_restore_marker(
     target: DateTime<Utc>,
     achieved: Option<DateTime<Utc>>,
     reason: Option<&str>,
+    attempt: u32,
 ) -> Result<()> {
     use std::io::Write;
 
-    // The attempt count carries over from whatever marker is already there:
-    // an InProgress write at the start of an attempt bumps it; the terminal
-    // write of the same attempt keeps it.
-    let previous = match read_marker_file(data_dir) {
-        MarkerFile::Present(m) => m.attempts,
-        _ => 0,
-    };
-    let attempts = if matches!(status, RestoreStatus::InProgress) {
-        previous + 1
-    } else {
-        previous.max(1)
-    };
+    // `attempt` is the number this boot computed before it ran anything
+    // (`recorded_attempts + 1`), and every write of the attempt carries it:
+    // the InProgress write once the datadir exists, and the terminal write.
+    // Deriving the count from the marker on disk instead (bump on
+    // InProgress, keep on terminal) undercounted every attempt that ended
+    // before its InProgress write — a bucket the S3 client cannot dial, no
+    // full to select, a restore-phase mysqld that never came up — so the
+    // marker stayed at 1 across those boots, the verdict line said
+    // `attempt=2` forever, and MAX_RESTORE_ATTEMPTS never parked the fork.
     let marker = RestoreMarker {
         status,
         target_time: pitr::format_rfc3339_millis(target),
         achieved_time: achieved.map(pitr::format_rfc3339_millis),
         reason: reason.map(str::to_string),
-        attempts,
+        attempts: attempt,
         updated_at: pitr::format_rfc3339_millis(Utc::now()),
     };
     let json = serde_json::to_string(&marker).context("serializing the PITR restore marker")?;
@@ -372,7 +372,9 @@ fn write_restore_marker(
 /// `Config::restore_enabled()` and the datadir is still uninitialized.
 /// `run`, plus the one line the platform reads. Every attempt ends with a
 /// `point-in-time restore verdict` record — `verdict` completed/refused/failed,
-/// `kind` for refusals, `reason`, `elapsed_seconds` — and a refused or failed
+/// `kind` for refusals, `reason`, `elapsed_seconds`, `attempt` and
+/// `max_attempts` (so a `failed` line the next boot retries is told apart
+/// from the last one) — and a refused or failed
 /// attempt leaves its reason in the marker for the next boot to repeat. The
 /// fork's deployment turns healthy the moment its container is up, so this
 /// line is what tells anyone outside the container how the restore went.
@@ -404,7 +406,13 @@ fn with_said(what: &str, said: &str) -> String {
 
 pub async fn run_reporting(config: &Config) -> Result<()> {
     let started = std::time::Instant::now();
-    match run(config, started).await {
+    // Which attempt this is, counted before the run bumps the marker: the
+    // verdict line says so, and how many the wrapper makes in all, so whoever
+    // reads it can tell a failure the next boot retries from the last one.
+    // The platform's restore workflow used to fail on the FIRST `failed`
+    // verdict while the retry, seconds later, completed the restore.
+    let attempt = recorded_attempts(&config.data_dir) + 1;
+    match run(config, started, attempt).await {
         Ok(()) => Ok(()),
         Err(e) => {
             let (verdict, kind) = classify_restore_error(&e);
@@ -416,6 +424,8 @@ pub async fn run_reporting(config: &Config) -> Result<()> {
                 reason = %reason,
                 target = ?target.map(pitr::format_rfc3339_millis),
                 elapsed_seconds = started.elapsed().as_secs(),
+                attempt,
+                max_attempts = MAX_RESTORE_ATTEMPTS,
                 "point-in-time restore verdict"
             );
             if let Some(target) = target {
@@ -425,7 +435,7 @@ pub async fn run_reporting(config: &Config) -> Result<()> {
                     RestoreStatus::Failed
                 };
                 if let Err(m) =
-                    write_restore_marker(&config.data_dir, status, target, None, Some(&reason))
+                    write_restore_marker(&config.data_dir, status, target, None, Some(&reason), attempt)
                 {
                     warn!(error = %m, "could not record the restore verdict in the marker");
                 }
@@ -435,7 +445,7 @@ pub async fn run_reporting(config: &Config) -> Result<()> {
     }
 }
 
-pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
+pub async fn run(config: &Config, started: std::time::Instant, attempt: u32) -> Result<()> {
     let data_dir = config.data_dir.clone();
     let target = config
         .recovery_target_time()
@@ -559,7 +569,7 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
         .await
         .context("spawning the restore-phase mysqld")?;
 
-    write_marker_once_datadir_exists(&data_dir, &mut child, target).await?;
+    write_marker_once_datadir_exists(&data_dir, &mut child, target, attempt).await?;
 
     let sql = Sql::connect_root_over_socket(&config.socket_path, &config.mysql_root_password);
     wait_for_ready_or_exit(&mut child, &sql).await?;
@@ -616,6 +626,7 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
         target,
         Some(achieved),
         None,
+        attempt,
     )?;
     info!(
         achieved = %pitr::format_rfc3339_millis(achieved),
@@ -627,6 +638,8 @@ pub async fn run(config: &Config, started: std::time::Instant) -> Result<()> {
         target = %pitr::format_rfc3339_millis(target),
         achieved = %pitr::format_rfc3339_millis(achieved),
         elapsed_seconds = started.elapsed().as_secs(),
+        attempt,
+        max_attempts = MAX_RESTORE_ATTEMPTS,
         "point-in-time restore verdict"
     );
     Ok(())
@@ -709,6 +722,7 @@ async fn write_marker_once_datadir_exists(
     data_dir: &str,
     child: &mut Child,
     target: DateTime<Utc>,
+    attempt: u32,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -721,7 +735,7 @@ async fn write_marker_once_datadir_exists(
                     .map(|mut d| d.next().is_some())
                     .unwrap_or(false);
                 if non_empty {
-                    write_restore_marker(data_dir, RestoreStatus::InProgress, target, None, None)?;
+                    write_restore_marker(data_dir, RestoreStatus::InProgress, target, None, None, attempt)?;
                     return Ok(());
                 }
             }
@@ -1585,6 +1599,7 @@ mod tests {
             t(),
             None,
             Some("binlog lineage gap"),
+            1,
         )
         .unwrap();
         assert!(crashed_mid_restore(&dir));
@@ -1597,10 +1612,11 @@ mod tests {
             t(),
             None,
             Some("gunzip exited with 1"),
+            1,
         )
         .unwrap();
         assert!(crashed_mid_restore(&dir));
-        write_restore_marker(&dir, RestoreStatus::Completed, t(), Some(t()), None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::Completed, t(), Some(t()), None, 1).unwrap();
         assert!(!crashed_mid_restore(&dir));
         assert_eq!(previous_attempt(&dir).unwrap().1, None);
     }
@@ -1651,7 +1667,7 @@ mod tests {
     #[test]
     fn in_progress_marker_reads_as_crashed() {
         let dir = temp_dir("in-progress");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None, 1).unwrap();
         assert!(crashed_mid_restore(&dir));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1659,9 +1675,9 @@ mod tests {
     #[test]
     fn completed_marker_is_not_a_crash_and_records_the_achieved_point() {
         let dir = temp_dir("completed");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None, 1).unwrap();
         let achieved = pitr::parse_target_time("2026-08-13T13:59:10.000Z").unwrap();
-        write_restore_marker(&dir, RestoreStatus::Completed, t(), Some(achieved), None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::Completed, t(), Some(achieved), None, 1).unwrap();
         assert!(!crashed_mid_restore(&dir));
         let marker = read_restore_marker(&dir).unwrap();
         assert_eq!(marker.status, RestoreStatus::Completed);
@@ -1676,7 +1692,7 @@ mod tests {
     #[test]
     fn marker_write_publishes_atomically() {
         let dir = temp_dir("atomic");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None, 1).unwrap();
         // The tmp staging file must never survive a successful publish — a
         // stray one would mean the rename pattern regressed to two files.
         assert!(!Path::new(&dir)
@@ -1698,7 +1714,7 @@ mod tests {
     #[test]
     fn reset_partial_restore_wipes_everything_but_the_runtime_lock_and_the_marker() {
         let dir = temp_dir("reset");
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None, 1).unwrap();
         std::fs::create_dir_all(Path::new(&dir).join("mysql")).unwrap();
         std::fs::write(Path::new(&dir).join("mysql").join("ibdata1"), "junk").unwrap();
         std::fs::write(Path::new(&dir).join("binlog.000001"), "junk").unwrap();
@@ -1729,20 +1745,38 @@ mod tests {
     fn attempts_count_each_start_and_survive_the_terminal_write() {
         let dir = temp_dir("attempts");
         assert_eq!(recorded_attempts(&dir), 0, "no marker, no attempts");
-        // Attempt 1: starts, then is refused.
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        // Attempt 1 (recorded 0 + 1): starts, then is refused.
+        let attempt = recorded_attempts(&dir) + 1;
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None, attempt).unwrap();
         assert_eq!(recorded_attempts(&dir), 1);
-        write_restore_marker(&dir, RestoreStatus::Refused, t(), None, Some("binlog lineage gap"))
-            .unwrap();
+        write_restore_marker(
+            &dir,
+            RestoreStatus::Refused,
+            t(),
+            None,
+            Some("binlog lineage gap"),
+            attempt,
+        )
+        .unwrap();
         assert_eq!(recorded_attempts(&dir), 1, "a terminal write keeps the count");
         // The wipe between attempts keeps the marker, so attempt 2 counts on.
         reset_partial_restore(&dir).unwrap();
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        let attempt = recorded_attempts(&dir) + 1;
+        assert_eq!(attempt, 2);
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None, attempt).unwrap();
         assert_eq!(recorded_attempts(&dir), 2);
-        write_restore_marker(&dir, RestoreStatus::Failed, t(), None, Some("gunzip exited with 1"))
-            .unwrap();
+        write_restore_marker(
+            &dir,
+            RestoreStatus::Failed,
+            t(),
+            None,
+            Some("gunzip exited with 1"),
+            attempt,
+        )
+        .unwrap();
         reset_partial_restore(&dir).unwrap();
-        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None).unwrap();
+        let attempt = recorded_attempts(&dir) + 1;
+        write_restore_marker(&dir, RestoreStatus::InProgress, t(), None, None, attempt).unwrap();
         assert_eq!(recorded_attempts(&dir), MAX_RESTORE_ATTEMPTS);
         // A marker written before the field existed reads as 0 attempts.
         std::fs::write(
@@ -1752,6 +1786,51 @@ mod tests {
         .unwrap();
         assert_eq!(recorded_attempts(&dir), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_attempt_that_ends_before_its_in_progress_write_still_counts() {
+        // The shape the cap missed: the S3 client cannot be built, no full
+        // is found, or the restore-phase mysqld exits during initialization.
+        // None of those reach the InProgress write, so the terminal write is
+        // the attempt's only write — and it has to advance the count, or
+        // every boot is "attempt 2" and MAX_RESTORE_ATTEMPTS never parks
+        // the fork.
+        let dir = temp_dir("early-failures");
+        for expected in 1..=MAX_RESTORE_ATTEMPTS {
+            let attempt = recorded_attempts(&dir) + 1;
+            assert_eq!(attempt, expected, "each boot counts one past the marker");
+            write_restore_marker(
+                &dir,
+                RestoreStatus::Failed,
+                t(),
+                None,
+                Some("building the PITR restore S3 client: dial tcp"),
+                attempt,
+            )
+            .unwrap();
+            assert_eq!(recorded_attempts(&dir), expected);
+            reset_partial_restore(&dir).unwrap();
+        }
+        assert!(
+            recorded_attempts(&dir) >= MAX_RESTORE_ATTEMPTS,
+            "after MAX_RESTORE_ATTEMPTS early failures the next boot must park"
+        );
+        // A refusal before the InProgress write counts the same way.
+        let dir2 = temp_dir("early-refusal");
+        let attempt = recorded_attempts(&dir2) + 1;
+        write_restore_marker(
+            &dir2,
+            RestoreStatus::Refused,
+            t(),
+            None,
+            Some("no full backup at or before the target"),
+            attempt,
+        )
+        .unwrap();
+        assert_eq!(recorded_attempts(&dir2), 1);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 
     #[test]
