@@ -433,25 +433,35 @@ fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.is_empty())
 }
 
-/// A bucket is one name. Under path-style addressing a slash would quietly
-/// turn the rest into a key prefix inside some other bucket, and whitespace
-/// never reaches S3 at all; both come from a hand-edited variable, so the
-/// refusal names the variable and where a prefix belongs.
 /// Why the archive contract, present, cannot be used: the first of a missing
 /// sibling, a malformed bucket, a malformed endpoint. `None` when the
 /// contract is absent or usable.
 fn archive_config_refusal(config: &Config) -> Option<String> {
     let bucket = config.binlog_archive_bucket.as_deref()?;
-    if config.binlog_archive_key.is_none()
-        || config.binlog_archive_secret.is_none()
-        || config.binlog_archive_region.is_none()
-        || config.binlog_archive_endpoint.is_none()
-    {
-        return Some(
-            "BINLOG_ARCHIVE_KEY, BINLOG_ARCHIVE_SECRET, BINLOG_ARCHIVE_REGION, and \
-             BINLOG_ARCHIVE_ENDPOINT must all be set when BINLOG_ARCHIVE_BUCKET is set"
-                .to_string(),
-        );
+    // Name exactly the siblings that are missing, not the whole family: the
+    // customer with three of four set must not have to guess which one, and
+    // this string is what the log, telemetry and /pitr's last_error carry.
+    let missing: Vec<&str> = [
+        ("BINLOG_ARCHIVE_KEY", config.binlog_archive_key.is_none()),
+        (
+            "BINLOG_ARCHIVE_SECRET",
+            config.binlog_archive_secret.is_none(),
+        ),
+        (
+            "BINLOG_ARCHIVE_REGION",
+            config.binlog_archive_region.is_none(),
+        ),
+        (
+            "BINLOG_ARCHIVE_ENDPOINT",
+            config.binlog_archive_endpoint.is_none(),
+        ),
+    ]
+    .iter()
+    .filter(|(_, absent)| *absent)
+    .map(|(name, _)| *name)
+    .collect();
+    if !missing.is_empty() {
+        return Some(missing_archive_siblings_refusal(&missing));
     }
     if let Err(e) = check_bucket_shape("BINLOG_ARCHIVE_BUCKET", bucket) {
         return Some(e.to_string());
@@ -464,6 +474,26 @@ fn archive_config_refusal(config: &Config) -> Option<String> {
     None
 }
 
+/// The refusal for missing archive siblings: only the names actually absent
+/// (or blank), so the fix is the variable named and nothing else. No comma
+/// in the message: it travels as /pitr's last_error, and readers that cut
+/// the JSON value at the first comma must still see every name.
+fn missing_archive_siblings_refusal(missing: &[&str]) -> String {
+    let (noun, verb) = if missing.len() == 1 {
+        ("is", "it")
+    } else {
+        ("are", "them")
+    };
+    format!(
+        "{} {noun} not set but BINLOG_ARCHIVE_BUCKET is - set {verb} to enable archiving",
+        missing.join(" and ")
+    )
+}
+
+/// A bucket is one name. Under path-style addressing a slash would quietly
+/// turn the rest into a key prefix inside some other bucket, and whitespace
+/// never reaches S3 at all; both come from a hand-edited variable, so the
+/// refusal names the variable and where a prefix belongs.
 pub(crate) fn check_bucket_shape(var: &str, value: &str) -> Result<()> {
     if value.contains('/') || value.chars().any(char::is_whitespace) {
         let path_var = var.replace("_BUCKET", "_PATH");
@@ -763,7 +793,14 @@ mod tests {
         assert!(config.archive_configured());
         assert!(!config.archive_enabled());
         let refusal = config.archive_refusal.as_deref().expect("refusal recorded");
-        assert!(refusal.contains("BINLOG_ARCHIVE_KEY"), "{refusal}");
+        for name in [
+            "BINLOG_ARCHIVE_KEY",
+            "BINLOG_ARCHIVE_SECRET",
+            "BINLOG_ARCHIVE_REGION",
+            "BINLOG_ARCHIVE_ENDPOINT",
+        ] {
+            assert!(refusal.contains(name), "{refusal}");
+        }
 
         set_archive_env();
         let config = Config::from_env().unwrap();
@@ -776,6 +813,46 @@ mod tests {
         assert_eq!(loc.region, "auto");
         assert_eq!(loc.endpoint, "https://s3.example.com");
         assert_eq!(loc.path, "/binlog");
+    }
+
+    #[test]
+    fn a_missing_archive_sibling_refusal_names_only_the_missing_ones() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        base_env();
+        // One missing: only that one is named; the three present are not.
+        set_archive_env();
+        env::remove_var("BINLOG_ARCHIVE_REGION");
+        let config = Config::from_env().expect("a missing sibling is not fatal");
+        assert!(config.archive_configured());
+        assert!(!config.archive_enabled());
+        let refusal = config.archive_refusal.clone().expect("refusal recorded");
+        assert!(refusal.contains("BINLOG_ARCHIVE_REGION"), "{refusal}");
+        for present in [
+            "BINLOG_ARCHIVE_KEY",
+            "BINLOG_ARCHIVE_SECRET",
+            "BINLOG_ARCHIVE_ENDPOINT",
+        ] {
+            assert!(!refusal.contains(present), "{refusal}");
+        }
+        assert!(
+            !refusal.contains(','),
+            "no comma may travel in last_error: {refusal}"
+        );
+
+        // Two missing, one of them set to the empty string rather than
+        // absent (what a cleared variable arrives as): both named, neither
+        // present one is.
+        set_archive_env();
+        env::remove_var("BINLOG_ARCHIVE_KEY");
+        env::set_var("BINLOG_ARCHIVE_ENDPOINT", "");
+        let config = Config::from_env().expect("two missing siblings are not fatal");
+        assert!(!config.archive_enabled());
+        let refusal = config.archive_refusal.clone().expect("refusal recorded");
+        assert!(refusal.contains("BINLOG_ARCHIVE_KEY"), "{refusal}");
+        assert!(refusal.contains("BINLOG_ARCHIVE_ENDPOINT"), "{refusal}");
+        assert!(!refusal.contains("BINLOG_ARCHIVE_SECRET"), "{refusal}");
+        assert!(!refusal.contains("BINLOG_ARCHIVE_REGION"), "{refusal}");
+        assert!(!refusal.contains(','), "{refusal}");
     }
 
     #[test]

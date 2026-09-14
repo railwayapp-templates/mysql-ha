@@ -2255,8 +2255,14 @@ t_pitr_malformed_archive_config_refuses_archiving_not_the_database() {
     -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-badshape"
   )
   start_standalone mysql-pitr-badshape "${archive_env[@]}"
-  # (b) missing sibling: only the bucket.
-  start_standalone mysql-pitr-nosibling -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+  # (b) missing sibling: three of the four set, REGION absent — so the
+  # assertion below can tell "named the missing one" from "named them all".
+  start_standalone mysql-pitr-nosibling \
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET" \
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER" \
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD" \
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000" \
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-nosibling"
 
   wait_until 120 "node serves mysqld regardless of the malformed archive endpoint" \
     bash -c 'docker exec mysql-pitr-badshape wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
@@ -2286,16 +2292,20 @@ t_pitr_malformed_archive_config_refuses_archiving_not_the_database() {
     && bad "the archiver ran against a malformed endpoint" \
     || ok "the archiver never started against the malformed endpoint"
 
-  wait_until 120 "node serves mysqld with only BINLOG_ARCHIVE_BUCKET set" \
+  wait_until 120 "node serves mysqld with BINLOG_ARCHIVE_REGION missing" \
     bash -c 'docker exec mysql-pitr-nosibling wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
     || { bad "a missing archive sibling must not take the database down"; docker logs mysql-pitr-nosibling 2>&1 | tail -40; return; }
   [ "$(sql mysql-pitr-nosibling "SELECT 1")" = "1" ] \
     && ok "the database answers queries with a missing archive sibling" \
     || bad "the database did not answer with a missing archive sibling"
   last_error="$(pitr_field mysql-pitr-nosibling mysql-pitr-nosibling last_error)"
-  printf '%s' "$last_error" | grep -q 'BINLOG_ARCHIVE_KEY' \
-    && ok "/pitr names the missing sibling (BINLOG_ARCHIVE_KEY) in last_error" \
+  log "last_error: $last_error"
+  printf '%s' "$last_error" | grep -q 'BINLOG_ARCHIVE_REGION' \
+    && ok "/pitr names the missing sibling (BINLOG_ARCHIVE_REGION) in last_error" \
     || bad "/pitr's last_error does not name the missing sibling: '$last_error'"
+  printf '%s' "$last_error" | grep -qE 'BINLOG_ARCHIVE_(KEY|SECRET|ENDPOINT)' \
+    && bad "/pitr's last_error names a sibling that IS set: '$last_error'" \
+    || ok "/pitr names only the missing sibling, not the three that are set"
 
   # Restore side: the recover-from shape is judged on the fork that restores,
   # as a verdict the platform reads (kind is free text, reason verbatim).
