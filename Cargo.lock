@@ -1819,6 +1819,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-types",
  "axum",
+ "base64",
  "chrono",
  "common",
  "mysql_async",
@@ -1826,7 +1827,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
