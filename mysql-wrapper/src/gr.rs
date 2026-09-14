@@ -1112,6 +1112,7 @@ pub async fn orchestrate(
     config: Arc<Config>,
     sql: Sql,
     telemetry: Arc<Telemetry>,
+    active_root_password: String,
     mut group_name: String,
     fresh_datadir: bool,
     healing: Arc<std::sync::atomic::AtomicBool>,
@@ -1248,10 +1249,34 @@ pub async fn orchestrate(
     //     connectivity self-test fails without it, bootstrap node included.
     //     Must precede super_read_only (CREATE USER is a write, even
     //     unlogged).
-    let recovery_password = config
+    //
+    //     The credential FOLLOWS THE ROOT PIN. The template stamps
+    //     `GR_REPLICATION_PASSWORD = ${{MySQL-1.MYSQL_ROOT_PASSWORD}}`, so an edit
+    //     to the root variable changes this value too — while the live root
+    //     password, pinned by password_pin.rs, does not move. Reading the
+    //     variable here rewrote each restarted member's local `gr_recovery`
+    //     to a password no peer holds; the member could never join, and the
+    //     stuck-member self-heal recloned with the same credential until the
+    //     attempt cap parked it. `active_root_password` is what the pin
+    //     resolved at boot, so a coupled credential stays on the password the
+    //     group actually enforces, exactly as root does. A distinct literal is
+    //     taken as written.
+    let env_recovery_password = config
         .gr_replication_password
         .clone()
         .expect("HA mode requires GR_REPLICATION_PASSWORD (validated in Config::from_env)");
+    let recovery_password = recovery_credential(
+        &env_recovery_password,
+        &config.mysql_root_password,
+        &active_root_password,
+    );
+    if recovery_password != env_recovery_password {
+        warn!(
+            "GR_REPLICATION_PASSWORD follows MYSQL_ROOT_PASSWORD, which no longer matches the \
+             active root password; the recovery credential follows the pinned active password \
+             so this member stays in the group — variable edits do not rotate the live credential"
+        );
+    }
     if let Err(e) = sql
         .ensure_recovery_user(RECOVERY_USER, &recovery_password)
         .await
@@ -2171,9 +2196,54 @@ async fn futures_join_all(
     results
 }
 
+/// The password the recovery account and the recovery channel use.
+///
+/// In the template's shape `GR_REPLICATION_PASSWORD` is a reference to
+/// `MYSQL_ROOT_PASSWORD`, so the two environment values are equal — and both
+/// change together when someone edits the root variable, while the live root
+/// password stays pinned (password_pin.rs). A coupled credential therefore
+/// follows the ACTIVE root, never the variable. An operator who set a distinct
+/// literal gets it as written; nothing here second-guesses a deliberate value.
+pub fn recovery_credential(
+    env_recovery_password: &str,
+    env_root_password: &str,
+    active_root_password: &str,
+) -> String {
+    if env_recovery_password == env_root_password {
+        active_root_password.to_string()
+    } else {
+        env_recovery_password.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coupled_recovery_credential_follows_the_active_root_not_the_variable() {
+        // Template shape, root variable edited: env says "new" for both, the
+        // pin says the group still enforces "old". The recovery credential
+        // must be "old", or every restarted member rewrites gr_recovery to a
+        // password no peer accepts.
+        assert_eq!(recovery_credential("new", "new", "old"), "old");
+        // Healthy boot: nothing drifted, the credential is the variable.
+        assert_eq!(recovery_credential("pw", "pw", "pw"), "pw");
+    }
+
+    #[test]
+    fn a_distinct_recovery_literal_is_taken_as_written() {
+        // An operator who chose their own GR_REPLICATION_PASSWORD keeps it,
+        // whatever happened to the root variable.
+        assert_eq!(
+            recovery_credential("repl-secret", "new", "old"),
+            "repl-secret"
+        );
+        assert_eq!(
+            recovery_credential("repl-secret", "pw", "pw"),
+            "repl-secret"
+        );
+    }
 
     // The GTID comparisons themselves run inside mysqld (classify_round →
     // Sql::gtid_compare, exercised in test/e2e.sh); decide() is the pure
