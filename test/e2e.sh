@@ -304,6 +304,13 @@ mc_exists() {
     -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc stat e2e/$PITR_BUCKET/$1 >/dev/null 2>&1"
 }
 
+# mc_cat <key> — the object's bytes on stdout; the caller decompresses and
+# greps. Used to read what a full backup's dump actually carries.
+mc_cat() {
+  docker run --rm --label "$LABEL" --network "$NET" --entrypoint sh "$MC_IMAGE" \
+    -c "mc alias set e2e http://mysql-ha-e2e-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && mc cat e2e/$PITR_BUCKET/$1" 2>/dev/null
+}
+
 # mc_count_matching <prefix> <substring> — objects under a prefix whose key
 # contains a substring. Same fail-loud contract as mc_count.
 mc_count_matching() {
@@ -2514,8 +2521,20 @@ t_pitr_rejected_credentials_are_named_in_status() {
 # the source never had at the target, written with log_bin OFF so nothing
 # records them. The restore-phase mysqld runs with the scheduler disabled; the
 # serving mysqld that boots on the finished datadir runs it as configured.
+#
+# For the scenario to see the difference, the event must be DEFINED on the
+# restore-phase server while a tick falls due — otherwise a scheduler-on
+# server passes it too. So the event is created before a full is taken (its
+# definition travels in the dump and is live from the moment the dump loads),
+# and one 64 MiB statement written after that full makes the binlog replay
+# that follows last seconds. Both premises are asserted: the selected dump
+# carries the definition, and the replay spanned at least two whole seconds
+# (the event ticks every second). The first form of this scenario
+# (2026-09-14) created the event after the initial full, so it reached the
+# fork as the last statement of a millisecond replay and the scheduler-on
+# server shut down before its first tick was due — it passed without the fix.
 t_pitr_restore_keeps_scheduled_events_quiet_during_replay() {
-  log "t_pitr_restore_keeps_scheduled_events_quiet_during_replay"
+  log "t_pitr_restore_keeps_scheduled_events_quiet_during_replay (an event defined in the full stays quiet through a seconds-long replay)"
   docker rm -f mysql-pitr-ev-src mysql-pitr-ev-restore mysql-ha-e2e-minio >/dev/null 2>&1
   docker volume rm mysql-ha-e2e-vol-mysql-pitr-ev-src mysql-ha-e2e-vol-mysql-pitr-ev-restore mysql-ha-e2e-minio-data >/dev/null 2>&1
 
@@ -2528,7 +2547,11 @@ t_pitr_restore_keeps_scheduled_events_quiet_during_replay() {
     -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000"
     -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-events"
   )
-  start_standalone mysql-pitr-ev-src "${archive_env[@]}"
+  # A short full cadence, so a full taken after the event exists lands within
+  # the scenario — and long enough that no further full lands between the
+  # bulk write below and T (that full would carry the write and shrink the
+  # replay this scenario needs).
+  start_standalone mysql-pitr-ev-src "${archive_env[@]}" -e BINLOG_FULL_BACKUP_INTERVAL_SECONDS=45
   wait_until 120 "PITR source node healthy" \
     bash -c 'docker exec mysql-pitr-ev-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
     || { bad "PITR source node never became healthy"; return; }
@@ -2538,12 +2561,22 @@ t_pitr_restore_keeps_scheduled_events_quiet_during_replay() {
   # (1); only the restore-phase server runs with --skip-log-bin (0), so a row
   # with log_bin=0 can only have been written DURING the restore.
   sql mysql-pitr-ev-src "CREATE DATABASE t; CREATE TABLE t.ticks (id INT AUTO_INCREMENT PRIMARY KEY, at DATETIME(3) NOT NULL, logbin TINYINT NOT NULL); CREATE EVENT t.tick ON SCHEDULE EVERY 1 SECOND DO INSERT INTO t.ticks (at, logbin) VALUES (UTC_TIMESTAMP(3), @@log_bin);"
-  wait_until 120 "initial full backup completed" \
-    bash -c 'docker logs mysql-pitr-ev-src 2>&1 | grep -q "initial full backup completed"' \
-    || { bad "initial full backup never completed"; docker logs mysql-pitr-ev-src 2>&1 | tail -40; return; }
+  # The initial full is taken the moment the archiver starts — before the
+  # event existed. Wait for a full that STARTED after the event was created:
+  # any full completed beyond the count of fulls started by now is one.
+  local fulls_started
+  fulls_started="$(docker logs mysql-pitr-ev-src 2>&1 | grep -c '"message":"starting full backup"')"
+  wait_until 120 "a full backup taken after the event was created" \
+    bash -c 'docker logs mysql-pitr-ev-src 2>&1 | grep -c "full backup completed" | awk "{exit !(\$1 > '"$fulls_started"')}"' \
+    || { bad "no full backup was taken after the event was created"; docker logs mysql-pitr-ev-src 2>&1 | tail -40; return; }
   wait_until 30 "the event has ticked a few times" \
     bash -c '[ "$(docker exec mysql-pitr-ev-src mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT COUNT(*) FROM t.ticks" 2>/dev/null)" -ge 3 ]' \
     || { bad "the scheduled event never ran on the source"; return; }
+  # 16384 rows x 4 KiB in ONE statement, written AFTER the full so the restore
+  # replays it: the restore-phase server lives through seconds of replay with
+  # the event defined (the shape t_pitr_restore_replays_a_large_single_statement pins).
+  sql mysql-pitr-ev-src "SET SESSION cte_max_recursion_depth = 20000; CREATE TABLE t.big (id INT AUTO_INCREMENT PRIMARY KEY, payload VARBINARY(4096) NOT NULL); INSERT INTO t.big (payload) WITH RECURSIVE n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 16384) SELECT CONCAT(RANDOM_BYTES(1024), RANDOM_BYTES(1024), RANDOM_BYTES(1024), RANDOM_BYTES(1024)) FROM n;" \
+    || { bad "the 64 MiB single-statement write failed on the source"; return; }
   sleep 2
   local t
   t="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
@@ -2551,10 +2584,11 @@ t_pitr_restore_keeps_scheduled_events_quiet_during_replay() {
   local expected
   expected="$(sql mysql-pitr-ev-src "SELECT COUNT(*) FROM t.ticks WHERE at < '${t:0:10} ${t:11:8}'")"
   log "captured T=$t; the source had $expected ticks before it"
+  local f
+  f="$(active_binlog mysql-pitr-ev-src)"
   sql mysql-pitr-ev-src "FLUSH BINARY LOGS;"
-  wait_until 60 "binlog shipped" \
-    bash -c 'docker logs mysql-pitr-ev-src 2>&1 | grep -q "binlog uploaded"' \
-    || { bad "binlog was never shipped to the bucket"; docker logs mysql-pitr-ev-src 2>&1 | tail -40; return; }
+  wait_uploaded mysql-pitr-ev-src "$f" 120 \
+    || { bad "the binlog carrying the ticks and the bulk write never shipped"; docker logs mysql-pitr-ev-src 2>&1 | tail -40; return; }
 
   local recover_env=(
     -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET"
@@ -2566,9 +2600,34 @@ t_pitr_restore_keeps_scheduled_events_quiet_during_replay() {
     -e "MYSQL_RECOVERY_TARGET_TIME=$t"
   )
   start_standalone mysql-pitr-ev-restore "${recover_env[@]}"
-  wait_until 180 "restore completed and serving" \
+  wait_until 300 "restore completed and serving" \
     bash -c 'docker exec mysql-pitr-ev-restore wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
     || { bad "restored node never became healthy"; docker logs mysql-pitr-ev-restore 2>&1 | tail -60; return; }
+
+  # Premise 1: the restore started from a full whose dump carries the event's
+  # definition — a scheduler-on server had the event from the moment the
+  # dump loaded, not from the last replayed statement.
+  local dump_key
+  dump_key="$(docker logs mysql-pitr-ev-restore 2>&1 | grep -o '"dump_key":"[^"]*"' | head -1 | cut -d'"' -f4)"
+  if [ -n "$dump_key" ] && mc_cat "$dump_key" | gunzip -c 2>/dev/null | grep -q -- 'EVENT `tick`'; then
+    ok "premise: the selected full carries the event's definition ($dump_key)"
+  else
+    bad "premise failed: the selected full does not carry CREATE EVENT tick (dump_key='$dump_key'); the scenario cannot discriminate"
+  fi
+  # Premise 2: the replay spanned at least two whole seconds with the event
+  # defined — it ticks every second, so a scheduler-on server would have
+  # fired at least once in that window.
+  local replay_from replay_to replay_secs
+  replay_from="$(log_epoch mysql-pitr-ev-restore '"message":"full backup loaded"')"
+  replay_to="$(log_epoch mysql-pitr-ev-restore '"message":"binlog replay complete"')"
+  if [ -n "$replay_from" ] && [ -n "$replay_to" ]; then
+    replay_secs=$((replay_to - replay_from))
+    [ "$replay_secs" -ge 2 ] \
+      && ok "premise: the binlog replay spanned $replay_secs s with the event defined (a tick was due)" \
+      || bad "premise failed: the binlog replay spanned only $replay_secs s — a 1-second event may never have come due; the scenario cannot discriminate"
+  else
+    bad "premise unverifiable: replay timestamps not found in the fork's log (loaded='$replay_from' complete='$replay_to')"
+  fi
 
   local quiet before_t sched
   quiet="$(sql mysql-pitr-ev-restore "SELECT COUNT(*) FROM t.ticks WHERE logbin = 0")"
@@ -2579,6 +2638,9 @@ t_pitr_restore_keeps_scheduled_events_quiet_during_replay() {
   [ "$before_t" = "$expected" ] \
     && ok "the fork holds exactly the source's $expected ticks before T" \
     || bad "the fork holds $before_t ticks before T; the source had $expected"
+  [ "$(sql mysql-pitr-ev-restore "SELECT COUNT(*) FROM t.big")" = "16384" ] \
+    && ok "the 64 MiB statement replayed whole" \
+    || bad "the 64 MiB statement did not replay whole"
   sched="$(sql mysql-pitr-ev-restore "SELECT @@event_scheduler")"
   [ "$sched" = "ON" ] \
     && ok "the serving fork runs the event scheduler again (the customer's events resume after the restore)" \
@@ -3738,6 +3800,17 @@ wait_uploaded() {
 
 # node_logged <node> <needle> — grep the node's log for a fixed string.
 node_logged() { docker logs "$1" 2>&1 | grep -qF "$2"; }
+
+# log_epoch <node> <needle> — docker's timestamp of the first log line holding
+# <needle>, as whole epoch seconds (fraction dropped). GNU date on the CI
+# runner; gdate where coreutils is not the system date. Empty when unseen.
+log_epoch() {
+  local ts
+  ts="$(docker logs -t "$1" 2>&1 | grep -F -- "$2" | head -1 | awk '{print $1}')"
+  [ -n "$ts" ] || return 1
+  ts="${ts%%.*}Z"
+  date -u -d "$ts" +%s 2>/dev/null || gdate -u -d "$ts" +%s 2>/dev/null
+}
 
 # mc_lineage_count <prefix> — distinct server-<uuid>/ lineages under a
 # prefix. Fail-loud contract as mc_count.
