@@ -576,19 +576,29 @@ impl Sql {
         Ok(())
     }
 
-    /// Read the group-level pre-GTID-data flag. False when the schema/table
-    /// doesn't exist (plain groups never create it).
-    pub async fn group_pre_gtid_flag(&self) -> bool {
+    /// Read the group-level pre-GTID-data flag. `Ok(false)` when the row, the
+    /// table or the schema does not exist (plain groups never create them):
+    /// a definitive "no". `Err` when the question could not be answered —
+    /// timeout, connection refused, any other server error. Callers must not
+    /// read that as "no": the adopted-data guard in gr.rs turns "no trace on
+    /// any live member" into a refusal that tells the operator to delete
+    /// members, and a loaded primary whose `railway_ha.meta` read timed out
+    /// is not a group that formed without the data.
+    pub async fn group_pre_gtid_flag(&self) -> Result<bool> {
         self.short(async {
             let mut conn = self.conn().await?;
-            let v: Option<String> = conn
+            let row: std::result::Result<Option<String>, mysql_async::Error> = conn
                 .query_first("SELECT v FROM railway_ha.meta WHERE k = 'pre_gtid_data'")
-                .await
-                .unwrap_or(None);
-            Ok(v.as_deref() == Some("1"))
+                .await;
+            match row {
+                Ok(v) => Ok(v.as_deref() == Some("1")),
+                // 1146 ER_NO_SUCH_TABLE / 1049 ER_BAD_DB_ERROR: the flag was
+                // never written on this group. Definitively false.
+                Err(mysql_async::Error::Server(e)) if e.code == 1146 || e.code == 1049 => Ok(false),
+                Err(e) => Err(e.into()),
+            }
         })
         .await
-        .unwrap_or(false)
     }
 
     /// Explicitly clone this (empty) instance from a live group member.

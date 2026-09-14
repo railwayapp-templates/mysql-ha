@@ -32,6 +32,14 @@ pub struct GrState {
     /// the un-GTID'd base data, so binlog recovery would silently skip it.
     #[serde(default)]
     pub pre_gtid_data: bool,
+    /// True when this node could not read the replicated pre-GTID flag this
+    /// time (the `railway_ha.meta` query timed out or failed) and holds no
+    /// file marker of its own — so the `false` above means "could not tell",
+    /// not "no". A joiner's adopted-data guard holds on such an answer instead
+    /// of counting it as "no trace of the data". Absent (false) on older
+    /// builds, whose `false` is taken at face value as before.
+    #[serde(default)]
+    pub pre_gtid_data_unknown: bool,
     /// This node's server_uuid. Lets a joiner detect that a live member
     /// already carries ITS identity — the signature of a datadir that is a
     /// byte copy of that member's (a volume backup of one node restored onto

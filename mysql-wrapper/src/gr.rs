@@ -133,6 +133,47 @@ fn waiver_generation_path(data_dir: &str) -> PathBuf {
 /// absent, so callers fall through to derivation instead (availability
 /// posture: a torn marker must never block boot; the next persist rewrites
 /// it, atomically).
+/// Written the first time this node sees itself ONLINE in a group; never
+/// removed. The group-name marker is NOT membership: every node persists the
+/// resolved name at the start of orchestration, before it has met anyone, so
+/// a fresh replica carried it within seconds of its first boot — which is
+/// why the never-member guard below never fired in the e2e (the fresh pair
+/// "had been members" by that measure and waived the root).
+const MEMBER_MARKER: &str = ".railway_gr_member";
+
+/// Whether this node has ever been ONLINE in a group, by the marker above.
+/// Members from before the marker existed are recognised by their datadir
+/// instead — see `has_been_group_member`.
+pub(crate) fn read_member_marker(data_dir: &str) -> bool {
+    Path::new(data_dir).join(MEMBER_MARKER).exists()
+}
+
+/// Persist the member marker once; idempotent and cheap on every later call.
+fn note_membership(data_dir: &str) {
+    let path = Path::new(data_dir).join(MEMBER_MARKER);
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = persist_atomically(&path, "online\n") {
+        warn!(error = %e, "could not persist the group-member marker");
+    }
+}
+
+/// Has this node ever been a member of `group_name`? The marker, or an
+/// executed GTID set that carries the group's own UUID (every group
+/// transaction is tagged with it, so a datadir that replicated anything from
+/// the group says so — the case of members deployed before the marker
+/// existed). A fresh node has neither.
+async fn has_been_group_member(sql: &Sql, data_dir: &str, group_name: &str) -> bool {
+    if read_member_marker(data_dir) {
+        return true;
+    }
+    match sql.executed_gtid_set().await {
+        Ok(set) => set.contains(&format!("{group_name}:")),
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn read_group_name_marker(data_dir: &str) -> Option<String> {
     let content = std::fs::read_to_string(Path::new(data_dir).join(GROUP_NAME_MARKER)).ok()?;
     let trimmed = content.trim();
@@ -337,6 +378,20 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
         .find(|m| m.member_id.eq_ignore_ascii_case(&self_uuid));
     let member_state = me.map(|m| m.state.clone());
     let group_active = group_active_from(member_state.as_deref(), &members);
+    if member_state.as_deref() == Some("ONLINE") {
+        note_membership(data_dir);
+    }
+    let (pre_gtid_data, pre_gtid_data_unknown) = if has_pre_gtid_data(data_dir) {
+        (true, false)
+    } else {
+        match sql.group_pre_gtid_flag().await {
+            Ok(flag) => (flag, false),
+            Err(e) => {
+                debug!(error = %e, "could not read the group's pre-GTID flag; reporting it as unknown");
+                (false, true)
+            }
+        }
+    };
 
     Ok(GrState {
         group_active,
@@ -347,8 +402,10 @@ pub async fn local_gr_state(sql: &Sql, data_dir: &str) -> Result<GrState> {
         members_reachable: members.iter().filter(|m| m.state != "UNREACHABLE").count(),
         // File marker: the adopting node itself, detected pre-bootstrap.
         // DB flag: replicated group-level truth — survives clones and the
-        // adopting node's deletion.
-        pre_gtid_data: has_pre_gtid_data(data_dir) || sql.group_pre_gtid_flag().await,
+        // adopting node's deletion. A flag read that fails is reported as
+        // unknown, never as "no": see GrState::pre_gtid_data_unknown.
+        pre_gtid_data,
+        pre_gtid_data_unknown,
         server_uuid: Some(self_uuid),
         group_name: read_group_name_marker(data_dir),
         // Best-effort: a state probe must never fail over an advisory
@@ -376,6 +433,77 @@ fn uuid_collision_peer(my_uuid: &str, answers: &[(String, PeerAnswer)]) -> Optio
         }) if peer_uuid.eq_ignore_ascii_case(my_uuid) => Some(host.clone()),
         _ => None,
     })
+}
+
+/// What the live group says about pre-GTID data, read off its members'
+/// /gr/state answers. Only group-active peers count: a node outside the
+/// group cannot speak for it.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct GroupPreGtidPicture {
+    /// At least one live member says the group carries pre-GTID data. The
+    /// flag is replicated, so one definitive yes is the group's answer.
+    pub carries_pre_gtid_data: bool,
+    /// Live members that could not read the flag this time
+    /// (`GrState::pre_gtid_data_unknown`).
+    pub unknown: Vec<String>,
+    /// Every live member that answered.
+    pub live_peers: Vec<String>,
+}
+
+pub(crate) fn group_pre_gtid_picture(answers: &[(String, PeerAnswer)]) -> GroupPreGtidPicture {
+    let mut picture = GroupPreGtidPicture::default();
+    for (host, answer) in answers {
+        let PeerAnswer::State(s) = answer else {
+            continue;
+        };
+        if !s.group_active {
+            continue;
+        }
+        picture.live_peers.push(host.clone());
+        if s.pre_gtid_data {
+            picture.carries_pre_gtid_data = true;
+        } else if s.pre_gtid_data_unknown {
+            picture.unknown.push(host.clone());
+        }
+    }
+    picture
+}
+
+/// The adopted-data guard's verdict for one orchestration pass.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AdoptedDataVerdict {
+    /// Nothing to guard: this node holds no pre-GTID data, or it has been a
+    /// member of the group — its data is already replicated into it.
+    NotApplicable,
+    /// A live member says the group carries the data: join.
+    GroupCarriesIt,
+    /// No live member says yes and at least one could not tell: hold this
+    /// pass and ask again.
+    Incomplete { unknown: Vec<String> },
+    /// Every live member answered and none carries a trace: the group formed
+    /// without this node's data.
+    Refuse { live_peers: Vec<String> },
+}
+
+pub(crate) fn adopted_data_verdict(
+    i_hold_pre_gtid_data: bool,
+    been_member: bool,
+    picture: &GroupPreGtidPicture,
+) -> AdoptedDataVerdict {
+    if !i_hold_pre_gtid_data || been_member {
+        return AdoptedDataVerdict::NotApplicable;
+    }
+    if picture.carries_pre_gtid_data {
+        return AdoptedDataVerdict::GroupCarriesIt;
+    }
+    if !picture.unknown.is_empty() {
+        return AdoptedDataVerdict::Incomplete {
+            unknown: picture.unknown.clone(),
+        };
+    }
+    AdoptedDataVerdict::Refuse {
+        live_peers: picture.live_peers.clone(),
+    }
 }
 
 /// What one majority-loss recovery round decided (issue #31). Pure over its
@@ -572,6 +700,16 @@ pub async fn majority_watch(
             consecutive_force = 0;
             continue;
         }
+        // This node is ONLINE in the group: it has standing to waive a gone
+        // peer from now on (`has_been_group_member`). The other writer of the
+        // marker is `local_gr_state`, which runs only when a peer polls
+        // `/gr/state` — and nobody polls a member once every node has left
+        // orchestration, so a joiner that came up RECOVERING and went ONLINE
+        // after its peers stopped asking never got the marker, and a group
+        // with no write since its current name was minted had no GTID to
+        // recognise it by either. The watcher runs for the member's whole
+        // life, so this is where every member earns the marker.
+        note_membership(&config.data_dir);
 
         // ===== Membership fence (issue #33) =====
         // Group Replication fences a view that LOST members it cannot expel
@@ -1384,6 +1522,9 @@ pub async fn orchestrate(
     let mut last_wait_reason = String::new();
     let mut gone_tracker = GoneTracker::new();
     let mut last_waiver_note = String::new();
+    let mut last_never_member_note = String::new();
+    let mut last_unproven_gone_note = String::new();
+    let mut adopted_refusal_reported = false;
     let gone_dwell = Duration::from_secs(config.peer_gone_dwell_seconds);
     let dns_deadline = Duration::from_millis(config.peer_query_timeout_ms);
 
@@ -1450,6 +1591,22 @@ pub async fn orchestrate(
         // resolver; only continuous NXDOMAIN across the whole dwell earns a
         // waiver (see GoneTracker). Reachable peers reset their clock.
         let now = Instant::now();
+        // Who may waive a gone peer: a node that has been a group member
+        // (persisted group name) or one that holds data of its own (an
+        // adopted volume). A FRESH node that has never met any peer cannot
+        // tell a deleted peer from one whose deploy is failing, and it has
+        // nothing to lose by waiting — while the peer it would waive may
+        // hold the only copy of the customer's data. 2026-09-08, production:
+        // a converted root's deploy failed on registry credentials, the two
+        // fresh replicas waited out the dwell, waived it and bootstrapped an
+        // EMPTY group, which the edge then served for two days.
+        // "Has been a group member" is the member marker or the group's own
+        // GTIDs in this datadir — never the group-name marker, which every
+        // node writes before it has met anyone (see MEMBER_MARKER).
+        let been_member = has_been_group_member(&sql, &config.data_dir, &group_name).await;
+        let may_waive = been_member || has_pre_gtid_data(&config.data_dir);
+        let mut never_member_holds: Vec<&String> = Vec::new();
+        let mut unproven_gone: Vec<String> = Vec::new();
         for (host, answer) in &answers {
             if matches!(answer, PeerAnswer::Unreachable) {
                 let (verdict, detail) = probe_name_detailed(host, dns_deadline).await;
@@ -1461,15 +1618,52 @@ pub async fn orchestrate(
                         dwell = ?gone_dwell,
                         "unreachable peer's name is authoritatively gone; will stop waiting on it if this persists for the whole dwell"
                     );
+                } else if verdict == NameVerdict::Gone && !may_waive {
+                    never_member_holds.push(host);
+                } else if verdict == NameVerdict::ExistsOrUnknown {
+                    unproven_gone.push(format!("{host} ({detail:?})"));
                 }
             } else {
                 gone_tracker.observe_reachable(host);
             }
         }
+        // An unreachable peer whose name is NOT provably gone is the ordinary
+        // case — a deploy in flight, a resolver hiccup — and the fence stays
+        // up for that reason alone, nothing to do with the waiver. Say so
+        // once per change: without this line a node waiting on a name that
+        // never NXDOMAINs logs nothing at all after its first wait reason,
+        // and the only readable state is silence.
+        let unproven_note = if unproven_gone.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "unreachable peers whose names are not provably gone: {unproven_gone:?} — waiting for them (only an authoritative NXDOMAIN across the whole dwell can retire a peer)"
+            )
+        };
+        if last_unproven_gone_note != unproven_note {
+            if !unproven_note.is_empty() {
+                info!("{unproven_note}");
+            }
+            last_unproven_gone_note = unproven_note;
+        }
+        let never_member_note = if never_member_holds.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "peers {never_member_holds:?} are gone past the dwell, but this node has never been a group member and holds no data of its own: not waiving them — a declared seed that never came up may hold the only copy of the data (an adopted volume whose deploy is failing); waiting for it"
+            )
+        };
+        if last_never_member_note != never_member_note {
+            if !never_member_note.is_empty() {
+                warn!("{never_member_note}");
+            }
+            last_never_member_note = never_member_note;
+        }
         let waived: Vec<&String> = answers
             .iter()
             .filter(|(host, answer)| {
-                matches!(answer, PeerAnswer::Unreachable)
+                may_waive
+                    && matches!(answer, PeerAnswer::Unreachable)
                     && gone_tracker.is_waived(host, now, gone_dwell)
             })
             .map(|(host, _)| host)
@@ -1699,19 +1893,103 @@ pub async fn orchestrate(
                 }
             }
 
+            let picture = group_pre_gtid_picture(&answers);
+            let group_has_pre_gtid_data = picture.carries_pre_gtid_data;
+            let i_hold_pre_gtid_data = has_pre_gtid_data(&config.data_dir);
+
+            // Adopted-data guard: this node holds base data that predates any
+            // GTID history (an adopted standalone volume), it has never been
+            // a member of the group, and the live group carries no trace of
+            // such data — it formed WITHOUT this node (a fresh pair past a
+            // waiver while this deploy was failing, or a foreign group at the
+            // same seeds). Joining would be the worst of both worlds: binlog
+            // recovery hides the base data behind an empty primary, and any
+            // conflict during recovery walks the stuck-member self-heal into
+            // recloning this datadir off that empty group. Refuse, loud,
+            // every pass: the data stays put, fenced, and the operator decides
+            // which history wins — the group formed without this node's data,
+            // not the other way round.
+            //
+            // Two qualifiers keep the refusal honest. A node that HAS been a
+            // member of the group already replicated its data into it — the
+            // group is its own, flag or no flag (the replicated flag write at
+            // bootstrap can fail; that must not turn the adopting root against
+            // its own group on its next restart). And the "no trace" reading
+            // needs a complete picture: a live member whose flag read failed
+            // (`pre_gtid_data_unknown`) has not said "no", so the pass holds
+            // and asks again rather than refusing on a timeout during a loaded
+            // rolling redeploy — the advice below tells the operator to delete
+            // members, and it must never be printed for a group that holds the
+            // data.
+            let been_member_now =
+                been_member || has_been_group_member(&sql, &config.data_dir, &group_name).await;
+            match adopted_data_verdict(i_hold_pre_gtid_data, been_member_now, &picture) {
+                AdoptedDataVerdict::NotApplicable | AdoptedDataVerdict::GroupCarriesIt => {
+                    // The data is in the group (or this node put it there):
+                    // any earlier refusal episode is over, and a later one
+                    // must be reported again, not swallowed by the dedup.
+                    adopted_refusal_reported = false;
+                }
+                AdoptedDataVerdict::Incomplete { unknown } => {
+                    wait_log_once(
+                        &mut last_wait_reason,
+                        &format!(
+                            "this volume holds data that predates any GTID history and live members {unknown:?} could not say whether the group carries it; holding this pass until every live member answers"
+                        ),
+                    );
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+                AdoptedDataVerdict::Refuse { live_peers } => {
+                    if !adopted_refusal_reported {
+                        error!(
+                            ?live_peers,
+                            "refusing to join: this volume holds data that predates any GTID history and the live group carries no trace of it — the group formed without this node; joining would hide this data behind an empty primary or reclone it away. Delete the members that formed without it and redeploy this service to seed the group from its data, or revert the cluster to standalone"
+                        );
+                        telemetry.send(TelemetryEvent::ComponentError {
+                            component: "mysql-wrapper".to_string(),
+                            error: format!(
+                                "adopted volume refused to join a group that formed without its data (live peers {live_peers:?})"
+                            ),
+                            context: "adopted_data_guard".to_string(),
+                        });
+                        adopted_refusal_reported = true;
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+            }
+
             // Clone-first path: the group carries data that predates its
             // GTID history (adopted standalone volume), and this node has no
             // GTID history of its own to prove it holds that base data.
             // Binlog-based recovery would join "successfully" while silently
             // skipping everything that was never binlogged — clone instead.
-            let group_has_pre_gtid_data = answers.iter().any(
-                |(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active && s.pre_gtid_data),
-            );
-            let i_hold_pre_gtid_data = has_pre_gtid_data(&config.data_dir);
             // Fail closed: my_gtid_now collapsed a read error to empty above,
             // so an unreadable local GTID set clones rather than START
             // GROUP_REPLICATION without the adopted base.
             let my_gtid_is_empty = my_gtid_now.is_empty();
+
+            // The same reading, on the joiner's side: with no yes from any live
+            // member and at least one that could not tell, this pass cannot
+            // choose between a clone and a binlog join — and a binlog join
+            // against a group that does carry adopted data would skip it
+            // silently. Hold, ask again; the next pass decides.
+            if !i_hold_pre_gtid_data
+                && my_gtid_is_empty
+                && !group_has_pre_gtid_data
+                && !picture.unknown.is_empty()
+            {
+                wait_log_once(
+                    &mut last_wait_reason,
+                    &format!(
+                        "live members {:?} could not say whether the group carries pre-GTID data; holding the join until they answer (a binlog join would skip such data)",
+                        picture.unknown
+                    ),
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
 
             if group_has_pre_gtid_data && !i_hold_pre_gtid_data && my_gtid_is_empty {
                 if let Some(donor) = pick_donor(&answers) {
@@ -1841,7 +2119,8 @@ pub async fn orchestrate(
         let considered: Vec<(String, PeerAnswer)> = answers
             .into_iter()
             .filter(|(host, answer)| {
-                !(matches!(answer, PeerAnswer::Unreachable)
+                !(may_waive
+                    && matches!(answer, PeerAnswer::Unreachable)
                     && gone_tracker.is_waived(host, now, gone_dwell))
             })
             .collect();
@@ -2175,6 +2454,119 @@ async fn futures_join_all(
 mod tests {
     use super::*;
 
+    /// One live-group member's /gr/state answer as the adopted-data guard
+    /// reads it: whether it carries pre-GTID data, or could not tell.
+    fn live_member(host: &str, pre_gtid_data: bool, unknown: bool) -> (String, PeerAnswer) {
+        (
+            host.to_string(),
+            PeerAnswer::State(GrState {
+                group_active: true,
+                member_state: Some("ONLINE".to_string()),
+                member_role: Some("SECONDARY".to_string()),
+                gtid_executed: Some(String::new()),
+                members_total: 2,
+                members_reachable: 2,
+                pre_gtid_data,
+                pre_gtid_data_unknown: unknown,
+                server_uuid: Some(host.to_string()),
+                group_name: None,
+                gtid_assignment_block_size: None,
+                waiver_generation: 0,
+            }),
+        )
+    }
+
+    #[test]
+    fn adopted_guard_never_refuses_a_group_this_node_has_been_a_member_of() {
+        // The adopting root bootstrapped the group, the replicated flag write
+        // failed, and it restarts into a group carrying no trace: its own
+        // group. Membership settles it — never the destructive advice.
+        let answers = vec![
+            live_member("mysql-2", false, false),
+            live_member("mysql-3", false, false),
+        ];
+        let picture = group_pre_gtid_picture(&answers);
+        assert_eq!(
+            adopted_data_verdict(true, true, &picture),
+            AdoptedDataVerdict::NotApplicable
+        );
+        // And a node holding no adopted data has nothing to guard.
+        assert_eq!(
+            adopted_data_verdict(false, false, &picture),
+            AdoptedDataVerdict::NotApplicable
+        );
+    }
+
+    #[test]
+    fn adopted_guard_refuses_only_on_a_complete_picture_of_no() {
+        // The 2026-09-08 shape: a never-member root with adopted data meets a
+        // pair that formed without it; both answered, neither carries a
+        // trace.
+        let answers = vec![
+            live_member("mysql-2", false, false),
+            live_member("mysql-3", false, false),
+        ];
+        let picture = group_pre_gtid_picture(&answers);
+        assert_eq!(
+            adopted_data_verdict(true, false, &picture),
+            AdoptedDataVerdict::Refuse {
+                live_peers: vec!["mysql-2".to_string(), "mysql-3".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn adopted_guard_holds_while_a_live_member_could_not_tell() {
+        // A loaded primary whose railway_ha.meta read timed out has not said
+        // "no": the pass holds instead of refusing.
+        let answers = vec![
+            live_member("mysql-2", false, true),
+            live_member("mysql-3", false, false),
+        ];
+        let picture = group_pre_gtid_picture(&answers);
+        assert_eq!(
+            adopted_data_verdict(true, false, &picture),
+            AdoptedDataVerdict::Incomplete {
+                unknown: vec!["mysql-2".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn adopted_guard_takes_one_yes_as_the_groups_answer() {
+        // The flag is replicated: one member saying yes outweighs another
+        // that could not tell.
+        let answers = vec![
+            live_member("mysql-2", false, true),
+            live_member("mysql-3", true, false),
+        ];
+        let picture = group_pre_gtid_picture(&answers);
+        assert!(picture.carries_pre_gtid_data);
+        assert_eq!(
+            adopted_data_verdict(true, false, &picture),
+            AdoptedDataVerdict::GroupCarriesIt
+        );
+    }
+
+    #[test]
+    fn pre_gtid_picture_counts_only_live_members() {
+        // A node outside the group cannot speak for it, whatever it says.
+        let mut outsider = live_member("mysql-4", true, false);
+        if let PeerAnswer::State(s) = &mut outsider.1 {
+            s.group_active = false;
+        }
+        let answers = vec![
+            outsider,
+            ("mysql-5".to_string(), PeerAnswer::Unreachable),
+            ("mysql-6".to_string(), PeerAnswer::NotReady),
+            live_member("mysql-2", false, false),
+        ];
+        let picture = group_pre_gtid_picture(&answers);
+        assert_eq!(picture.live_peers, vec!["mysql-2".to_string()]);
+        assert!(!picture.carries_pre_gtid_data);
+        assert!(picture.unknown.is_empty());
+    }
+
     // The GTID comparisons themselves run inside mysqld (classify_round →
     // Sql::gtid_compare, exercised in test/e2e.sh); decide() is the pure
     // decision over those comparisons and is fully covered here.
@@ -2197,6 +2589,7 @@ mod tests {
             members_total: 1,
             members_reachable: 1,
             pre_gtid_data: false,
+            pre_gtid_data_unknown: false,
             server_uuid: Some("someone".to_string()),
             group_name: Some(group_name.to_string()),
             gtid_assignment_block_size: None,
@@ -2760,6 +3153,7 @@ mod tests {
             members_total: usize::from(group_active),
             members_reachable: usize::from(group_active),
             pre_gtid_data: false,
+            pre_gtid_data_unknown: false,
             server_uuid: server_uuid.map(str::to_string),
             group_name: None,
             gtid_assignment_block_size: None,
@@ -2783,6 +3177,7 @@ mod tests {
             members_total: 2,
             members_reachable: 2,
             pre_gtid_data: false,
+            pre_gtid_data_unknown: false,
             server_uuid: None,
             group_name: None,
             gtid_assignment_block_size: None,
@@ -2837,6 +3232,7 @@ mod tests {
                 members_total: 1,
                 members_reachable: 0,
                 pre_gtid_data: false,
+                pre_gtid_data_unknown: false,
                 server_uuid: None,
                 group_name: None,
                 gtid_assignment_block_size: None,
@@ -3022,6 +3418,7 @@ mod tests {
                     members_total: 3,
                     members_reachable: 3,
                     pre_gtid_data: false,
+                    pre_gtid_data_unknown: false,
                     server_uuid: Some("someone".to_string()),
                     group_name: Some("group".to_string()),
                     gtid_assignment_block_size: size,
