@@ -44,6 +44,7 @@ mod config;
 mod demote_on_shutdown;
 mod dns_probe;
 mod gr;
+mod health_auth;
 mod health_server;
 mod mysql_conf;
 mod password_pin;
@@ -259,6 +260,7 @@ async fn main() -> Result<()> {
         let membership_fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
+            config.health_api_credential(),
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: false,
@@ -373,6 +375,7 @@ async fn main() -> Result<()> {
         info!("GR_SEEDS not set — standalone passthrough mode");
         tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
+            config.health_api_credential(),
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: true,
