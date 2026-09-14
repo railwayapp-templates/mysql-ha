@@ -155,6 +155,24 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     buffer pool is the server default rather than the container-sized value
     and closed binlogs expire on the server default instead of being kept
     for the archiver, until the variable is fixed and the service redeployed.
+    - *The full's locks*: the dump runs under two locks of the archiver's
+      own. `FLUSH TABLES WITH READ LOCK` stands for the instant mysqldump
+      takes to open its `--single-transaction` snapshot at the binlog
+      coordinates the wrapper records — new writes queue for that instant.
+      It is asked for only when no statement has been running longer than
+      its own wait (`GLOBAL_READ_LOCK_WAIT`, 5 s; otherwise the attempt is
+      deferred, not failed) and released the moment the snapshot is open.
+      `LOCK INSTANCE FOR BACKUP` is held across the whole dump and its
+      upload (the dump is streamed, so the two end together): DDL,
+      `TRUNCATE`, account statements — the platform's password reset is an
+      `ALTER USER` — and `PURGE BINARY LOGS` wait for it; DML does not.
+      Every multipart call of the upload is bounded (120 s an attempt, three
+      attempts), so a throttled bucket cannot hold the customer's DDL
+      indefinitely, and the hold's length is logged on release. The
+      archiver's own reclaim steps aside for its own dump; a reclaim
+      deferred by a lock that is not this node's full — or by a full older
+      than the interval between fulls — is named on `GET /pitr` as
+      `last_error`, and cleared when reclaim resumes.
     - *Standalone*: the archive conf turns the binlog on (the plain
       rendering leaves it off), and a binlog is only purged locally once its
       upload is confirmed — the volume is the spool during a bucket outage.
