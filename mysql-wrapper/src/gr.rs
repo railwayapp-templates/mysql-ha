@@ -616,6 +616,16 @@ pub async fn majority_watch(
             consecutive_force = 0;
             continue;
         }
+        // This node is ONLINE in the group: it has standing to waive a gone
+        // peer from now on (`has_been_group_member`). The other writer of the
+        // marker is `local_gr_state`, which runs only when a peer polls
+        // `/gr/state` — and nobody polls a member once every node has left
+        // orchestration, so a joiner that came up RECOVERING and went ONLINE
+        // after its peers stopped asking never got the marker, and a group
+        // with no write since its current name was minted had no GTID to
+        // recognise it by either. The watcher runs for the member's whole
+        // life, so this is where every member earns the marker.
+        note_membership(&config.data_dir);
 
         // ===== Membership fence (issue #33) =====
         // Group Replication fences a view that LOST members it cannot expel
