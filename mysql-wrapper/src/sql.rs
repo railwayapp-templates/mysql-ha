@@ -101,6 +101,15 @@ pub struct RunningStatement {
     pub info_head: String,
 }
 
+const LONGEST_RUNNING_STATEMENT_QUERY: &str =
+    "SELECT TIME, COMMAND, LEFT(COALESCE(INFO, ''), 120) \
+     FROM information_schema.PROCESSLIST \
+     WHERE ID <> CONNECTION_ID() \
+       AND COMMAND NOT IN ('Sleep', 'Daemon', 'Connect', 'Binlog Dump', 'Binlog Dump GTID') \
+       AND COMMAND NOT LIKE 'Group Replicatio%' \
+       AND USER NOT IN ('system user', 'event_scheduler') \
+     ORDER BY TIME DESC LIMIT 1";
+
 fn lock_wait_ran_out(error: &mysql_async::Error) -> bool {
     matches!(error, mysql_async::Error::Server(e) if e.code == ER_LOCK_WAIT_TIMEOUT)
 }
@@ -368,19 +377,13 @@ impl Sql {
     /// and Group Replication threads (`system user`), the event scheduler's
     /// daemon, idle sessions and binlog dump threads run indefinitely by
     /// design and are not statements the lock waits on; they are left out.
+    /// MySQL exposes Group Replication's command as the 16-character
+    /// `Group Replicatio`, so it also needs an explicit command filter.
     pub async fn longest_running_statement(&self) -> Result<Option<RunningStatement>> {
         self.short(async {
             let mut conn = self.conn().await?;
-            let row: Option<(i64, String, String)> = conn
-                .query_first(
-                    "SELECT TIME, COMMAND, LEFT(COALESCE(INFO, ''), 120) \
-                     FROM information_schema.PROCESSLIST \
-                     WHERE ID <> CONNECTION_ID() \
-                       AND COMMAND NOT IN ('Sleep', 'Daemon', 'Connect', 'Binlog Dump', 'Binlog Dump GTID') \
-                       AND USER NOT IN ('system user', 'event_scheduler') \
-                     ORDER BY TIME DESC LIMIT 1",
-                )
-                .await?;
+            let row: Option<(i64, String, String)> =
+                conn.query_first(LONGEST_RUNNING_STATEMENT_QUERY).await?;
             Ok(row.map(|(seconds, command, info_head)| RunningStatement {
                 seconds: seconds.max(0) as u64,
                 command,
@@ -1205,6 +1208,14 @@ mod tests {
         assert_eq!(sql_string_literal("plain"), "'plain'");
         assert_eq!(sql_string_literal("o'brien"), "'o\\'brien'");
         assert_eq!(sql_string_literal("back\\slash"), "'back\\\\slash'");
+    }
+
+    #[test]
+    fn the_backup_blocker_query_ignores_group_replication_threads() {
+        assert!(
+            LONGEST_RUNNING_STATEMENT_QUERY.contains("COMMAND NOT LIKE 'Group Replicatio%'"),
+            "PROCESSLIST truncates Group Replication commands to 16 characters"
+        );
     }
 }
 
