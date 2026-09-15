@@ -63,12 +63,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::oneshot;
 use tokio::process::Command;
+use tokio::sync::{oneshot, Notify};
 use tracing::{error, info, warn};
 
 const SHIP_POLL: Duration = Duration::from_secs(10);
@@ -78,6 +78,9 @@ const UPLOAD_STATE_FILE: &str = ".pitr_uploaded_binlogs.json";
 /// order as HAProxy's /role probe: a demoted primary stops archiving within
 /// one poll, and a promoted one starts within one.
 const ROLE_POLL: Duration = Duration::from_secs(5);
+const FULL_BACKUP_IDLE: u8 = 0;
+const FULL_BACKUP_QUEUED: u8 = 1;
+const FULL_BACKUP_RUNNING: u8 = 2;
 
 /// How the archiver relates to the server it runs beside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +131,8 @@ pub struct PitrStatusSnapshot {
 /// Shared, cheaply-cloned handle to the live `PitrStatusSnapshot`.
 pub struct PitrStatus {
     inner: RwLock<PitrStatusSnapshot>,
+    full_backup_state: AtomicU8,
+    full_backup_wake: Notify,
 }
 
 impl PitrStatus {
@@ -137,6 +142,8 @@ impl PitrStatus {
                 archive_configured,
                 ..PitrStatusSnapshot::default()
             }),
+            full_backup_state: AtomicU8::new(FULL_BACKUP_IDLE),
+            full_backup_wake: Notify::new(),
         })
     }
 
@@ -187,6 +194,88 @@ impl PitrStatus {
                 s.last_error = None;
             }
         });
+    }
+
+    /// Queue one out-of-cadence full backup. The health endpoint calls this
+    /// after authentication; the archiver loop consumes it. One atomic state
+    /// covers queued and running work, preventing duplicate concurrent dumps.
+    pub fn request_full_backup(&self) -> Result<(), &'static str> {
+        let snapshot = self.snapshot();
+        if !snapshot.archive_configured {
+            return Err("PITR archiving is not configured");
+        }
+        if !snapshot.archiving {
+            return Err("this node is not currently archiving");
+        }
+        self.full_backup_state
+            .compare_exchange(
+                FULL_BACKUP_IDLE,
+                FULL_BACKUP_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| "a full backup is already queued or running")?;
+        self.full_backup_wake.notify_one();
+        Ok(())
+    }
+
+    fn begin_requested_full_backup(&self) -> Option<FullBackupRun<'_>> {
+        self.full_backup_state
+            .compare_exchange(
+                FULL_BACKUP_QUEUED,
+                FULL_BACKUP_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| FullBackupRun { status: self })
+    }
+
+    fn begin_scheduled_full_backup(&self) -> Option<FullBackupRun<'_>> {
+        self.full_backup_state
+            .compare_exchange(
+                FULL_BACKUP_IDLE,
+                FULL_BACKUP_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| FullBackupRun { status: self })
+    }
+
+    async fn wait_for_full_backup_request(&self) {
+        self.full_backup_wake.notified().await;
+    }
+
+    fn stop_archiving(&self) {
+        self.full_backup_state
+            .store(FULL_BACKUP_IDLE, Ordering::Release);
+        self.update(|s| {
+            s.archiving = false;
+            s.mode = None;
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_archiving_for_test(&self) {
+        self.update(|s| {
+            s.archive_configured = true;
+            s.archiving = true;
+        });
+    }
+}
+
+/// Reset the queue/running latch even when role loss aborts the archiver task
+/// while a dump is in flight.
+struct FullBackupRun<'a> {
+    status: &'a PitrStatus,
+}
+
+impl Drop for FullBackupRun<'_> {
+    fn drop(&mut self) {
+        self.status
+            .full_backup_state
+            .store(FULL_BACKUP_IDLE, Ordering::Release);
     }
 }
 
@@ -265,11 +354,13 @@ pub async fn run_group_primary_supervisor(
                 );
                 if let Some(handle) = running.take() {
                     handle.abort();
+                    // Wait for cancellation to drop a possibly-running dump's
+                    // latch before accepting requests against the stopped
+                    // archiver. Otherwise that late Drop could erase a newly
+                    // queued request.
+                    let _ = handle.await;
                 }
-                status.update(|s| {
-                    s.archiving = false;
-                    s.mode = None;
-                });
+                status.stop_archiving();
             }
             _ => {}
         }
@@ -552,7 +643,8 @@ async fn ensure_archive_ownership(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("could not settle the archive root's ownership")))
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("could not settle the archive root's ownership")))
 }
 
 async fn wait_for_mysqld(sql: &Sql) {
@@ -625,27 +717,63 @@ async fn full_backup_loop(
                 (None, true)
             }
         };
-        if let Some(taken_at) = newest {
+        let not_due_for = if let Some(taken_at) = newest {
             let due_at = taken_at + chrono::Duration::from_std(interval).unwrap_or_default();
             if due_at > now {
-                let wait = (due_at - now).to_std().unwrap_or(interval).min(interval);
-                tokio::time::sleep(wait).await;
-                continue;
+                Some((due_at - now).to_std().unwrap_or(interval).min(interval))
+            } else {
+                None
             }
-        }
-
-        let kind = if newest.is_none() && !listing_failed {
-            "initial"
         } else {
-            "scheduled"
+            None
         };
-        match take_full_backup(&config, &sql, &s3, &location, &server_uuid).await {
+
+        let (kind, run) = if let Some(run) = status.begin_requested_full_backup() {
+            ("triggered", run)
+        } else if let Some(wait) = not_due_for {
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {
+                    let Some(run) = status.begin_scheduled_full_backup() else {
+                        continue;
+                    };
+                    ("scheduled", run)
+                }
+                _ = status.wait_for_full_backup_request() => {
+                    let Some(run) = status.begin_requested_full_backup() else {
+                        // A stale notification can survive a role change;
+                        // only the atomic queued state authorizes a dump.
+                        continue;
+                    };
+                    ("triggered", run)
+                }
+            }
+        } else {
+            let Some(run) = status.begin_scheduled_full_backup() else {
+                continue;
+            };
+            (
+                if newest.is_none() && !listing_failed {
+                    "initial"
+                } else {
+                    "scheduled"
+                },
+                run,
+            )
+        };
+        let outcome = {
+            let _run = run;
+            take_full_backup(&config, &sql, &s3, &location, &server_uuid).await
+        };
+        match outcome {
             Ok(FullBackupOutcome::Deferred(reason)) => {
                 // The server was busy in a way the dump would have made the
                 // customer pay for. Nothing failed: ask again after the retry
                 // delay, and nothing lands on /pitr or reaches the monitor.
                 info!(reason, kind, "full backup deferred; retrying");
-                tokio::time::sleep(FULL_BACKUP_RETRY_DELAY).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(FULL_BACKUP_RETRY_DELAY) => {}
+                    _ = status.wait_for_full_backup_request() => {}
+                }
             }
             Ok(FullBackupOutcome::Taken(taken_at)) => {
                 status.update(|s| {
@@ -660,6 +788,8 @@ async fn full_backup_loop(
                 // waits on them by name.
                 if kind == "initial" {
                     info!("initial full backup completed");
+                } else if kind == "triggered" {
+                    info!("triggered full backup completed");
                 } else {
                     info!("scheduled full backup completed");
                 }
@@ -672,7 +802,10 @@ async fn full_backup_loop(
                     error: e.to_string(),
                     context: "pitr_full_backup".to_string(),
                 });
-                tokio::time::sleep(FULL_BACKUP_RETRY_DELAY).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(FULL_BACKUP_RETRY_DELAY) => {}
+                    _ = status.wait_for_full_backup_request() => {}
+                }
             }
         }
     }
@@ -1807,6 +1940,48 @@ async fn rotation_loop(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_backup_trigger_requires_an_active_archiver_and_queues_once() {
+        let disabled = PitrStatus::new(false);
+        assert_eq!(
+            disabled.request_full_backup(),
+            Err("PITR archiving is not configured")
+        );
+
+        let inactive = PitrStatus::new(true);
+        assert_eq!(
+            inactive.request_full_backup(),
+            Err("this node is not currently archiving")
+        );
+
+        inactive.mark_archiving_for_test();
+        assert_eq!(inactive.request_full_backup(), Ok(()));
+        assert_eq!(
+            inactive.request_full_backup(),
+            Err("a full backup is already queued or running")
+        );
+        let run = inactive
+            .begin_requested_full_backup()
+            .expect("queued request starts");
+        assert_eq!(
+            inactive.request_full_backup(),
+            Err("a full backup is already queued or running")
+        );
+        drop(run);
+        assert_eq!(inactive.request_full_backup(), Ok(()));
+    }
+
+    #[test]
+    fn dropping_a_running_backup_releases_the_latch() {
+        let status = PitrStatus::new(true);
+        status.mark_archiving_for_test();
+        let run = status
+            .begin_scheduled_full_backup()
+            .expect("scheduled backup starts");
+        drop(run);
+        assert_eq!(status.request_full_backup(), Ok(()));
+    }
 
     #[test]
     fn reclaim_is_deferred_while_this_node_holds_the_backup_lock() {

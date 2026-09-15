@@ -1,6 +1,7 @@
 //! HTTP Basic auth for the health server's mutating routes.
 //!
-//! `HEALTH_API_PASSWORD` set → `POST /switchover` requires
+//! `HEALTH_API_PASSWORD` set → mutating routes (`POST /switchover` and
+//! `POST /pitr/full-backup`) require
 //! `Authorization: Basic base64(HEALTH_API_USERNAME:HEALTH_API_PASSWORD)`
 //! (username default `railway`); anything else answers 401 with a
 //! `WWW-Authenticate` challenge. Reads stay open regardless: HAProxy's

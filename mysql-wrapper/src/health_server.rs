@@ -24,6 +24,11 @@
 //!                 Requires HTTP Basic auth once HEALTH_API_PASSWORD is set
 //!                 (401 otherwise) — the one route here that can change the
 //!                 group; see health_auth.rs.
+//!   POST /pitr/full-backup — queue one out-of-cadence full backup on the
+//!                 node currently running the archiver. Answers 202 when
+//!                 queued and 409 when PITR is inactive or a full is already
+//!                 queued/running. Protected by the same credential as
+//!                 `/switchover`.
 //!   GET /pitr   — point-in-time-recovery archiver status (JSON, see
 //!                 archiver::PitrStatusSnapshot): whether the archive
 //!                 contract is configured on this node and whether THIS node
@@ -120,6 +125,19 @@ async fn pitr(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (StatusCode::OK, Json(state.pitr.snapshot()))
 }
 
+async fn trigger_full_backup(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.pitr.request_full_backup() {
+        Ok(()) => {
+            info!("out-of-cadence PITR full backup queued");
+            (StatusCode::ACCEPTED, "full backup queued")
+        }
+        Err(reason) => {
+            warn!(reason, "PITR full-backup trigger refused");
+            (StatusCode::CONFLICT, reason)
+        }
+    }
+}
+
 async fn gr_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if !state.adoption_checked.load(Ordering::Acquire) {
         // mysqld answering queries does not mean this node's identity is
@@ -206,6 +224,7 @@ async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 fn app(state: Arc<AppState>, guard: Guard) -> Router {
     let mutating = Router::new()
         .route("/switchover", post(switchover))
+        .route("/pitr/full-backup", post(trigger_full_backup))
         .route_layer(middleware::from_fn_with_state(
             guard,
             health_auth::require_credential,
@@ -360,7 +379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_real_router_gates_only_the_switchover() {
+    async fn the_real_router_gates_only_mutating_routes() {
         // Without a credential the mutating route is refused by the guard —
         // never reaching the handler, which would have answered 503.
         let resp = app(state(), guard())
@@ -378,6 +397,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!resp.headers().contains_key(header::WWW_AUTHENTICATE));
+
+        // The full-backup trigger shares the guard. With auth, this fixture's
+        // inactive archiver reaches the handler and answers its own 409.
+        let resp = app(state(), guard())
+            .oneshot(req(Method::POST, "/pitr/full-backup", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = app(state(), guard())
+            .oneshot(req(Method::POST, "/pitr/full-backup", Some(&basic)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert!(!resp.headers().contains_key(header::WWW_AUTHENTICATE));
 
         // Every read stays open and answers its own verdict.
@@ -402,12 +435,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_guard_leaves_the_switchover_open() {
+    async fn no_guard_leaves_mutating_routes_open() {
         let resp = app(state(), None)
             .oneshot(req(Method::POST, "/switchover", None))
             .await
             .unwrap();
         // The handler's own answer (mysqld unreachable), not a refusal.
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = app(state(), None)
+            .oneshot(req(Method::POST, "/pitr/full-backup", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn full_backup_trigger_queues_once_and_then_reports_busy() {
+        let state = state();
+        state.pitr.mark_archiving_for_test();
+
+        let resp = app(state.clone(), None)
+            .oneshot(req(Method::POST, "/pitr/full-backup", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let resp = app(state, None)
+            .oneshot(req(Method::POST, "/pitr/full-backup", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 }

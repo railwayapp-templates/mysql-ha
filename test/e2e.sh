@@ -2442,6 +2442,49 @@ t_no_quorum_no_wipe() {
   teardown_trio
 }
 
+# The monitor's gap recovery needs a way to bypass the daily full cadence.
+# Pin the endpoint contract against a real mysqld and S3 archive.
+t_pitr_full_backup_endpoint_wakes_the_archiver() {
+  log "t_pitr_full_backup_endpoint_wakes_the_archiver (authenticated POST queues a full outside the daily cadence)"
+  local node=mysql-pitr-trigger
+  docker rm -f "$node" mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm "mysql-ha-e2e-vol-$node" mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  start_standalone "$node" \
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET" \
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER" \
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD" \
+    -e "BINLOG_ARCHIVE_REGION=us-east-1" \
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000" \
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-trigger" \
+    -e "BINLOG_FULL_BACKUP_INTERVAL_SECONDS=86400" \
+    -e "HEALTH_API_PASSWORD=$API_PW"
+
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs '"$node"' 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs "$node" 2>&1 | tail -40; return; }
+  [ "$(mc_count_matching e2e-pitr-trigger/ .meta.json)" = "1" ] \
+    || { bad "expected exactly one full before the trigger"; return; }
+
+  local url="http://localhost:8080/pitr/full-backup"
+  [ "$(http_code "$node" "$url" --post-data="")" = "401" ] \
+    && ok "full-backup trigger requires the health API credential" \
+    || { bad "unauthenticated full-backup trigger was not refused"; return; }
+  [ "$(http_code "$node" "$url" --post-data="" --header="$(basic_auth_header railway "$API_PW")")" = "202" ] \
+    && ok "authenticated full-backup trigger answered 202" \
+    || { bad "authenticated full-backup trigger was not accepted"; return; }
+
+  two_trigger_fulls() {
+    [ "$(mc_count_matching e2e-pitr-trigger/ .meta.json)" -ge 2 ]
+  }
+  wait_until 180 "triggered full backup lands" two_trigger_fulls \
+    || { bad "triggered full backup never landed"; docker logs "$node" 2>&1 | tail -60; return; }
+  docker logs "$node" 2>&1 | grep -q "triggered full backup completed" \
+    && ok "the out-of-cadence full completed and was named as triggered" \
+    || bad "the second full landed without the triggered completion log"
+}
+
 # One archive root, one owner. Two services archiving into the same bucket
 # path interleave two databases' histories in one archive, and a restore picks
 # the newest full across lineages — the other service's data, served as a
@@ -5119,6 +5162,7 @@ ALL_TESTS=(
   t_stuck_error_member_self_heals
   t_no_quorum_no_wipe
   t_pitr_archive_and_restore_to_point_in_time
+  t_pitr_full_backup_endpoint_wakes_the_archiver
   t_pitr_full_backup_holds_ddl_and_stays_consistent
   t_pitr_restore_keeps_scheduled_events_quiet_during_replay
   t_pitr_restore_honours_utc_targets_under_a_local_timezone
