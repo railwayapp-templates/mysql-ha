@@ -231,6 +231,19 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     - *Standalone*: the archive conf turns the binlog on (the plain
       rendering leaves it off), and a binlog is only purged locally once its
       upload is confirmed — the volume is the spool during a bucket outage.
+    - *Gap recovery*: a closed binlog that leaves the disk before it ships
+      (mysqld's own expiry on a group primary, an operator, a lost volume)
+      is a permanent hole in that lineage — restores past it refuse rather
+      than serve a history missing those transactions. The server still
+      holds the data the archive lost, so the archiver takes ONE full backup
+      immediately, out of cadence, re-anchoring the archive past the hole:
+      targets after that dump are restorable again, and carry the rows the
+      missing file had. Without it the lineage would have no restorable
+      point until the next scheduled full, up to
+      `BINLOG_FULL_BACKUP_INTERVAL_SECONDS` later. The request is recorded
+      on the volume, so a crash, a restart or a failed dump retries it
+      instead of dropping it, and it is logged as `gap-recovery full backup
+      completed`.
     - *Group Replication*: every member carries the same variables, and the
       archiver runs only on the member whose `/role` is the writable primary
       — a role supervisor starts it on promotion and stops it on demotion,
