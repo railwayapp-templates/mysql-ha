@@ -215,6 +215,7 @@ fn app(state: Arc<AppState>, guard: Guard) -> Router {
         .route("/role", get(role))
         .route("/gr/state", get(gr_state))
         .route("/pitr", get(pitr))
+        .route("/credentials/rotate", post(crate::credentials::rotate))
         .merge(mutating)
         .with_state(state)
 }
@@ -270,6 +271,7 @@ pub async fn run_health_server_supervised(
     state: Arc<AppState>,
     telemetry: Arc<Telemetry>,
 ) {
+    tokio::spawn(crate::credentials::reconcile(state.clone()));
     let mut alerted_for_current_incident = false;
 
     loop {

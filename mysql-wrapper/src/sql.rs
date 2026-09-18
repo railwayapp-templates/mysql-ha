@@ -280,6 +280,42 @@ pub fn is_recovery_credential_refusal(e: &anyhow::Error) -> bool {
 }
 
 impl Sql {
+    pub async fn probe_password(&self, password: &str) -> RootPasswordProbe {
+        probe_root_password(&self.socket_path, password).await
+    }
+
+    /// One binlogged account-management statement: all hosts and replication
+    /// accounts change atomically and Group Replication carries it to peers.
+    pub async fn rotate_cluster_accounts(&self, password: &str) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let app_user = std::env::var("MYSQL_USER").unwrap_or_else(|_| "railway".into());
+        let accounts: Vec<(String, String)> = conn
+            .exec(
+                "SELECT user, host FROM mysql.user WHERE user IN ('root', 'gr_recovery', ?)",
+                (&app_user,),
+            )
+            .await?;
+        anyhow::ensure!(
+            accounts.iter().any(|(u, _)| u == "root")
+                && accounts.iter().any(|(u, _)| u == "gr_recovery"),
+            "missing HA accounts"
+        );
+        let changes = accounts
+            .iter()
+            .map(|(user, host)| {
+                format!(
+                    "{}@{} IDENTIFIED BY {}",
+                    sql_string_literal(user),
+                    sql_string_literal(host),
+                    sql_string_literal(password)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.query_drop(format!("ALTER USER {changes}")).await?;
+        Ok(())
+    }
+
     pub fn connect_root_over_socket(socket_path: &str, root_password: &str) -> Self {
         Self {
             socket_path: Arc::new(socket_path.to_string()),
@@ -313,7 +349,20 @@ impl Sql {
 
     async fn conn(&self) -> Result<mysql_async::Conn> {
         let pool = self.pool.read().await.clone();
-        Ok(pool.get_conn().await?)
+        match pool.get_conn().await {
+            Ok(conn) => Ok(conn),
+            Err(mysql_async::Error::Server(ref e)) if e.code == 1045 => {
+                let pending = crate::config::Config::from_env()
+                    .ok()
+                    .and_then(|c| crate::credentials::pending_password(&c.data_dir))
+                    .context("no staged credential")?;
+                let replacement = Pool::new(root_opts(&self.socket_path, &pending));
+                let conn = replacement.get_conn().await?;
+                self.swap_root_password(&pending).await;
+                Ok(conn)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// `LOCK INSTANCE FOR BACKUP`, held on a connection of its own for as long
@@ -671,8 +720,10 @@ impl Sql {
         );
         for host in &hosts {
             let host_lit = sql_string_literal(host);
-            conn.query_drop(format!("ALTER USER 'root'@{host_lit} IDENTIFIED BY {pass_lit}"))
-                .await?;
+            conn.query_drop(format!(
+                "ALTER USER 'root'@{host_lit} IDENTIFIED BY {pass_lit}"
+            ))
+            .await?;
         }
         conn.query_drop("SET SESSION sql_log_bin = 1").await?;
         Ok(())

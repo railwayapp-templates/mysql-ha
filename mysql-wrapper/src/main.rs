@@ -41,6 +41,7 @@
 
 mod archiver;
 mod config;
+mod credentials;
 mod demote_on_shutdown;
 mod dns_probe;
 mod gr;
