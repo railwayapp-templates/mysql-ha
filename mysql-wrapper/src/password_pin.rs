@@ -125,7 +125,11 @@ pub async fn resolve_and_apply(config: Arc<Config>, sql: Sql, telemetry: Arc<Tel
         let pin = read_pin(&config.data_dir);
         let mut all_denied = true;
 
-        for (source, password) in candidates(&env_password, pin.as_deref()) {
+        let mut choices = candidates(&env_password, pin.as_deref());
+        if let Some(pending) = crate::credentials::pending_password(&config.data_dir) {
+            choices.insert(0, ("rotation", pending));
+        }
+        for (source, password) in choices {
             match probe_root_password(&config.socket_path, &password).await {
                 RootPasswordProbe::Works => {
                     finalize(

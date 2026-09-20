@@ -112,7 +112,16 @@ pub async fn require_credential(State(guard): State<Guard>, req: Request, next: 
     let Some(credential) = guard.as_deref() else {
         return next.run(req).await;
     };
-    if credential.accepts(req.headers().get(header::AUTHORIZATION)) {
+    let mut live = credential.clone();
+    if std::env::var("MYSQL_ROOT_PASSWORD").ok().as_deref() == Some(&credential.password) {
+        let dir = std::env::var("DATA_DIR")
+            .or_else(|_| std::env::var("RAILWAY_VOLUME_MOUNT_PATH"))
+            .unwrap_or_else(|_| "/var/lib/mysql".into());
+        if let Some(password) = crate::password_pin::read_pin(&dir) {
+            live.password = password;
+        }
+    }
+    if live.accepts(req.headers().get(header::AUTHORIZATION)) {
         return next.run(req).await;
     }
     warn!(
