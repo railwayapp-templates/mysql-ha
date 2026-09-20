@@ -2442,6 +2442,49 @@ t_no_quorum_no_wipe() {
   teardown_trio
 }
 
+# The monitor's gap recovery needs a way to bypass the daily full cadence.
+# Pin the endpoint contract against a real mysqld and S3 archive.
+t_pitr_full_backup_endpoint_wakes_the_archiver() {
+  log "t_pitr_full_backup_endpoint_wakes_the_archiver (authenticated POST queues a full outside the daily cadence)"
+  local node=mysql-pitr-trigger
+  docker rm -f "$node" mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm "mysql-ha-e2e-vol-$node" mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  start_standalone "$node" \
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET" \
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER" \
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD" \
+    -e "BINLOG_ARCHIVE_REGION=us-east-1" \
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000" \
+    -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-trigger" \
+    -e "BINLOG_FULL_BACKUP_INTERVAL_SECONDS=86400" \
+    -e "HEALTH_API_PASSWORD=$API_PW"
+
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs '"$node"' 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs "$node" 2>&1 | tail -40; return; }
+  [ "$(mc_count_matching e2e-pitr-trigger/ .meta.json)" = "1" ] \
+    || { bad "expected exactly one full before the trigger"; return; }
+
+  local url="http://localhost:8080/pitr/full-backup"
+  [ "$(http_code "$node" "$url" --post-data="")" = "401" ] \
+    && ok "full-backup trigger requires the health API credential" \
+    || { bad "unauthenticated full-backup trigger was not refused"; return; }
+  [ "$(http_code "$node" "$url" --post-data="" --header="$(basic_auth_header railway "$API_PW")")" = "202" ] \
+    && ok "authenticated full-backup trigger answered 202" \
+    || { bad "authenticated full-backup trigger was not accepted"; return; }
+
+  two_trigger_fulls() {
+    [ "$(mc_count_matching e2e-pitr-trigger/ .meta.json)" -ge 2 ]
+  }
+  wait_until 180 "triggered full backup lands" two_trigger_fulls \
+    || { bad "triggered full backup never landed"; docker logs "$node" 2>&1 | tail -60; return; }
+  docker logs "$node" 2>&1 | grep -q "triggered full backup completed" \
+    && ok "the out-of-cadence full completed and was named as triggered" \
+    || bad "the second full landed without the triggered completion log"
+}
+
 # One archive root, one owner. Two services archiving into the same bucket
 # path interleave two databases' histories in one archive, and a restore picks
 # the newest full across lineages — the other service's data, served as a
@@ -4056,6 +4099,16 @@ t_binlog_expiry_silently_loses_unshipped_data() {
     bad "a binlog ($victim) was purged/lost before upload and the archiver logged nothing — see archiver.rs's ship_once"
   fi
 
+  # Reporting the hole is half the contract. The server still holds every row
+  # the archive lost, so the archiver must also re-anchor: one full backup,
+  # out of cadence, taken as soon as the loss is seen. Without it the lineage
+  # has NO restorable point after the gap until the next scheduled full —
+  # hours of data with nowhere to restore to.
+  wait_until 120 "gap-recovery full backup taken" \
+    bash -c 'docker logs mysql-pitr-expiry-src 2>&1 | grep -q "gap-recovery full backup completed"' \
+    || { bad "the lost binlog never triggered a full backup — the archive has no restorable point past the gap"; docker logs mysql-pitr-expiry-src 2>&1 | grep '"message":' | tail -20; }
+  ok "the loss triggered an out-of-cadence full backup that re-anchors the archive"
+
   docker rm -f mysql-pitr-expiry-src mysql-ha-e2e-minio >/dev/null 2>&1
   docker volume rm mysql-ha-e2e-vol-mysql-pitr-expiry-src mysql-ha-e2e-minio-data >/dev/null 2>&1
 }
@@ -4796,13 +4849,16 @@ t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump() {
 # deterministically (the file is removed off the primary's datadir right
 # after the FLUSH that closes it, inside the archiver's ship poll — the same
 # stand-in for expiry t_binlog_expiry_silently_loses_unshipped_data uses) and
-# pins both halves of the contract on a group: the loss is REPORTED by name on
-# the primary, and a restore past it REFUSES on the GTID hole instead of
+# pins all three halves of the contract on a group: the loss is REPORTED by
+# name on the primary, the primary immediately RE-ANCHORS the archive with an
+# out-of-cadence full (the members still hold the row the archive lost, so the
+# dump puts it back within reach), and a restore to a target inside the gap
+# window — before that full — still REFUSES on the GTID hole instead of
 # serving a history silently missing the row every member still holds.
-t_pitr_ha_group_expiry_hole_is_reported_and_refused() {
-  log "t_pitr_ha_group_expiry_hole_is_reported_and_refused"
-  local hole=mysql-pitr-ha-expiry-restore
-  pitr_ha_teardown "$hole"
+t_pitr_ha_group_expiry_hole_is_reported_and_re_anchored() {
+  log "t_pitr_ha_group_expiry_hole_is_reported_and_re_anchored"
+  local hole=mysql-pitr-ha-expiry-restore anchored=mysql-pitr-ha-expiry-anchored
+  pitr_ha_teardown "$hole" "$anchored"
   start_minio || { bad "minio never became healthy"; return; }
   local -a env
   mapfile -t env < <(pitr_ha_archive_env /e2e-pitr-ha-expiry)
@@ -4833,6 +4889,21 @@ t_pitr_ha_group_expiry_hole_is_reported_and_refused() {
     || { bad "could not remove $victim from the primary's datadir"; return; }
   ok "$victim closed and removed from disk before the archiver could ship it — what the group's 3-day expiry does to a stuck archiver"
 
+  # Captured while the archive still has nothing past the hole: every restore
+  # aimed here has to cross the missing file, whatever the archiver does next.
+  sleep 2
+  local t_in_the_gap
+  t_in_the_gap="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+
+  # The primary owns the only copy of row 2 that is reachable — a dump taken
+  # now puts it back in the archive. That dump is the re-anchor, and waiting
+  # on it (rather than sleeping) is what keeps the targets below on the right
+  # side of it.
+  wait_until 180 "gap-recovery full backup on $primary" \
+    bash -c 'docker logs '"$primary"' 2>&1 | grep -q "gap-recovery full backup completed"' \
+    || { bad "the lost binlog never triggered a full backup on the group primary"; docker logs "$primary" 2>&1 | grep '"message":' | tail -20; return; }
+  ok "the primary re-anchored the archive with an out-of-cadence full backup"
+
   # Past the hole: another row, shipped normally, so the loss sits in the
   # middle of the lineage rather than at its end.
   sql "$primary" "INSERT INTO t.kv VALUES (3,'after-the-hole');"
@@ -4858,15 +4929,18 @@ t_pitr_ha_group_expiry_hole_is_reported_and_refused() {
     bad "$victim was lost before upload and the group primary logged nothing"
   fi
 
-  # Every member still holds row 2 — no lineage in the bucket does. A restore
-  # past it must refuse on the GTID hole, never serve a history without it.
+  # Inside the gap window the archive genuinely cannot serve the target: the
+  # newest full at or before it is the INITIAL one, and replaying forward from
+  # there walks into the missing file. Nothing the re-anchor did makes this
+  # instant recoverable, and claiming otherwise would serve a history without
+  # row 2 — so it must still refuse.
   local -a renv
-  mapfile -t renv < <(pitr_recover_env /e2e-pitr-ha-expiry "$t")
+  mapfile -t renv < <(pitr_recover_env /e2e-pitr-ha-expiry "$t_in_the_gap")
   start_standalone "$hole" "${renv[@]}"
   wait_until 240 "restore refused on the hole" \
     bash -c 'docker logs '"$hole"' 2>&1 | grep "\"message\":" | grep -qiE "restored GTID history has holes|binlog lineage has a gap"' \
     || { bad "the restore never reported the hole"; dump_node_log "$hole"; return; }
-  ok "restore detected and named the hole"
+  ok "a target inside the gap window is still refused, by name"
   node_logged "$hole" "point-in-time restore completed" \
     && bad "restore claimed completion despite the hole" || ok "restore never claimed completion"
   if docker exec "$hole" wget -q -O /dev/null http://localhost:8080/health 2>/dev/null; then
@@ -4875,7 +4949,28 @@ t_pitr_ha_group_expiry_hole_is_reported_and_refused() {
     ok "refused restore stays fail-closed (health not serving)"
   fi
 
-  pitr_ha_teardown "$hole"
+  # Past the re-anchor, the archive is whole again — and this is the point of
+  # taking that full at all. The dump was taken from a member that still held
+  # row 2, so restoring here serves the row the archive lost ALONG WITH the
+  # one written after the hole. Before the re-anchor, this target had no
+  # recoverable point at all: the group would have carried a restore-less
+  # window until the next scheduled full, hours away.
+  local -a aenv
+  mapfile -t aenv < <(pitr_recover_env /e2e-pitr-ha-expiry "$t")
+  start_standalone "$anchored" "${aenv[@]}"
+  wait_until 300 "restore from the re-anchoring full completed and serving" \
+    bash -c 'docker exec '"$anchored"' wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+    || { bad "a target past the re-anchoring full did not restore"; dump_node_log "$anchored"; return; }
+  node_logged "$anchored" "point-in-time restore completed" \
+    && ok "restore past the re-anchor completed" \
+    || bad "restore past the re-anchor never claimed completion"
+  local rows
+  rows="$(sql "$anchored" "SELECT GROUP_CONCAT(v ORDER BY k) FROM t.kv")"
+  [ "$rows" = "shipped,expired-before-upload,after-the-hole" ] \
+    && ok "the fork holds all three rows — the row the archive lost came back in the re-anchoring dump" \
+    || bad "the fork holds [$rows], expected [shipped,expired-before-upload,after-the-hole]"
+
+  pitr_ha_teardown "$hole" "$anchored"
 }
 
 # A standalone server that was already archiving (anonymous transactions,
@@ -5119,6 +5214,7 @@ ALL_TESTS=(
   t_stuck_error_member_self_heals
   t_no_quorum_no_wipe
   t_pitr_archive_and_restore_to_point_in_time
+  t_pitr_full_backup_endpoint_wakes_the_archiver
   t_pitr_full_backup_holds_ddl_and_stays_consistent
   t_pitr_restore_keeps_scheduled_events_quiet_during_replay
   t_pitr_restore_honours_utc_targets_under_a_local_timezone
@@ -5138,7 +5234,7 @@ ALL_TESTS=(
   t_pitr_ha_revert_to_standalone_keeps_the_archive
   t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole
   t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary
-  t_pitr_ha_group_expiry_hole_is_reported_and_refused
+  t_pitr_ha_group_expiry_hole_is_reported_and_re_anchored
   t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump
   t_pitr_ha_reverted_roots_full_declares_the_group_history
 )

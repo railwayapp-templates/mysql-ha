@@ -70,15 +70,20 @@ non-primary answer.
 
 ### Mutating routes and `HEALTH_API_PASSWORD`
 
-The same server carries one route that changes the group rather than
-describing it: `POST /switchover`, which asks THIS node to become the primary
-(Group Replication's `group_replication_set_as_primary`, run through the
-group's consensus). Anything on the private network that can reach port 8080
-can call it, so it is gated by HTTP Basic auth with the cluster's own secret:
+The same server carries two routes that mutate runtime state:
+
+- `POST /switchover` asks THIS node to become the primary (Group
+  Replication's `group_replication_set_as_primary`, run through consensus).
+- `POST /pitr/full-backup` queues one immediate full backup on the active
+  archiver. It answers `202` when queued and `409` when PITR is inactive on
+  this node or another full is already queued/running.
+
+Anything on the private network that can reach port 8080 can call them, so
+both are gated by HTTP Basic auth with the cluster's own secret:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `HEALTH_API_PASSWORD` | unset | Set → `POST /switchover` requires `Authorization: Basic base64(username:password)`; a missing, malformed or wrong credential answers `401` with `WWW-Authenticate: Basic realm="railway-ha"` and the body `unauthorized`. Unset or blank → the route stays open, exactly as before. |
+| `HEALTH_API_PASSWORD` | unset | Set → both mutating routes require `Authorization: Basic base64(username:password)`; a missing, malformed or wrong credential answers `401` with `WWW-Authenticate: Basic realm="railway-ha"` and the body `unauthorized`. Unset or blank → the routes stay open. |
 | `HEALTH_API_USERNAME` | `railway` | The username half of that credential. |
 
 Reads never require a credential: `GET /health`, `/role`, `/gr/state` and
@@ -95,8 +100,7 @@ cluster's shared `MYSQL_ROOT_PASSWORD` on every data node once that stamp
 lands (mono #38506), so a new cluster enforces from its first boot. An
 existing cluster enforces once the variable is set on its data nodes and they
 redeploy — each node gates its own route the moment
-it boots with the variable, and nodes never call each other's `/switchover`,
-so a cluster may adopt it one node at a time.
+it boots with the variable, so a cluster may adopt it one node at a time.
 
 ### Editing `MYSQL_ROOT_PASSWORD` on a running cluster
 
@@ -227,6 +231,19 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     - *Standalone*: the archive conf turns the binlog on (the plain
       rendering leaves it off), and a binlog is only purged locally once its
       upload is confirmed — the volume is the spool during a bucket outage.
+    - *Gap recovery*: a closed binlog that leaves the disk before it ships
+      (mysqld's own expiry on a group primary, an operator, a lost volume)
+      is a permanent hole in that lineage — restores past it refuse rather
+      than serve a history missing those transactions. The server still
+      holds the data the archive lost, so the archiver takes ONE full backup
+      immediately, out of cadence, re-anchoring the archive past the hole:
+      targets after that dump are restorable again, and carry the rows the
+      missing file had. Without it the lineage would have no restorable
+      point until the next scheduled full, up to
+      `BINLOG_FULL_BACKUP_INTERVAL_SECONDS` later. The request is recorded
+      on the volume, so a crash, a restart or a failed dump retries it
+      instead of dropping it, and it is logged as `gap-recovery full backup
+      completed`.
     - *Group Replication*: every member carries the same variables, and the
       archiver runs only on the member whose `/role` is the writable primary
       — a role supervisor starts it on promotion and stops it on demotion,
