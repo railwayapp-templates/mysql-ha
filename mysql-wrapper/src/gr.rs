@@ -1897,7 +1897,10 @@ pub async fn orchestrate(
                                         &donor,
                                         config.mysql_port,
                                         RECOVERY_USER,
-                                        &recovery_password,
+                                        &current_recovery_credential(
+                                            &config,
+                                            &active_root_password,
+                                        ),
                                     )
                                     .await
                                 {
@@ -2048,7 +2051,7 @@ pub async fn orchestrate(
                             &donor,
                             config.mysql_port,
                             RECOVERY_USER,
-                            &recovery_password,
+                            &current_recovery_credential(&config, &active_root_password),
                         )
                         .await
                     {
@@ -2553,6 +2556,20 @@ async fn futures_join_all(
     results
 }
 
+/// Long-lived watchdogs must resolve the pin at the time of each attempt.
+pub fn current_recovery_credential(config: &Config, boot_password: &str) -> String {
+    let active = crate::password_pin::read_pin(&config.data_dir)
+        .unwrap_or_else(|| boot_password.to_string());
+    recovery_credential(
+        config
+            .gr_replication_password
+            .as_deref()
+            .unwrap_or(&config.mysql_root_password),
+        &config.mysql_root_password,
+        &active,
+    )
+}
+
 /// The password the recovery account and the recovery channel use.
 ///
 /// In the template's shape `GR_REPLICATION_PASSWORD` is a reference to
@@ -2690,7 +2707,7 @@ mod tests {
         assert!(picture.unknown.is_empty());
     }
 
-#[test]
+    #[test]
     fn coupled_recovery_credential_follows_the_active_root_not_the_variable() {
         // Template shape, root variable edited: env says "new" for both, the
         // pin says the group still enforces "old". The recovery credential
@@ -3452,6 +3469,22 @@ mod tests {
             "99999999-8888-7777-6666-555555555555"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_attempts_follow_rotation_and_compensation_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.data_dir = dir.path().to_str().unwrap().into();
+        config.mysql_root_password = "boot".into();
+        config.gr_replication_password = Some("boot".into());
+        for password in ["boot", "rotated", "boot"] {
+            crate::password_pin::write_pin(&config.data_dir, password).unwrap();
+            assert_eq!(current_recovery_credential(&config, "boot"), password);
+        }
+        config.gr_replication_password = Some("independent".into());
+        crate::password_pin::write_pin(&config.data_dir, "rotated").unwrap();
+        assert_eq!(current_recovery_credential(&config, "boot"), "independent");
     }
 
     fn test_config() -> Config {

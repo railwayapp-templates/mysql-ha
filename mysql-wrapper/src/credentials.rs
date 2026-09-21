@@ -13,20 +13,23 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 static ROTATION: Mutex<()> = Mutex::const_new(());
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Rotation {
     operation: Operation,
     new_password: String,
     current_password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_verifiers: Option<Vec<(String, String, String)>>,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Operation {
     Preflight,
     Prepare,
     Database,
     Member,
+    Finalize,
     Verify,
 }
 
@@ -69,7 +72,7 @@ pub async fn rotate(
         ),
     }
 }
-async fn apply(state: &AppState, request: Rotation) -> anyhow::Result<Value> {
+async fn apply(state: &AppState, mut request: Rotation) -> anyhow::Result<Value> {
     match request.operation {
         Operation::Preflight => {
             anyhow::ensure!(
@@ -86,31 +89,44 @@ async fn apply(state: &AppState, request: Rotation) -> anyhow::Result<Value> {
             );
         }
         Operation::Prepare => {
+            let existing = read_pending(&state.data_dir);
+            request.previous_verifiers = match existing {
+                Some(staged) if staged.new_password == request.new_password => {
+                    staged.previous_verifiers
+                }
+                _ => Some(state.sql.rotation_verifiers().await?),
+            };
             save_pending(&state.data_dir, &request)?;
             return Ok(json!({"version": 1, "leader": false}));
         }
         Operation::Database => {
-            if !matches!(
-                state.sql.probe_password(&request.new_password).await,
-                RootPasswordProbe::Works
-            ) {
-                anyhow::ensure!(
-                    matches!(
-                        state.sql.probe_password(&request.current_password).await,
-                        RootPasswordProbe::Works
-                    ),
-                    "current password refused"
-                );
-                state
-                    .sql
-                    .swap_root_password(&request.current_password)
-                    .await;
+            let staged = read_pending(&state.data_dir)
+                .ok_or_else(|| anyhow::anyhow!("rotation intent missing"))?;
+            anyhow::ensure!(
+                staged.new_password == request.new_password,
+                "rotation intent differs"
+            );
+            let before = staged
+                .previous_verifiers
+                .ok_or_else(|| anyhow::anyhow!("rotation snapshot missing"))?;
+            // A retry after a lost SQL response must not replace the retained
+            // old password with the new one. On rollback, PREPARE takes a new
+            // snapshot and the same rule restores the old primary password.
+            let current = state.sql.rotation_verifiers().await?;
+            if current == before {
                 anyhow::ensure!(!state.sql.super_read_only().await?, "not primary");
                 state
                     .sql
                     .rotate_cluster_accounts(&request.new_password)
                     .await?;
             }
+            anyhow::ensure!(
+                matches!(
+                    state.sql.probe_password(&request.new_password).await,
+                    RootPasswordProbe::Works
+                ),
+                "target password refused"
+            );
             state.sql.swap_root_password(&request.new_password).await;
         }
         Operation::Member => {
@@ -127,6 +143,17 @@ async fn apply(state: &AppState, request: Rotation) -> anyhow::Result<Value> {
                 .configure_recovery_channel("gr_recovery", &request.new_password)
                 .await?;
             password_pin::write_pin(&state.data_dir, &request.new_password)?;
+        }
+        Operation::Finalize => {
+            anyhow::ensure!(!state.sql.super_read_only().await?, "not primary");
+            anyhow::ensure!(
+                matches!(
+                    state.sql.probe_password(&request.new_password).await,
+                    RootPasswordProbe::Works
+                ),
+                "target password refused"
+            );
+            state.sql.finalize_cluster_password().await?;
         }
         Operation::Verify => {
             let members = state.sql.group_members().await?;
@@ -162,7 +189,7 @@ async fn apply(state: &AppState, request: Rotation) -> anyhow::Result<Value> {
         }
     }
     let leader = !state.sql.super_read_only().await?;
-    Ok(json!({"version": 1, "leader": leader}))
+    Ok(json!({"version": 1, "leader": leader, "capabilities": ["dual_password"]}))
 }
 
 fn save_pending(data_dir: &str, request: &Rotation) -> anyhow::Result<()> {
@@ -181,6 +208,9 @@ fn save_pending(data_dir: &str, request: &Rotation) -> anyhow::Result<()> {
     std::fs::rename(tmp, path)?;
     std::fs::File::open(data_dir)?.sync_all()?;
     Ok(())
+}
+fn read_pending(data_dir: &str) -> Option<Rotation> {
+    serde_json::from_slice(&std::fs::read(format!("{data_dir}/.railway_rotation")).ok()?).ok()
 }
 pub fn pending_password(data_dir: &str) -> Option<String> {
     let request: Rotation =
@@ -204,5 +234,108 @@ pub async fn reconcile(state: Arc<AppState>) {
             Ok::<(), anyhow::Error>(())
         };
         let _ = tokio::time::timeout(std::time::Duration::from_secs(25), attempt).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{archiver::PitrStatus, sql::Sql};
+    use std::sync::atomic::AtomicBool;
+
+    // Uses an isolated server created by test/password-rotation-local.py.
+    #[tokio::test]
+    #[ignore = "requires an isolated local MySQL server"]
+    async fn live_dual_password_retry_and_rollback() {
+        let socket = std::env::var("ROTATION_TEST_MYSQL_SOCKET").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sql = Sql::connect_root_over_socket(&socket, "rotation-old-local");
+        let state = AppState {
+            sql,
+            standalone: true,
+            data_dir: dir.path().to_str().unwrap().into(),
+            adoption_checked: Arc::new(AtomicBool::new(true)),
+            membership_fenced: Arc::new(AtomicBool::new(false)),
+            pitr: PitrStatus::new(false),
+        };
+        async fn accepts(socket: &str, user: &str, password: &str) -> bool {
+            let options = mysql_async::OptsBuilder::default()
+                .socket(Some(socket))
+                .user(Some(user))
+                .pass(Some(password));
+            match mysql_async::Conn::new(options).await {
+                Ok(connection) => {
+                    connection.disconnect().await.unwrap();
+                    true
+                }
+                Err(mysql_async::Error::Server(error)) if error.code == 1045 => false,
+                Err(error) => panic!("unexpected local test connection failure: {error}"),
+            }
+        }
+        for (previous, target) in [
+            ("rotation-old-local", "rotation-new-local"),
+            ("rotation-new-local", "rotation-old-local"),
+        ] {
+            for operation in [
+                Operation::Prepare,
+                Operation::Database,
+                Operation::Prepare,
+                Operation::Database,
+            ] {
+                apply(
+                    &state,
+                    Rotation {
+                        operation,
+                        new_password: target.into(),
+                        current_password: previous.into(),
+                        previous_verifiers: None,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(matches!(
+                state.sql.probe_password(previous).await,
+                RootPasswordProbe::Works
+            ));
+            assert!(matches!(
+                state.sql.probe_password(target).await,
+                RootPasswordProbe::Works
+            ));
+            for role in ["gr_recovery", "railway"] {
+                assert!(accepts(&socket, role, previous).await);
+                assert!(accepts(&socket, role, target).await);
+            }
+            // Compensate the first change while the original password is
+            // still accepted as a secondary, before revocation.
+            if target == "rotation-new-local" {
+                continue;
+            }
+            for _ in 0..2 {
+                apply(
+                    &state,
+                    Rotation {
+                        operation: Operation::Finalize,
+                        new_password: target.into(),
+                        current_password: previous.into(),
+                        previous_verifiers: None,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(matches!(
+                state.sql.probe_password(previous).await,
+                RootPasswordProbe::AccessDenied
+            ));
+            for role in ["gr_recovery", "railway"] {
+                assert!(!accepts(&socket, role, previous).await);
+                assert!(accepts(&socket, role, target).await);
+            }
+            assert!(matches!(
+                state.sql.probe_password(target).await,
+                RootPasswordProbe::Works
+            ));
+        }
     }
 }

@@ -792,7 +792,7 @@ pub async fn stuck_watch(
                 &donor,
                 config.mysql_port,
                 gr::RECOVERY_USER,
-                &recovery_password,
+                &gr::current_recovery_credential(&config, &active_root_password),
             )
             .await
         {
