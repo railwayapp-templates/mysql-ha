@@ -284,27 +284,32 @@ impl Sql {
         probe_root_password(&self.socket_path, password).await
     }
 
-    /// One binlogged account-management statement: all hosts and replication
-    /// accounts change atomically and Group Replication carries it to peers.
-    pub async fn rotate_cluster_accounts(&self, password: &str) -> Result<()> {
+    /// Snapshot before mutation makes retries distinguish primary and retained
+    /// passwords without treating a successful secondary-password login as a
+    /// completed change (especially during rollback).
+    pub async fn rotation_verifiers(&self) -> Result<Vec<(String, String, String)>> {
         let mut conn = self.conn().await?;
         let app_user = std::env::var("MYSQL_USER").unwrap_or_else(|_| "railway".into());
-        let accounts: Vec<(String, String)> = conn
-            .exec(
-                "SELECT user, host FROM mysql.user WHERE user IN ('root', 'gr_recovery', ?)",
-                (&app_user,),
-            )
-            .await?;
+        let accounts: Vec<(String, String, String)> = conn.exec(
+            "SELECT user, host, authentication_string FROM mysql.user WHERE user IN ('root', 'gr_recovery', ?) ORDER BY user, host",
+            (&app_user,),
+        ).await?;
         anyhow::ensure!(
-            accounts.iter().any(|(u, _)| u == "root")
-                && accounts.iter().any(|(u, _)| u == "gr_recovery"),
+            accounts.iter().any(|(u, _, _)| u == "root")
+                && accounts.iter().any(|(u, _, _)| u == "gr_recovery"),
             "missing HA accounts"
         );
+        Ok(accounts)
+    }
+
+    /// One binlogged statement changes every coupled account atomically.
+    pub async fn rotate_cluster_accounts(&self, password: &str) -> Result<()> {
+        let accounts = self.rotation_verifiers().await?;
         let changes = accounts
             .iter()
-            .map(|(user, host)| {
+            .map(|(user, host, _)| {
                 format!(
-                    "{}@{} IDENTIFIED BY {}",
+                    "{}@{} IDENTIFIED BY {} RETAIN CURRENT PASSWORD",
                     sql_string_literal(user),
                     sql_string_literal(host),
                     sql_string_literal(password)
@@ -312,7 +317,30 @@ impl Sql {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        conn.query_drop(format!("ALTER USER {changes}")).await?;
+        self.conn()
+            .await?
+            .query_drop(format!("ALTER USER {changes}"))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn finalize_cluster_password(&self) -> Result<()> {
+        let accounts = self.rotation_verifiers().await?;
+        let changes = accounts
+            .iter()
+            .map(|(user, host, _)| {
+                format!(
+                    "{}@{} DISCARD OLD PASSWORD",
+                    sql_string_literal(user),
+                    sql_string_literal(host)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.conn()
+            .await?
+            .query_drop(format!("ALTER USER {changes}"))
+            .await?;
         Ok(())
     }
 
