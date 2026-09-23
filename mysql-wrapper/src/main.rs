@@ -293,6 +293,7 @@ async fn main() -> Result<()> {
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: false,
+                standalone_initialized: std::sync::atomic::AtomicBool::new(true),
                 data_dir: config.data_dir.clone(),
                 adoption_checked: adoption_checked.clone(),
                 membership_fenced: membership_fenced.clone(),
@@ -408,6 +409,9 @@ async fn main() -> Result<()> {
             Arc::new(AppState {
                 sql: sql.clone(),
                 standalone: true,
+                standalone_initialized: std::sync::atomic::AtomicBool::new(
+                    config.datadir_is_initialized(),
+                ),
                 membership_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 data_dir: config.data_dir.clone(),
                 // No orchestrate task runs in standalone mode to raise this
