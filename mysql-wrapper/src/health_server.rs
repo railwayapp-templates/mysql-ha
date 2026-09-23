@@ -59,6 +59,10 @@ use tracing::{error, info, warn};
 pub struct AppState {
     pub sql: Sql,
     pub standalone: bool,
+    /// Existing volumes skip entrypoint initialization. Fresh volumes must
+    /// observe the serving mysqld before accepting an authentication refusal
+    /// as liveness: the temporary init server also answers on the socket.
+    pub standalone_initialized: AtomicBool,
     /// Datadir path — /gr/state reads the pre-GTID-data marker from it.
     pub data_dir: String,
     /// Raised by `gr::orchestrate` once its one-time adoption detection
@@ -80,9 +84,22 @@ pub struct AppState {
     pub pitr: Arc<PitrStatus>,
 }
 
+impl AppState {
+    async fn ping_standalone(&self) -> anyhow::Result<()> {
+        if !self.standalone_initialized.load(Ordering::SeqCst) {
+            anyhow::ensure!(
+                !self.sql.is_init_temp_server().await?,
+                "mysqld is still initializing"
+            );
+            self.standalone_initialized.store(true, Ordering::SeqCst);
+        }
+        self.sql.ping_standalone().await
+    }
+}
+
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let result = if state.standalone {
-        state.sql.ping_standalone().await
+        state.ping_standalone().await
     } else {
         state.sql.ping().await
     };
@@ -95,7 +112,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.standalone {
         // No group to fence against — alive means writable.
-        return match state.sql.ping_standalone().await {
+        return match state.ping_standalone().await {
             Ok(()) => (StatusCode::OK, "primary (standalone)"),
             Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "mysqld not answering"),
         };
@@ -181,7 +198,7 @@ const SWITCHOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.standalone {
         // No group — a lone node is trivially its own primary.
-        return match state.sql.ping_standalone().await {
+        return match state.ping_standalone().await {
             Ok(()) => (StatusCode::OK, "already primary (standalone)".to_string()),
             Err(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -364,6 +381,7 @@ mod tests {
         Arc::new(AppState {
             sql: Sql::connect_root_over_socket("/nonexistent/mysql-ha-test.sock", "pw"),
             standalone: true,
+            standalone_initialized: AtomicBool::new(true),
             data_dir: "/nonexistent".to_string(),
             adoption_checked: Arc::new(AtomicBool::new(true)),
             membership_fenced: Arc::new(AtomicBool::new(false)),
