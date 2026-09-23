@@ -4738,6 +4738,12 @@ t_join_legacy_group_without_block_size_advert() {
   wait_until 30 "old protocol proxy ready" docker exec legacy-gr-proxy-1 python -c \
     'import json,urllib.request; s=json.load(urllib.request.urlopen("http://127.0.0.1:8080/gr/state")); assert "gtid_assignment_block_size" not in s and s["group_active"]' \
     || { bad "old protocol was not reproduced"; return; }
+  primary="$(current_primary mysql-1 mysql-1 mysql-2 mysql-3)" || { bad "no primary before rejoin"; return; }
+  sql "$primary" "CREATE DATABASE legacy_upgrade; CREATE TABLE legacy_upgrade.markers (id INT PRIMARY KEY, payload VARCHAR(64)); INSERT INTO legacy_upgrade.markers VALUES (1, 'before-upgrade');" \
+    || { bad "could not seed pre-upgrade data"; return; }
+  wait_until 60 "pre-upgrade data on returning member" bash -c \
+    '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT payload FROM legacy_upgrade.markers WHERE id=1" 2>/dev/null)" = "before-upgrade" ]' \
+    || { bad "pre-upgrade data never reached returning member"; return; }
   docker rm -f mysql-3 >/dev/null
   start_node 3
   wait_until 300 "new member joined old protocol group" group_is_fully_online mysql-3 \
@@ -4745,10 +4751,13 @@ t_join_legacy_group_without_block_size_advert() {
   [ "$(sql mysql-3 "SELECT @@global.group_replication_gtid_assignment_block_size")" = "1000000" ] \
     && ok "legacy block size adopted through SQL" || bad "legacy block size was not adopted"
   primary="$(current_primary mysql-1 mysql-1 mysql-2 mysql-3)" || { bad "no primary after rejoin"; return; }
-  sql "$primary" "CREATE TABLE IF NOT EXISTS railway.legacy_join (id INT PRIMARY KEY); INSERT INTO railway.legacy_join VALUES (1);"
-  wait_until 30 "post-rejoin data on new member" bash -c \
-    '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT COUNT(*) FROM railway.legacy_join" 2>/dev/null)" = "1" ]' \
-    && ok "new member replicated post-rejoin data" || bad "new member missed post-rejoin data"
+  [ "$(sql mysql-3 "SELECT payload FROM legacy_upgrade.markers WHERE id=1")" = "before-upgrade" ] \
+    && ok "existing data survived member upgrade" || bad "existing data changed across member upgrade"
+  sql "$primary" "INSERT INTO legacy_upgrade.markers VALUES (2, 'after-upgrade');" \
+    || { bad "could not write post-upgrade data"; return; }
+  wait_until 60 "post-rejoin data on new member" bash -c \
+    '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT GROUP_CONCAT(CONCAT(id, CHAR(58), payload) ORDER BY id) FROM legacy_upgrade.markers" 2>/dev/null)" = "1:before-upgrade,2:after-upgrade" ]' \
+    && ok "new member preserved old data and replicated new data" || bad "new member data does not match before/after markers"
   docker rm -f legacy-gr-proxy-1 legacy-gr-proxy-2 >/dev/null
   teardown_trio
   rm -f "$cnf"
