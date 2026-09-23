@@ -354,8 +354,7 @@ fn group_active_from(member_state: Option<&str>, members: &[MemberRow]) -> bool 
 ///
 /// Only group-active peers count: a peer that is not in the group is
 /// advertising its own configured value, which is no more authoritative
-/// than ours. A peer on an older build advertises nothing, which leaves the
-/// joiner on its configured value — the behaviour before this existed.
+/// than ours. Older adverts are resolved through SQL before this selection.
 fn block_size_to_adopt(local: Option<u64>, answers: &[(String, PeerAnswer)]) -> Option<u64> {
     let group = answers.iter().find_map(|(_, a)| match a {
         PeerAnswer::State(s) if s.group_active => s.gtid_assignment_block_size,
@@ -365,6 +364,42 @@ fn block_size_to_adopt(local: Option<u64>, answers: &[(String, PeerAnswer)]) -> 
         Some(mine) if mine == group => None,
         _ => Some(group),
     }
+}
+
+/// Resolve missing fields from old wrappers before START GROUP_REPLICATION.
+/// Never guess the old default: operators could have configured another value.
+async fn resolve_peer_block_sizes(
+    answers: &mut [(String, PeerAnswer)],
+    port: u16,
+    password: &str,
+) -> Result<()> {
+    if answers.iter().any(|(_, a)| {
+        matches!(a, PeerAnswer::State(s)
+        if s.group_active && s.gtid_assignment_block_size.is_some())
+    }) {
+        return Ok(());
+    }
+    for (host, answer) in answers.iter_mut() {
+        let PeerAnswer::State(state) = answer else {
+            continue;
+        };
+        if !state.group_active {
+            continue;
+        }
+        let (Some(uuid), Some(group)) = (&state.server_uuid, &state.group_name) else {
+            continue;
+        };
+        match crate::sql::peer_gtid_block_size(host, port, password, uuid, group).await {
+            Ok(size) => {
+                state.gtid_assignment_block_size = Some(size);
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(peer = %host, error = %error, "could not read legacy peer's GTID block size")
+            }
+        }
+    }
+    anyhow::bail!("no active peer supplied its GTID assignment block size")
 }
 
 /// This node's own Group Replication state, in the same shape peers report.
@@ -2094,6 +2129,15 @@ pub async fn orchestrate(
             // an image whose default had changed under a group already
             // formed on the old one). Adopt before joining; the local
             // my.cnf value is only the bootstrap default.
+            let root_password = crate::password_pin::read_pin(&config.data_dir)
+                .unwrap_or_else(|| active_root_password.clone());
+            if let Err(error) =
+                resolve_peer_block_sizes(&mut answers, config.mysql_port, &root_password).await
+            {
+                warn!(error = %error, "waiting for live group configuration before joining");
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
             let local_block_size = sql.gtid_assignment_block_size().await.ok();
             if let Some(group_block_size) = block_size_to_adopt(local_block_size, &answers) {
                 match sql.set_gtid_assignment_block_size(group_block_size).await {
@@ -3631,8 +3675,8 @@ mod tests {
             block_size_to_adopt(Some(1), &[peer(false, Some(1_000_000))]),
             None
         );
-        // An older build advertises nothing: the joiner stays on its
-        // configured value, exactly as it did before this existed.
+        // The pure selector cannot resolve an old advert. The join path
+        // resolves it through SQL before calling this selector.
         assert_eq!(block_size_to_adopt(Some(1), &[peer(true, None)]), None);
         // No peers at all (bootstrap territory) changes nothing.
         assert_eq!(block_size_to_adopt(Some(1), &[]), None);

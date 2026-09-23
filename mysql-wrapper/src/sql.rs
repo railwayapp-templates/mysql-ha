@@ -37,6 +37,92 @@ pub const GLOBAL_READ_LOCK_WAIT: Duration = Duration::from_secs(5);
 /// broken — the one error the read lock turns into a deferral.
 pub const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
 
+/// Read group-wide configuration from an ONLINE peer whose HTTP advert is
+/// too old to carry it. Check identity and membership in the same query;
+/// a stale advert or a recycled address must not supply join configuration.
+pub async fn peer_gtid_block_size(
+    host: &str,
+    port: u16,
+    password: &str,
+    expected_uuid: &str,
+    expected_group: &str,
+) -> Result<u64> {
+    tokio::time::timeout(SHORT_QUERY_TIMEOUT, async {
+        let opts = OptsBuilder::default()
+            .ip_or_hostname(host)
+            .tcp_port(port)
+            .prefer_socket(false)
+            .user(Some("root"))
+            .pass(Some(password));
+        let mut conn = mysql_async::Conn::new(opts).await?;
+        let row: Option<(String, String, u64, String)> = conn
+            .query_first(
+                "SELECT @@server_uuid, @@GLOBAL.group_replication_group_name, \
+             @@GLOBAL.group_replication_gtid_assignment_block_size, MEMBER_STATE \
+             FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid",
+            )
+            .await?;
+        // Do not keep a peer session alive between orchestration passes.
+        conn.disconnect().await?;
+        let (uuid, group, size, state) = row.context("peer is not a group member")?;
+        verified_peer_block_size(&uuid, &group, size, &state, expected_uuid, expected_group)
+            .context("peer identity, ONLINE state or GTID block size did not match")
+    })
+    .await
+    .context("peer GTID block-size query timed out")?
+}
+
+fn verified_peer_block_size(
+    uuid: &str,
+    group: &str,
+    size: u64,
+    state: &str,
+    expected_uuid: &str,
+    expected_group: &str,
+) -> Option<u64> {
+    (state == "ONLINE"
+        && size > 0
+        && size <= i64::MAX as u64
+        && !expected_uuid.is_empty()
+        && !expected_group.is_empty()
+        && uuid.eq_ignore_ascii_case(expected_uuid)
+        && group.eq_ignore_ascii_case(expected_group))
+    .then_some(size)
+}
+
+#[cfg(test)]
+mod peer_block_size_tests {
+    use super::verified_peer_block_size;
+    #[test]
+    fn requires_live_membership_and_matching_identity() {
+        assert_eq!(
+            verified_peer_block_size("ABC", "DEF", 1_000_000, "ONLINE", "abc", "def"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            verified_peer_block_size("a", "g", i64::MAX as u64, "ONLINE", "a", "g"),
+            Some(i64::MAX as u64)
+        );
+        for state in ["OFFLINE", "RECOVERING", "ERROR", ""] {
+            assert_eq!(verified_peer_block_size("a", "g", 1, state, "a", "g"), None);
+        }
+        assert_eq!(
+            verified_peer_block_size("a", "g", 1, "ONLINE", "other", "g"),
+            None
+        );
+        assert_eq!(
+            verified_peer_block_size("a", "g", 1, "ONLINE", "a", "other"),
+            None
+        );
+        for size in [0, u64::MAX] {
+            assert_eq!(
+                verified_peer_block_size("a", "g", size, "ONLINE", "a", "g"),
+                None
+            );
+        }
+    }
+}
+
 /// The global read lock (`FLUSH TABLES WITH READ LOCK`), alive while this
 /// value is — for the instant a dump needs to open its snapshot at the
 /// exact coordinates the wrapper records (see archiver::take_full_backup).

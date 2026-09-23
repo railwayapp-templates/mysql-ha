@@ -4715,6 +4715,54 @@ t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole() {
   pitr_ha_teardown "$restore" "$hole"
 }
 
+# Same old protocol as the degraded continuous canary: the live group uses
+# 1,000,000 but /gr/state does not advertise that value. Only the returning
+# member uses today's default 1. SQL must discover the group's actual value.
+t_join_legacy_group_without_block_size_advert() {
+  log "t_join_legacy_group_without_block_size_advert"
+  teardown_trio
+  local cnf n primary
+  cnf="$(mktemp "${TMPDIR:-/tmp}/mysql-ha-e2e-legacy.XXXXXX")"
+  printf '[mysqld]\nloose-group_replication_gtid_assignment_block_size = 1000000\n' > "$cnf"
+  chmod 644 "$cnf"
+  for n in 1 2 3; do
+    start_node "$n" -e HEALTH_PORT=8081 -v "$cnf:/etc/mysql/conf.d/zz-zz-legacy.cnf:ro"
+  done
+  wait_until 300 "legacy group ONLINE" group_is_fully_online mysql-1 || { bad "legacy group did not form"; rm -f "$cnf"; return; }
+  for n in 1 2; do
+    docker run -d --label "$LABEL" --name "legacy-gr-proxy-$n" \
+      --network "container:mysql-$n" \
+      -v "$PWD/test/legacy-gr-proxy.py:/proxy.py:ro" \
+      python:3.12-alpine python /proxy.py >/dev/null || { bad "legacy proxy did not start"; return; }
+  done
+  wait_until 30 "old protocol proxy ready" docker exec legacy-gr-proxy-1 python -c \
+    'import json,urllib.request; s=json.load(urllib.request.urlopen("http://127.0.0.1:8080/gr/state")); assert "gtid_assignment_block_size" not in s and s["group_active"]' \
+    || { bad "old protocol was not reproduced"; return; }
+  primary="$(current_primary mysql-1 mysql-1 mysql-2 mysql-3)" || { bad "no primary before rejoin"; return; }
+  sql "$primary" "CREATE DATABASE legacy_upgrade; CREATE TABLE legacy_upgrade.markers (id INT PRIMARY KEY, payload VARCHAR(64)); INSERT INTO legacy_upgrade.markers VALUES (1, 'before-upgrade');" \
+    || { bad "could not seed pre-upgrade data"; return; }
+  wait_until 60 "pre-upgrade data on returning member" bash -c \
+    '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT payload FROM legacy_upgrade.markers WHERE id=1" 2>/dev/null)" = "before-upgrade" ]' \
+    || { bad "pre-upgrade data never reached returning member"; return; }
+  docker rm -f mysql-3 >/dev/null
+  start_node 3
+  wait_until 300 "new member joined old protocol group" group_is_fully_online mysql-3 \
+    || { bad "new member cannot join legacy group"; return; }
+  [ "$(sql mysql-3 "SELECT @@global.group_replication_gtid_assignment_block_size")" = "1000000" ] \
+    && ok "legacy block size adopted through SQL" || bad "legacy block size was not adopted"
+  primary="$(current_primary mysql-1 mysql-1 mysql-2 mysql-3)" || { bad "no primary after rejoin"; return; }
+  [ "$(sql mysql-3 "SELECT payload FROM legacy_upgrade.markers WHERE id=1")" = "before-upgrade" ] \
+    && ok "existing data survived member upgrade" || bad "existing data changed across member upgrade"
+  sql "$primary" "INSERT INTO legacy_upgrade.markers VALUES (2, 'after-upgrade');" \
+    || { bad "could not write post-upgrade data"; return; }
+  wait_until 60 "post-rejoin data on new member" bash -c \
+    '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT GROUP_CONCAT(CONCAT(id, CHAR(58), payload) ORDER BY id) FROM legacy_upgrade.markers" 2>/dev/null)" = "1:before-upgrade,2:after-upgrade" ]' \
+    && ok "new member preserved old data and replicated new data" || bad "new member data does not match before/after markers"
+  docker rm -f legacy-gr-proxy-1 legacy-gr-proxy-2 >/dev/null
+  teardown_trio
+  rm -f "$cnf"
+}
+
 # Every group formed before this image pinned
 # group_replication_gtid_assignment_block_size to 1 (52f0241) runs on the
 # default of 1,000,000: each member reserves a block of a million numbers
@@ -5184,6 +5232,7 @@ t_pitr_ha_reverted_roots_full_declares_the_group_history() {
 }
 
 ALL_TESTS=(
+  t_join_legacy_group_without_block_size_advert
   t_group_forms_and_replicates
   t_failover_on_primary_pause
   t_cold_restart_preserves_group
