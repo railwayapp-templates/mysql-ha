@@ -3,7 +3,8 @@
 //! Three probe endpoints, all fail-closed (any error, timeout, or uncertain
 //! read answers 503), plus one action endpoint the Railway dashboard drives:
 //!
-//!   GET /health — liveness: 200 iff mysqld answers `SELECT 1`.
+//!   GET /health — authenticated SQL liveness in HA; standalone also accepts
+//!                 an authentication refusal as proof that mysqld is alive.
 //!   GET /role   — write-routing fence: 200 iff this node is the writable
 //!                 Group Replication primary AND its view of the group has a
 //!                 reachable majority (see sql::role_is_writable_primary).
@@ -80,7 +81,12 @@ pub struct AppState {
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match state.sql.ping().await {
+    let result = if state.standalone {
+        state.sql.ping_standalone().await
+    } else {
+        state.sql.ping().await
+    };
+    match result {
         Ok(()) => (StatusCode::OK, "ok"),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "mysqld not answering"),
     }
@@ -89,7 +95,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.standalone {
         // No group to fence against — alive means writable.
-        return match state.sql.ping().await {
+        return match state.sql.ping_standalone().await {
             Ok(()) => (StatusCode::OK, "primary (standalone)"),
             Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "mysqld not answering"),
         };
@@ -175,7 +181,7 @@ const SWITCHOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.standalone {
         // No group — a lone node is trivially its own primary.
-        return match state.sql.ping().await {
+        return match state.sql.ping_standalone().await {
             Ok(()) => (StatusCode::OK, "already primary (standalone)".to_string()),
             Err(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,

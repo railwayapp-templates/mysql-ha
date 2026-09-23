@@ -482,9 +482,11 @@ pub async fn boot_watch(
             }
         }
 
-        // The same readiness test the orchestrator uses: the FINAL mysqld
-        // (not docker-entrypoint's init temp server) answering queries.
-        if let Ok(false) = sql.is_init_temp_server().await {
+        // A completed boot or an authentication refusal both prove mysqld
+        // answered. Missing credentials must never burn the boot budget and
+        // eventually discard a healthy dataset. This only resets crash-loop
+        // accounting; HA membership/routing still require authenticated SQL.
+        if boot_answered(&sql.is_init_temp_server().await) {
             state.ready.store(true, Ordering::Relaxed);
             if let Err(e) = persist_boot_attempts(&config.data_dir, 0) {
                 warn!(error = %e, "could not reset the boot attempt counter");
@@ -524,6 +526,13 @@ pub async fn boot_watch(
         }
 
         sleep(BOOT_WATCH_POLL).await;
+    }
+}
+
+fn boot_answered(result: &Result<bool>) -> bool {
+    match result {
+        Ok(is_init_temp_server) => !is_init_temp_server,
+        Err(error) => crate::sql::is_access_denied(error),
     }
 }
 
@@ -857,6 +866,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn denied_credentials_are_not_a_boot_failure() {
+        let denied = anyhow::Error::from(mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1045,
+            message: "Access denied".into(),
+            state: "28000".into(),
+        }))
+        .context("getting connection");
+        assert!(boot_answered(&Err(denied)));
+        assert!(boot_answered(&Ok(false)));
+        assert!(!boot_answered(&Ok(true)));
+        assert!(!boot_answered(&Err(anyhow::anyhow!("connection refused"))));
     }
 
     #[test]
