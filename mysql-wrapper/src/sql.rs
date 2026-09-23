@@ -341,6 +341,11 @@ pub async fn probe_root_password(socket_path: &str, password: &str) -> RootPassw
     }
 }
 
+pub fn is_access_denied(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<mysql_async::Error>(),
+        Some(mysql_async::Error::Server(server)) if server.code == 1045)
+}
+
 /// Did a `CLONE INSTANCE` fail because the donor refused the recovery
 /// credential this node presented?
 ///
@@ -602,6 +607,16 @@ impl Sql {
             Ok(())
         })
         .await
+    }
+
+    /// Standalone liveness follows mysqladmin ping: an authentication refusal
+    /// proves mysqld answered, even when the wrapper lacks its root credential.
+    /// Never use this for HA routing or for readiness to run administrative SQL.
+    pub async fn ping_standalone(&self) -> Result<()> {
+        match self.ping().await {
+            Err(error) if is_access_denied(&error) => Ok(()),
+            result => result,
+        }
     }
 
     /// True while the server is docker-entrypoint's init-phase temp instance

@@ -211,15 +211,15 @@ async fn main() -> Result<()> {
     let boot_password =
         password_pin::initial_password(&config.mysql_root_password, boot_pin.as_deref());
     let sql = sql::Sql::connect_root_over_socket(&config.socket_path, &boot_password);
+    // Behind /pitr in both modes; the archiver (or its role supervisor)
+    // writes it, the health server reads it.
+    let pitr_status = archiver::PitrStatus::new(config.archive_configured());
     tokio::spawn(password_pin::resolve_and_apply(
         config.clone(),
         sql.clone(),
         telemetry.clone(),
+        pitr_status.clone(),
     ));
-
-    // Behind /pitr in both modes; the archiver (or its role supervisor)
-    // writes it, the health server reads it.
-    let pitr_status = archiver::PitrStatus::new(config.archive_configured());
     // The archive contract is present but unusable (a sibling missing, a
     // malformed bucket or endpoint): archiving is off for this boot and
     // mysqld serves exactly as it would without the contract — which, on a

@@ -5231,7 +5231,126 @@ t_pitr_ha_reverted_roots_full_declares_the_group_history() {
   pitr_ha_teardown "$restore"
 }
 
+# Adoption must work even when the published template omitted its password
+# precondition. The stock image only needs the variable at first initialization.
+t_existing_database_without_root_password() {
+  log "t_existing_database_without_root_password"
+  local node=mysql-no-root-password mode uuid snapshot
+  docker rm -f "$node" mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm "mysql-ha-e2e-vol-$node" mysql-ha-e2e-minio-data >/dev/null 2>&1
+  start_minio || { bad "minio never became healthy"; return; }
+  docker volume create --label "$LABEL" "mysql-ha-e2e-vol-$node" >/dev/null
+  docker run -d --label "$LABEL" --name "$node" --network "$NET" \
+    -v "mysql-ha-e2e-vol-$node:/var/lib/mysql" -e MYSQL_ROOT_PASSWORD="$ROOT_PW" \
+    "mysql:$MYSQL_VERSION" >/dev/null || { bad "stock mysql did not start"; return; }
+  wait_until 180 "stock mysql ready" sql "$node" "SELECT 1" \
+    || { bad "stock mysql never became ready"; return; }
+  sql "$node" "CREATE DATABASE preserved; CREATE TABLE preserved.markers (id INT PRIMARY KEY, payload VARCHAR(64)); INSERT INTO preserved.markers VALUES (1, 'before-adoption'); CREATE USER 'existing_app'@'%' IDENTIFIED BY 'existing-app-password'; GRANT SELECT, INSERT ON preserved.* TO 'existing_app'@'%';" \
+    || { bad "could not seed existing data and application account"; return; }
+  uuid="$(sql "$node" "SELECT @@server_uuid")"
+  docker exec "$node" test ! -f /var/lib/mysql/.railway_active_root_password \
+    || { bad "stock fixture unexpectedly has a password pin"; return; }
+  local archive_env=(
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET"
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER"
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD"
+    -e BINLOG_ARCHIVE_REGION=us-east-1
+    -e BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000
+    -e BINLOG_ARCHIVE_PATH=/e2e-no-root-password
+    -e RAILWAY_ENVIRONMENT_ID=e2e-env
+    -e "RAILWAY_SERVICE_ID=$node"
+  )
+  for mode in absent empty; do
+    docker stop "$node" >/dev/null
+    docker rm "$node" >/dev/null
+    local credential_env=()
+    [ "$mode" = empty ] && credential_env=(-e MYSQL_ROOT_PASSWORD=)
+    docker run -d --label "$LABEL" --name "$node" --network "$NET" \
+      -v "mysql-ha-e2e-vol-$node:/var/lib/mysql" \
+      "${archive_env[@]}" "${credential_env[@]}" "$IMAGE" >/dev/null \
+      || { bad "adopted container did not start ($mode)"; return; }
+    wait_until 120 "standalone health without root variable ($mode)" \
+      docker exec "$node" wget -q -O /dev/null http://localhost:8080/health \
+      || { bad "missing credential broke database health ($mode)"; return; }
+    [ "$(sql "$node" "SELECT @@server_uuid")" = "$uuid" ] \
+      || { bad "existing instance identity changed ($mode)"; return; }
+    [ "$(sql "$node" "SELECT payload FROM preserved.markers WHERE id=1")" = before-adoption ] \
+      || { bad "old password or old data lost ($mode)"; return; }
+    docker exec "$node" mysql --protocol=TCP -h127.0.0.1 -uexisting_app -pexisting-app-password \
+      -e "INSERT INTO preserved.markers VALUES ($( [ "$mode" = absent ] && echo 2 || echo 3), '$mode');" 2>/dev/null \
+      || { bad "existing application cannot write ($mode)"; return; }
+    # The lack of a usable root credential must be visible, not reported as protection.
+    wait_until 30 "PITR reports missing credentials ($mode)" bash -c \
+      'docker exec '"$node"' wget -qO- http://localhost:8080/pitr | grep -q "no known root credential authenticates"' \
+      || { bad "PITR hid its credential problem ($mode)"; return; }
+    snapshot="$(docker exec "$node" wget -qO- http://localhost:8080/pitr)"
+    printf '%s' "$snapshot" | grep -q '"archiving":false' \
+      || { bad "PITR claimed to archive without credentials ($mode)"; return; }
+    docker exec "$node" mysql -uroot --skip-password -e 'SELECT 1' >/dev/null 2>&1 \
+      && { bad "image removed root authentication ($mode)"; return; }
+    ok "existing data, root password and application access preserved ($mode)"
+  done
+  docker stop "$node" >/dev/null
+  docker rm "$node" >/dev/null
+  start_standalone "$node" "${archive_env[@]}"
+  wait_until 180 "archiving starts when the actual credential is supplied" bash -c \
+    'docker exec '"$node"' wget -qO- http://localhost:8080/pitr | grep -qE "\"last_full_backup_at\":\"[^\"]+"' \
+    || { bad "archiving did not recover with the actual root password"; return; }
+  [ "$(sql "$node" "SELECT GROUP_CONCAT(CONCAT(id, CHAR(58), payload) ORDER BY id) FROM preserved.markers")" = '1:before-adoption,2:absent,3:empty' ] \
+    && ok "all existing and subsequent writes survived credential recovery" \
+    || bad "data changed when archiving recovered"
+  docker rm -f "$node" mysql-ha-e2e-minio >/dev/null
+  docker volume rm "mysql-ha-e2e-vol-$node" mysql-ha-e2e-minio-data >/dev/null
+}
+
+# Missing env uses the existing pin. Without either credential the wrapper
+# must keep the volume, not mistake Access denied for a crash-loop to heal.
+t_ha_missing_root_password_preserves_volume() {
+  log "t_ha_missing_root_password_preserves_volume"
+  teardown_trio
+  start_trio
+  wait_until 300 "group ONLINE" group_is_fully_online mysql-1 \
+    || { bad "initial group did not form"; return; }
+  sql mysql-1 "CREATE DATABASE missing_credential; CREATE TABLE missing_credential.markers (id INT PRIMARY KEY, payload VARCHAR(64)); INSERT INTO missing_credential.markers VALUES (1, 'preserve-me');" \
+    || { bad "could not seed existing HA data"; return; }
+  wait_until 60 "marker replicated" bash -c \
+    '[ "$(docker exec mysql-3 mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT payload FROM missing_credential.markers WHERE id=1" 2>/dev/null)" = preserve-me ]' \
+    || { bad "seed marker never replicated"; return; }
+  local uuid
+  uuid="$(sql mysql-3 "SELECT @@server_uuid")"
+  docker stop mysql-3 >/dev/null
+  docker rm mysql-3 >/dev/null
+  start_node 3 -e MYSQL_ROOT_PASSWORD=
+  wait_until 300 "member rejoins with pin and no env credential" group_is_fully_online mysql-3 \
+    || { bad "missing variable prevented pinned member from rejoining"; return; }
+  [ "$(sql mysql-3 "SELECT @@server_uuid")" = "$uuid" ] \
+    && ok "pinned member preserved its existing identity" || { bad "pinned member identity changed"; return; }
+  docker exec mysql-3 rm /var/lib/mysql/.railway_active_root_password
+  docker stop mysql-3 >/dev/null
+  docker rm mysql-3 >/dev/null
+  start_node 3 -e MYSQL_ROOT_PASSWORD= -e BOOT_READY_BUDGET_SECONDS=5 -e BOOT_LOOP_THRESHOLD=1
+  wait_until 60 "credential failure resets boot-loop accounting" bash -c \
+    '[ "$(docker exec mysql-3 cat /var/lib/mysql/.railway_boot_attempts 2>/dev/null)" = 0 ]' \
+    || { bad "missing credential counted as a boot failure"; return; }
+  sleep 10
+  [ "$(sql mysql-3 "SELECT @@server_uuid")" = "$uuid" ] \
+    || { bad "uncredentialed member was reinitialized"; return; }
+  [ "$(sql mysql-3 "SELECT payload FROM missing_credential.markers WHERE id=1")" = preserve-me ] \
+    || { bad "uncredentialed member lost existing data"; return; }
+  [ "$(role_code mysql-1 mysql-3)" = 503 ] \
+    && ok "HA routing stays fenced without authenticated membership" || bad "uncredentialed HA member was routed as primary"
+  ok "missing credential never discarded the existing HA volume"
+  docker stop mysql-3 >/dev/null
+  docker rm mysql-3 >/dev/null
+  start_node 3
+  wait_until 300 "member rejoins after restoring actual credential" group_is_fully_online mysql-3 \
+    && ok "HA management recovers with the existing root password" || bad "member failed to rejoin after restoring credential"
+  teardown_trio
+}
+
 ALL_TESTS=(
+  t_existing_database_without_root_password
+  t_ha_missing_root_password_preserves_volume
   t_join_legacy_group_without_block_size_advert
   t_group_forms_and_replicates
   t_failover_on_primary_pause
