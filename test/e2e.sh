@@ -5223,6 +5223,7 @@ t_pitr_ha_reverted_roots_full_declares_the_group_history() {
 }
 
 ALL_TESTS=(
+  t_join_legacy_group_without_block_size_advert
   t_group_forms_and_replicates
   t_failover_on_primary_pause
   t_cold_restart_preserves_group
@@ -5274,7 +5275,6 @@ ALL_TESTS=(
   t_pitr_ha_failover_recovers_the_unshipped_tail_and_refuses_a_gtid_hole
   t_pitr_ha_conversion_keeps_archiving_and_restores_across_the_gtid_boundary
   t_pitr_ha_group_expiry_hole_is_reported_and_re_anchored
-  t_join_legacy_group_without_block_size_advert
   t_pitr_ha_legacy_block_size_group_restores_across_the_block_jump
   t_pitr_ha_reverted_roots_full_declares_the_group_history
 )

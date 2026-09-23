@@ -82,7 +82,7 @@ fn verified_peer_block_size(
 ) -> Option<u64> {
     (state == "ONLINE"
         && size > 0
-        && size <= 1_000_000_000
+        && size <= i64::MAX as u64
         && !expected_uuid.is_empty()
         && !expected_group.is_empty()
         && uuid.eq_ignore_ascii_case(expected_uuid)
@@ -99,6 +99,10 @@ mod peer_block_size_tests {
             verified_peer_block_size("ABC", "DEF", 1_000_000, "ONLINE", "abc", "def"),
             Some(1_000_000)
         );
+        assert_eq!(
+            verified_peer_block_size("a", "g", i64::MAX as u64, "ONLINE", "a", "g"),
+            Some(i64::MAX as u64)
+        );
         for state in ["OFFLINE", "RECOVERING", "ERROR", ""] {
             assert_eq!(verified_peer_block_size("a", "g", 1, state, "a", "g"), None);
         }
@@ -110,7 +114,7 @@ mod peer_block_size_tests {
             verified_peer_block_size("a", "g", 1, "ONLINE", "a", "other"),
             None
         );
-        for size in [0, 1_000_000_001, u64::MAX] {
+        for size in [0, u64::MAX] {
             assert_eq!(
                 verified_peer_block_size("a", "g", size, "ONLINE", "a", "g"),
                 None
