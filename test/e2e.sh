@@ -5271,7 +5271,7 @@ t_existing_database_without_root_password() {
       || { bad "adopted container did not start ($mode)"; return; }
     wait_until 120 "standalone health without root variable ($mode)" \
       docker exec "$node" wget -q -O /dev/null http://localhost:8080/health \
-      || { bad "missing credential broke database health ($mode)"; return; }
+      || { bad "missing credential broke database health ($mode)"; dump_node_log "$node"; return; }
     [ "$(sql "$node" "SELECT @@server_uuid")" = "$uuid" ] \
       || { bad "existing instance identity changed ($mode)"; return; }
     [ "$(sql "$node" "SELECT payload FROM preserved.markers WHERE id=1")" = before-adoption ] \
@@ -5337,7 +5337,7 @@ t_ha_missing_root_password_preserves_volume() {
   start_node 3 -e GR_REPLICATION_PASSWORD= -e MYSQL_ROOT_PASSWORD= -e BOOT_READY_BUDGET_SECONDS=5 -e BOOT_LOOP_THRESHOLD=1
   wait_until 60 "credential failure resets boot-loop accounting" bash -c \
     '[ "$(docker exec mysql-3 cat /var/lib/mysql/.railway_boot_attempts 2>/dev/null)" = 0 ]' \
-    || { bad "missing credential counted as a boot failure"; return; }
+    || { bad "missing credential counted as a boot failure"; dump_node_log mysql-3; return; }
   sleep 10
   [ "$(sql mysql-3 "SELECT @@server_uuid")" = "$uuid" ] \
     || { bad "uncredentialed member was reinitialized"; return; }
