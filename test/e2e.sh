@@ -382,6 +382,18 @@ sql() {
   docker exec "$node" mysql -uroot -p"$ROOT_PW" --batch --skip-column-names -e "$1" 2>/dev/null
 }
 
+# wait_standalone_sql_ready <node> <timeout-seconds> — a fresh standalone is
+# ready once root authenticates on the serving mysqld. Standalone /health
+# follows mysqladmin ping (Access denied counts as alive), so it answers 200
+# while docker-entrypoint's init-phase server is still loading time zones,
+# before the root password is applied, and that server is restarted once
+# setup finishes (@@skip_networking=1 until then).
+wait_standalone_sql_ready() {
+  local node="$1" timeout="$2"
+  wait_until "$timeout" "$node serves authenticated SQL" bash -c \
+    '[ "$(docker exec '"$node"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT @@skip_networking" 2>/dev/null)" = 0 ]'
+}
+
 # role_code <from-node> <target-node> — HTTP status class of /role (200|503).
 role_code() {
   if docker exec "$1" wget -q -O /dev/null "http://$2:8080/role" 2>/dev/null; then
@@ -2919,15 +2931,15 @@ t_pitr_restore_keeps_scheduled_events_quiet_during_replay() {
   # bulk write below and T (that full would carry the write and shrink the
   # replay this scenario needs).
   start_standalone mysql-pitr-ev-src "${archive_env[@]}" -e BINLOG_FULL_BACKUP_INTERVAL_SECONDS=45
-  wait_until 120 "PITR source node healthy" \
-    bash -c 'docker exec mysql-pitr-ev-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+  wait_standalone_sql_ready mysql-pitr-ev-src 120 \
     || { bad "PITR source node never became healthy"; return; }
 
   # A scheduled event ticking every second. Each row records whether the server
   # that wrote it had binary logging on: the source and the serving fork do
   # (1); only the restore-phase server runs with --skip-log-bin (0), so a row
   # with log_bin=0 can only have been written DURING the restore.
-  sql mysql-pitr-ev-src "CREATE DATABASE t; CREATE TABLE t.ticks (id INT AUTO_INCREMENT PRIMARY KEY, at DATETIME(3) NOT NULL, logbin TINYINT NOT NULL); CREATE EVENT t.tick ON SCHEDULE EVERY 1 SECOND DO INSERT INTO t.ticks (at, logbin) VALUES (UTC_TIMESTAMP(3), @@log_bin);"
+  sql mysql-pitr-ev-src "CREATE DATABASE t; CREATE TABLE t.ticks (id INT AUTO_INCREMENT PRIMARY KEY, at DATETIME(3) NOT NULL, logbin TINYINT NOT NULL); CREATE EVENT t.tick ON SCHEDULE EVERY 1 SECOND DO INSERT INTO t.ticks (at, logbin) VALUES (UTC_TIMESTAMP(3), @@log_bin);" \
+    || { bad "could not create the scheduled event on the source"; return; }
   # The initial full is taken the moment the archiver starts — before the
   # event existed. Wait for a full that STARTED after the event was created:
   # any full completed beyond the count of fulls started by now is one.
@@ -3039,8 +3051,7 @@ t_pitr_restore_honours_utc_targets_under_a_local_timezone() {
     -e "TZ=America/Sao_Paulo"
   )
   start_standalone mysql-pitr-tz-src "${archive_env[@]}"
-  wait_until 120 "PITR source node healthy" \
-    bash -c 'docker exec mysql-pitr-tz-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+  wait_standalone_sql_ready mysql-pitr-tz-src 120 \
     || { bad "PITR source node never became healthy"; return; }
   wait_until 120 "initial full backup completed" \
     bash -c 'docker logs mysql-pitr-tz-src 2>&1 | grep -q "initial full backup completed"' \
@@ -3200,8 +3211,7 @@ t_pitr_archive_and_restore_to_point_in_time() {
   )
   start_standalone mysql-pitr-src "${archive_env[@]}"
 
-  wait_until 120 "PITR source node healthy" \
-    bash -c 'docker exec mysql-pitr-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+  wait_standalone_sql_ready mysql-pitr-src 120 \
     || { bad "PITR source node never became healthy"; return; }
   ok "PITR source node up with archiving enabled"
 
@@ -3356,8 +3366,7 @@ t_pitr_restore_reaches_the_fulls_named_instant() {
     -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-named"
   )
   start_standalone mysql-pitr-named-src "${archive_env[@]}"
-  wait_until 120 "PITR source node healthy" \
-    bash -c 'docker exec mysql-pitr-named-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+  wait_standalone_sql_ready mysql-pitr-named-src 120 \
     || { bad "PITR source node never became healthy"; return; }
   wait_until 120 "initial full backup completed" \
     bash -c 'docker logs mysql-pitr-named-src 2>&1 | grep -q "initial full backup completed"' \
@@ -3440,8 +3449,7 @@ t_pitr_restore_replays_a_large_single_statement() {
     -e "BINLOG_ARCHIVE_PATH=/e2e-pitr-big"
   )
   start_standalone mysql-pitr-big-src "${archive_env[@]}"
-  wait_until 120 "PITR source node healthy" \
-    bash -c 'docker exec mysql-pitr-big-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+  wait_standalone_sql_ready mysql-pitr-big-src 120 \
     || { bad "PITR source node never became healthy"; return; }
   wait_until 120 "initial full backup completed" \
     bash -c 'docker logs mysql-pitr-big-src 2>&1 | grep -q "initial full backup completed"' \
@@ -3542,8 +3550,7 @@ t_pitr_restore_never_serves_the_half_loaded_database() {
   )
   start_standalone mysql-pitr-window-src "${archive_env[@]}"
 
-  wait_until 120 "PITR source node healthy" \
-    bash -c 'docker exec mysql-pitr-window-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+  wait_standalone_sql_ready mysql-pitr-window-src 120 \
     || { bad "PITR source node never became healthy"; return; }
   wait_until 120 "initial full backup completed" \
     bash -c 'docker logs mysql-pitr-window-src 2>&1 | grep -q "initial full backup completed"' \
@@ -3869,8 +3876,7 @@ t_pitr_restore_silently_stops_short_of_target() {
   )
   start_standalone mysql-pitr-gap-src "${archive_env[@]}"
 
-  wait_until 120 "PITR source node healthy" \
-    bash -c 'docker exec mysql-pitr-gap-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+  wait_standalone_sql_ready mysql-pitr-gap-src 120 \
     || { bad "PITR source node never became healthy"; return; }
   wait_until 120 "initial full backup completed" \
     bash -c 'docker logs mysql-pitr-gap-src 2>&1 | grep -q "initial full backup completed"' \
@@ -4056,8 +4062,7 @@ t_binlog_expiry_silently_loses_unshipped_data() {
   )
   start_standalone mysql-pitr-expiry-src "${archive_env[@]}"
 
-  wait_until 120 "PITR source node healthy" \
-    bash -c 'docker exec mysql-pitr-expiry-src wget -q -O /dev/null http://localhost:8080/health 2>/dev/null' \
+  wait_standalone_sql_ready mysql-pitr-expiry-src 120 \
     || { bad "PITR source node never became healthy"; return; }
   wait_until 120 "initial full backup completed" \
     bash -c 'docker logs mysql-pitr-expiry-src 2>&1 | grep -q "initial full backup completed"' \
