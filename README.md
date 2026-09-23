@@ -112,7 +112,8 @@ Its liveness endpoint accepts a MySQL authentication refusal as evidence the ser
 is running, like `mysqladmin ping`. PITR remains inactive and `/pitr.last_error`
 names the missing credential. Restore `MYSQL_ROOT_PASSWORD` to the database's
 existing password and redeploy to enable archiving. New volumes still require the
-password. HA routing continues to require authenticated primary/membership checks;
+password. Existing HA members also use the pin when the coupled
+`GR_REPLICATION_PASSWORD` variable becomes empty. HA routing continues to require authenticated primary/membership checks;
 an authentication refusal is never grounds to discard a member's dataset.
 
 ### Editing `MYSQL_ROOT_PASSWORD` on a running cluster

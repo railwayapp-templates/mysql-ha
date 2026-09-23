@@ -315,7 +315,13 @@ pub async fn preboot(config: &Config, telemetry: &Telemetry) -> PrebootState {
     let failed_boots = read_boot_attempts(data_dir);
     let mut pending_ledger = None;
 
-    if failed_boots >= config.boot_loop_threshold {
+    // An older boot may already have consumed the budget before the missing
+    // credential was distinguished from a dead server. Preserve that volume
+    // too: without an initialization credential, wiping cannot recover it.
+    if failed_boots >= config.boot_loop_threshold && config.mysql_root_password.is_empty() {
+        warn!(failed_boots, "root password variable is absent; preserving the existing datadir instead of reprovisioning");
+    }
+    if failed_boots >= config.boot_loop_threshold && !config.mysql_root_password.is_empty() {
         let ledger = read_ledger(data_dir);
         match heal_gate(
             ledger,
@@ -588,7 +594,7 @@ pub async fn stuck_watch(
     let env_recovery_password = config
         .gr_replication_password
         .clone()
-        .expect("HA mode requires GR_REPLICATION_PASSWORD (validated in Config::from_env)");
+        .unwrap_or_else(|| config.mysql_root_password.clone());
     let recovery_password = gr::recovery_credential(
         &env_recovery_password,
         &config.mysql_root_password,

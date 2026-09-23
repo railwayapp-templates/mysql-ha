@@ -5308,7 +5308,10 @@ t_existing_database_without_root_password() {
 t_ha_missing_root_password_preserves_volume() {
   log "t_ha_missing_root_password_preserves_volume"
   teardown_trio
-  start_trio
+  # Mirror the template: the recovery credential follows the root variable.
+  start_node 1 -e GR_REPLICATION_PASSWORD="$ROOT_PW"
+  start_node 2 -e GR_REPLICATION_PASSWORD="$ROOT_PW"
+  start_node 3 -e GR_REPLICATION_PASSWORD="$ROOT_PW"
   wait_until 300 "group ONLINE" group_is_fully_online mysql-1 \
     || { bad "initial group did not form"; return; }
   sql mysql-1 "CREATE DATABASE missing_credential; CREATE TABLE missing_credential.markers (id INT PRIMARY KEY, payload VARCHAR(64)); INSERT INTO missing_credential.markers VALUES (1, 'preserve-me');" \
@@ -5320,15 +5323,18 @@ t_ha_missing_root_password_preserves_volume() {
   uuid="$(sql mysql-3 "SELECT @@server_uuid")"
   docker stop mysql-3 >/dev/null
   docker rm mysql-3 >/dev/null
-  start_node 3 -e MYSQL_ROOT_PASSWORD=
+  start_node 3 -e GR_REPLICATION_PASSWORD= -e MYSQL_ROOT_PASSWORD=
   wait_until 300 "member rejoins with pin and no env credential" group_is_fully_online mysql-3 \
     || { bad "missing variable prevented pinned member from rejoining"; return; }
   [ "$(sql mysql-3 "SELECT @@server_uuid")" = "$uuid" ] \
     && ok "pinned member preserved its existing identity" || { bad "pinned member identity changed"; return; }
   docker exec mysql-3 rm /var/lib/mysql/.railway_active_root_password
+  # Carry a failed-boot count from an older image into the upgrade. It must
+  # not trigger a preboot wipe before the credential-aware watchdog runs.
+  docker exec mysql-3 sh -c 'printf 1 > /var/lib/mysql/.railway_boot_attempts'
   docker stop mysql-3 >/dev/null
   docker rm mysql-3 >/dev/null
-  start_node 3 -e MYSQL_ROOT_PASSWORD= -e BOOT_READY_BUDGET_SECONDS=5 -e BOOT_LOOP_THRESHOLD=1
+  start_node 3 -e GR_REPLICATION_PASSWORD= -e MYSQL_ROOT_PASSWORD= -e BOOT_READY_BUDGET_SECONDS=5 -e BOOT_LOOP_THRESHOLD=1
   wait_until 60 "credential failure resets boot-loop accounting" bash -c \
     '[ "$(docker exec mysql-3 cat /var/lib/mysql/.railway_boot_attempts 2>/dev/null)" = 0 ]' \
     || { bad "missing credential counted as a boot failure"; return; }
@@ -5342,7 +5348,7 @@ t_ha_missing_root_password_preserves_volume() {
   ok "missing credential never discarded the existing HA volume"
   docker stop mysql-3 >/dev/null
   docker rm mysql-3 >/dev/null
-  start_node 3
+  start_node 3 -e GR_REPLICATION_PASSWORD="$ROOT_PW"
   wait_until 300 "member rejoins after restoring actual credential" group_is_fully_online mysql-3 \
     && ok "HA management recovers with the existing root password" || bad "member failed to rejoin after restoring credential"
   teardown_trio

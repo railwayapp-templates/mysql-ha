@@ -53,7 +53,8 @@ pub struct Config {
     /// re-derivation.
     pub gr_group_name: Option<String>,
     /// Password for the `gr_recovery` user (distributed recovery / clone).
-    /// Required in HA mode.
+    /// Required for a new HA volume; existing members can fall back to the
+    /// active root pin when both coupled environment variables are absent.
     pub gr_replication_password: Option<String>,
     pub health_port: u16,
     /// Username the health server's mutating routes expect
@@ -301,7 +302,10 @@ impl Config {
             bail!("MYSQL_ROOT_PASSWORD must be set when initializing a new database");
         }
 
-        if config.gr_enabled() && config.gr_replication_password.is_none() {
+        if config.gr_enabled()
+            && config.gr_replication_password.is_none()
+            && !config.datadir_is_initialized()
+        {
             bail!("GR_REPLICATION_PASSWORD must be set when GR_SEEDS is set");
         }
 
@@ -663,6 +667,10 @@ mod tests {
                 "preserve"
             );
         }
+        env::set_var("GR_SEEDS", "mysql-1:3306,mysql-2:3306,mysql-3:3306");
+        let config = Config::from_env().unwrap();
+        assert!(config.gr_enabled());
+        assert!(config.gr_replication_password.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
