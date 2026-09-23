@@ -253,6 +253,7 @@ mod tests {
         let state = AppState {
             sql,
             standalone: true,
+            standalone_initialized: AtomicBool::new(true),
             data_dir: dir.path().to_str().unwrap().into(),
             adoption_checked: Arc::new(AtomicBool::new(true)),
             membership_fenced: Arc::new(AtomicBool::new(false)),
