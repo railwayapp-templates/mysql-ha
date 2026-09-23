@@ -20,15 +20,16 @@
 //! the only mysqld in the picture.
 
 use crate::pitr::S3Location;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use common::{ConfigExt, RailwayEnv};
 
 pub struct Config {
-    /// MySQL root password. Required — passed through to the upstream
-    /// `docker-entrypoint.sh` via the environment (not re-forwarded as a CLI
-    /// arg), which is what actually initializes the root account. The wrapper
-    /// also uses it for its own local socket connection.
+    /// Root credential candidate for the wrapper's local socket connection.
+    /// Required on a fresh datadir. Existing databases keep their own grants
+    /// and must still boot when the variable is absent; the persisted pin may
+    /// authenticate, otherwise management/archiving wait for a valid credential.
+    /// The environment is passed unchanged to upstream docker-entrypoint.sh.
     pub mysql_root_password: String,
     pub mysql_port: u16,
     /// Group Replication server_id. Every node needs a distinct one; when
@@ -52,7 +53,8 @@ pub struct Config {
     /// re-derivation.
     pub gr_group_name: Option<String>,
     /// Password for the `gr_recovery` user (distributed recovery / clone).
-    /// Required in HA mode.
+    /// Required for a new HA volume; existing members can fall back to the
+    /// active root pin when both coupled environment variables are absent.
     pub gr_replication_password: Option<String>,
     pub health_port: u16,
     /// Username the health server's mutating routes expect
@@ -209,8 +211,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let mysql_root_password = String::env_required("MYSQL_ROOT_PASSWORD")
-            .context("MYSQL_ROOT_PASSWORD must be set")?;
+        let mysql_root_password = String::env_or("MYSQL_ROOT_PASSWORD", "");
 
         let mysql_recovery_target_time =
             non_empty(std::env::var("MYSQL_RECOVERY_TARGET_TIME").ok())
@@ -297,7 +298,14 @@ impl Config {
             mysql_recovery_target_time,
         };
 
-        if config.gr_enabled() && config.gr_replication_password.is_none() {
+        if config.mysql_root_password.is_empty() && !config.datadir_is_initialized() {
+            bail!("MYSQL_ROOT_PASSWORD must be set when initializing a new database");
+        }
+
+        if config.gr_enabled()
+            && config.gr_replication_password.is_none()
+            && !config.datadir_is_initialized()
+        {
             bail!("GR_REPLICATION_PASSWORD must be set when GR_SEEDS is set");
         }
 
@@ -635,6 +643,35 @@ mod tests {
             .err()
             .expect("should fail without a password");
         assert!(err.to_string().contains("MYSQL_ROOT_PASSWORD"));
+    }
+
+    #[test]
+    fn existing_database_can_boot_without_root_password_variable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let dir =
+            std::env::temp_dir().join(format!("mysql-wrapper-no-password-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("mysql")).unwrap();
+        std::fs::write(dir.join("existing-data"), "preserve").unwrap();
+        env::set_var("DATA_DIR", dir.to_string_lossy().to_string());
+        for value in [None, Some("")] {
+            if let Some(value) = value {
+                env::set_var("MYSQL_ROOT_PASSWORD", value);
+            }
+            let config = Config::from_env().unwrap();
+            assert!(config.mysql_root_password.is_empty());
+            assert!(config.datadir_is_initialized());
+            assert_eq!(
+                std::fs::read_to_string(dir.join("existing-data")).unwrap(),
+                "preserve"
+            );
+        }
+        env::set_var("GR_SEEDS", "mysql-1:3306,mysql-2:3306,mysql-3:3306");
+        let config = Config::from_env().unwrap();
+        assert!(config.gr_enabled());
+        assert!(config.gr_replication_password.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

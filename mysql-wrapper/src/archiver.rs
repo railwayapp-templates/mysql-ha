@@ -192,7 +192,7 @@ impl PitrStatus {
 
     /// Clear `last_error` when the text it holds satisfies `ours` — so a
     /// fault that is over goes away without wiping a different, live one.
-    fn clear_error_if(&self, ours: impl FnOnce(&str) -> bool) {
+    pub(crate) fn clear_error_if(&self, ours: impl FnOnce(&str) -> bool) {
         self.update(|s| {
             if s.last_error.as_deref().is_some_and(ours) {
                 s.last_error = None;

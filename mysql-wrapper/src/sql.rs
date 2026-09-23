@@ -341,6 +341,11 @@ pub async fn probe_root_password(socket_path: &str, password: &str) -> RootPassw
     }
 }
 
+pub fn is_access_denied(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<mysql_async::Error>(),
+        Some(mysql_async::Error::Server(server)) if server.code == 1045)
+}
+
 /// Did a `CLONE INSTANCE` fail because the donor refused the recovery
 /// credential this node presented?
 ///
@@ -465,11 +470,16 @@ impl Sql {
         let pool = self.pool.read().await.clone();
         match pool.get_conn().await {
             Ok(conn) => Ok(conn),
-            Err(mysql_async::Error::Server(ref e)) if e.code == 1045 => {
-                let pending = crate::config::Config::from_env()
+            Err(error) if matches!(&error, mysql_async::Error::Server(e) if e.code == 1045) => {
+                let Some(pending) = crate::config::Config::from_env()
                     .ok()
                     .and_then(|c| crate::credentials::pending_password(&c.data_dir))
-                    .context("no staged credential")?;
+                else {
+                    // Preserve the server's verdict for liveness and boot-loop
+                    // accounting. A missing rotation journal is not the cause
+                    // of the connection failure and must not hide Access denied.
+                    return Err(error.into());
+                };
                 let replacement = Pool::new(root_opts(&self.socket_path, &pending));
                 let conn = replacement.get_conn().await?;
                 self.swap_root_password(&pending).await;
@@ -602,6 +612,16 @@ impl Sql {
             Ok(())
         })
         .await
+    }
+
+    /// Standalone liveness follows mysqladmin ping: an authentication refusal
+    /// proves mysqld answered, even when the wrapper lacks its root credential.
+    /// Never use this for HA routing or for readiness to run administrative SQL.
+    pub async fn ping_standalone(&self) -> Result<()> {
+        match self.ping().await {
+            Err(error) if is_access_denied(&error) => Ok(()),
+            result => result,
+        }
     }
 
     /// True while the server is docker-entrypoint's init-phase temp instance
@@ -1455,5 +1475,39 @@ mod recovery_credential_refusal_tests {
         assert!(!is_recovery_credential_refusal(&anyhow::anyhow!(
             "donor list unavailable"
         )));
+    }
+}
+
+#[cfg(test)]
+mod missing_credential_liveness_tests {
+    use super::{is_access_denied, Sql};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn pool_preserves_access_denied_without_a_rotation_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mysql.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // A real MySQL protocol ERR packet through the actual driver/pool:
+        // this catches conn() replacing 1045 with an unrelated journal error.
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = b"\xff\x15\x04#28000Access denied";
+                let mut packet = vec![body.len() as u8, 0, 0, 0];
+                packet.extend_from_slice(body);
+                let _ = stream.write_all(&packet).await;
+            }
+        });
+        let sql = Sql::connect_root_over_socket(socket.to_str().unwrap(), "");
+        let error = sql.ping().await.unwrap_err();
+        assert!(is_access_denied(&error), "lost server error: {error:#}");
+        sql.ping_standalone().await.unwrap();
+        assert!(is_access_denied(
+            &sql.is_init_temp_server().await.unwrap_err()
+        ));
+        server.abort();
+        let _ = server.await;
+        // A dead socket is still unhealthy; no generic error is swallowed.
+        assert!(sql.ping_standalone().await.is_err());
     }
 }

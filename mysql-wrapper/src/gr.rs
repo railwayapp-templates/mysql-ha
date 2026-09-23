@@ -1437,7 +1437,7 @@ pub async fn orchestrate(
     let env_recovery_password = config
         .gr_replication_password
         .clone()
-        .expect("HA mode requires GR_REPLICATION_PASSWORD (validated in Config::from_env)");
+        .unwrap_or_else(|| config.mysql_root_password.clone());
     let recovery_password = recovery_credential(
         &env_recovery_password,
         &config.mysql_root_password,
@@ -3529,6 +3529,9 @@ mod tests {
         config.gr_replication_password = Some("independent".into());
         crate::password_pin::write_pin(&config.data_dir, "rotated").unwrap();
         assert_eq!(current_recovery_credential(&config, "boot"), "independent");
+        config.mysql_root_password.clear();
+        config.gr_replication_password = None;
+        assert_eq!(current_recovery_credential(&config, ""), "rotated");
     }
 
     fn test_config() -> Config {

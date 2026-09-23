@@ -315,7 +315,13 @@ pub async fn preboot(config: &Config, telemetry: &Telemetry) -> PrebootState {
     let failed_boots = read_boot_attempts(data_dir);
     let mut pending_ledger = None;
 
-    if failed_boots >= config.boot_loop_threshold {
+    // An older boot may already have consumed the budget before the missing
+    // credential was distinguished from a dead server. Preserve that volume
+    // too: without an initialization credential, wiping cannot recover it.
+    if failed_boots >= config.boot_loop_threshold && config.mysql_root_password.is_empty() {
+        warn!(failed_boots, "root password variable is absent; preserving the existing datadir instead of reprovisioning");
+    }
+    if failed_boots >= config.boot_loop_threshold && !config.mysql_root_password.is_empty() {
         let ledger = read_ledger(data_dir);
         match heal_gate(
             ledger,
@@ -482,9 +488,11 @@ pub async fn boot_watch(
             }
         }
 
-        // The same readiness test the orchestrator uses: the FINAL mysqld
-        // (not docker-entrypoint's init temp server) answering queries.
-        if let Ok(false) = sql.is_init_temp_server().await {
+        // A completed boot or an authentication refusal both prove mysqld
+        // answered. Missing credentials must never burn the boot budget and
+        // eventually discard a healthy dataset. This only resets crash-loop
+        // accounting; HA membership/routing still require authenticated SQL.
+        if boot_answered(&sql.is_init_temp_server().await) {
             state.ready.store(true, Ordering::Relaxed);
             if let Err(e) = persist_boot_attempts(&config.data_dir, 0) {
                 warn!(error = %e, "could not reset the boot attempt counter");
@@ -524,6 +532,13 @@ pub async fn boot_watch(
         }
 
         sleep(BOOT_WATCH_POLL).await;
+    }
+}
+
+fn boot_answered(result: &Result<bool>) -> bool {
+    match result {
+        Ok(is_init_temp_server) => !is_init_temp_server,
+        Err(error) => crate::sql::is_access_denied(error),
     }
 }
 
@@ -579,7 +594,7 @@ pub async fn stuck_watch(
     let env_recovery_password = config
         .gr_replication_password
         .clone()
-        .expect("HA mode requires GR_REPLICATION_PASSWORD (validated in Config::from_env)");
+        .unwrap_or_else(|| config.mysql_root_password.clone());
     let recovery_password = gr::recovery_credential(
         &env_recovery_password,
         &config.mysql_root_password,
@@ -857,6 +872,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn denied_credentials_are_not_a_boot_failure() {
+        let denied = anyhow::Error::from(mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1045,
+            message: "Access denied".into(),
+            state: "28000".into(),
+        }))
+        .context("getting connection");
+        assert!(boot_answered(&Err(denied)));
+        assert!(boot_answered(&Ok(false)));
+        assert!(!boot_answered(&Ok(true)));
+        assert!(!boot_answered(&Err(anyhow::anyhow!("connection refused"))));
     }
 
     #[test]

@@ -102,6 +102,20 @@ existing cluster enforces once the variable is set on its data nodes and they
 redeploy — each node gates its own route the moment
 it boots with the variable, so a cluster may adopt it one node at a time.
 
+### Existing databases without `MYSQL_ROOT_PASSWORD`
+
+An initialized volume boots even when `MYSQL_ROOT_PASSWORD` is absent or empty.
+The wrapper tries its persisted active-password pin when available; it never
+resets the database password or initializes an existing dataset to recover access.
+With no valid root credential, standalone MySQL keeps serving existing clients.
+Its liveness endpoint accepts a MySQL authentication refusal as evidence the server
+is running, like `mysqladmin ping`. PITR remains inactive and `/pitr.last_error`
+names the missing credential. Restore `MYSQL_ROOT_PASSWORD` to the database's
+existing password and redeploy to enable archiving. New volumes still require the
+password. Existing HA members also use the pin when the coupled
+`GR_REPLICATION_PASSWORD` variable becomes empty. HA routing continues to require authenticated primary/membership checks;
+an authentication refusal is never grounds to discard a member's dataset.
+
 ### Editing `MYSQL_ROOT_PASSWORD` on a running cluster
 
 The live root password is pinned on each member's volume (`password_pin`), so

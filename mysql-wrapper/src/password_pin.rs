@@ -41,6 +41,7 @@ const PIN_FILE: &str = ".railway_active_root_password";
 /// init phase is still running its setup SQL, so denial only becomes an
 /// incident once it has clearly outlived any init (rounds are ~1s apart).
 const DENIED_ROUNDS_BEFORE_ALERT: u32 = 120;
+const CREDENTIAL_REFUSAL: &str = "PITR unavailable: no known root credential authenticates; set MYSQL_ROOT_PASSWORD to the database's existing root password. The database's password and data are unchanged.";
 
 pub fn pin_path(data_dir: &str) -> PathBuf {
     PathBuf::from(data_dir).join(PIN_FILE)
@@ -111,11 +112,17 @@ fn candidates(env_password: &str, pin: Option<&str>) -> Vec<(&'static str, Strin
 /// in both HA and standalone mode. Never gives up: while every candidate is
 /// denied it keeps probing (docker-entrypoint init, or an operator fixing
 /// the variable live, both resolve without a restart).
-pub async fn resolve_and_apply(config: Arc<Config>, sql: Sql, telemetry: Arc<Telemetry>) {
+pub async fn resolve_and_apply(
+    config: Arc<Config>,
+    sql: Sql,
+    telemetry: Arc<Telemetry>,
+    pitr_status: Arc<crate::archiver::PitrStatus>,
+) {
     let env_password = config.mysql_root_password.clone();
     let boot_pin = read_pin(&config.data_dir);
     let boot_password = initial_password(&env_password, boot_pin.as_deref());
 
+    let existing_database = config.datadir_is_initialized();
     let mut denied_rounds = 0u32;
     let mut alerted = false;
 
@@ -143,6 +150,7 @@ pub async fn resolve_and_apply(config: Arc<Config>, sql: Sql, telemetry: Arc<Tel
                         pin.as_deref(),
                     )
                     .await;
+                    pitr_status.clear_error_if(|error| error == CREDENTIAL_REFUSAL);
                     return;
                 }
                 RootPasswordProbe::AccessDenied => {}
@@ -158,8 +166,11 @@ pub async fn resolve_and_apply(config: Arc<Config>, sql: Sql, telemetry: Arc<Tel
 
         if all_denied {
             denied_rounds += 1;
-            if denied_rounds >= DENIED_ROUNDS_BEFORE_ALERT && !alerted {
+            if (existing_database || denied_rounds >= DENIED_ROUNDS_BEFORE_ALERT) && !alerted {
                 alerted = true;
+                if config.archive_configured() {
+                    pitr_status.note_refusal(CREDENTIAL_REFUSAL);
+                }
                 error!(
                     "mysqld denies every known root password (pin and environment); \
                      the wrapper cannot manage this node until the variable is \
