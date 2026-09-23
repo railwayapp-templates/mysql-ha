@@ -2927,7 +2927,8 @@ t_pitr_restore_keeps_scheduled_events_quiet_during_replay() {
   # that wrote it had binary logging on: the source and the serving fork do
   # (1); only the restore-phase server runs with --skip-log-bin (0), so a row
   # with log_bin=0 can only have been written DURING the restore.
-  sql mysql-pitr-ev-src "CREATE DATABASE t; CREATE TABLE t.ticks (id INT AUTO_INCREMENT PRIMARY KEY, at DATETIME(3) NOT NULL, logbin TINYINT NOT NULL); CREATE EVENT t.tick ON SCHEDULE EVERY 1 SECOND DO INSERT INTO t.ticks (at, logbin) VALUES (UTC_TIMESTAMP(3), @@log_bin);"
+  sql mysql-pitr-ev-src "CREATE DATABASE t; CREATE TABLE t.ticks (id INT AUTO_INCREMENT PRIMARY KEY, at DATETIME(3) NOT NULL, logbin TINYINT NOT NULL); CREATE EVENT t.tick ON SCHEDULE EVERY 1 SECOND DO INSERT INTO t.ticks (at, logbin) VALUES (UTC_TIMESTAMP(3), @@log_bin);" \
+    || { bad "could not create the source event"; dump_node_log mysql-pitr-ev-src; return; }
   # The initial full is taken the moment the archiver starts — before the
   # event existed. Wait for a full that STARTED after the event was created:
   # any full completed beyond the count of fulls started by now is one.
@@ -5354,7 +5355,64 @@ t_ha_missing_root_password_preserves_volume() {
   teardown_trio
 }
 
+# Hold docker-entrypoint's temporary, socket-only mysqld open so readiness
+# cannot pass by racing through initialization between two probe polls.
+t_standalone_health_waits_for_initialization() {
+  log "t_standalone_health_waits_for_initialization"
+  local node=mysql-init-readiness init_dir endpoint
+  init_dir="$(mktemp -d)"
+  chmod 755 "$init_dir"
+  cat > "$init_dir/hold.sh" <<'INIT'
+touch /tmp/init-held
+for attempt in $(seq 1 120); do
+  [ -f /tmp/release-init ] && break
+  sleep 1
+done
+INIT
+  chmod 644 "$init_dir/hold.sh"
+  start_standalone "$node" -v "$init_dir:/docker-entrypoint-initdb.d:ro"
+  wait_until 120 "entrypoint temporary server held" docker exec "$node" test -f /tmp/init-held \
+    || { bad "initialization barrier never reached"; dump_node_log "$node"; rm -rf "$init_dir"; return; }
+  [ "$(sql "$node" "SELECT @@skip_networking")" = 1 ] \
+    || { bad "fixture is not the temporary mysqld"; return; }
+  for endpoint in health role; do
+    docker exec "$node" wget -q -O /dev/null "http://localhost:8080/$endpoint" 2>/dev/null \
+      && bad "$endpoint accepted the temporary init server" \
+      || ok "$endpoint stays unavailable during authenticated initialization"
+  done
+  sql "$node" "ALTER USER 'root'@'localhost' IDENTIFIED BY 'temporary-init-password';" \
+    || { bad "could not exercise init authentication refusal"; return; }
+  docker exec "$node" sh -c 'mysql -uroot -ptemporary-init-password -NBe "SELECT CONCAT(CHAR(75,73,76,76,32), ID, CHAR(59)) FROM information_schema.PROCESSLIST WHERE USER=CHAR(114,111,111,116) AND ID <> CONNECTION_ID()" | mysql -uroot -ptemporary-init-password' 2>/dev/null
+  for endpoint in health role; do
+    docker exec "$node" wget -q -O /dev/null "http://localhost:8080/$endpoint" 2>/dev/null \
+      && bad "$endpoint accepted Access denied during initialization" \
+      || ok "$endpoint stays unavailable during init authentication refusal"
+  done
+  docker exec "$node" mysql -uroot -ptemporary-init-password -e \
+    "ALTER USER 'root'@'localhost' IDENTIFIED BY '$ROOT_PW';" 2>/dev/null \
+    || { bad "could not restore fixture credential"; return; }
+  docker exec "$node" touch /tmp/release-init
+  wait_until 120 "standalone serving health" docker exec "$node" wget -q -O /dev/null http://localhost:8080/health \
+    || { bad "initialized standalone never became healthy"; dump_node_log "$node"; return; }
+  docker exec "$node" mysql --protocol=TCP -h127.0.0.1 -uroot -p"$ROOT_PW" \
+    -e 'CREATE DATABASE ready; CREATE TABLE ready.marker (id INT PRIMARY KEY); INSERT INTO ready.marker VALUES (1);' 2>/dev/null \
+    || { bad "health passed before clients could write"; return; }
+  ok "health only passes when the initialized server accepts client writes"
+  sql "$node" "ALTER USER 'root'@'localhost' IDENTIFIED BY 'serving-password';" \
+    || { bad "could not exercise serving authentication refusal"; return; }
+  # Existing pooled sessions remain authenticated after ALTER USER; restart
+  # the pool's connections by killing them from the new root session.
+  docker exec "$node" sh -c 'mysql -uroot -pserving-password -NBe "SELECT CONCAT(CHAR(75,73,76,76,32), ID, CHAR(59)) FROM information_schema.PROCESSLIST WHERE USER=CHAR(114,111,111,116) AND ID <> CONNECTION_ID()" | mysql -uroot -pserving-password' 2>/dev/null
+  docker exec "$node" wget -q -O /dev/null http://localhost:8080/health \
+    && ok "serving database remains live after root credential changes" \
+    || bad "readiness gate broke liveness after a credential change"
+  docker rm -f "$node" >/dev/null
+  docker volume rm "mysql-ha-e2e-vol-$node" >/dev/null
+  rm -rf "$init_dir"
+}
+
 ALL_TESTS=(
+  t_standalone_health_waits_for_initialization
   t_existing_database_without_root_password
   t_ha_missing_root_password_preserves_volume
   t_join_legacy_group_without_block_size_advert
