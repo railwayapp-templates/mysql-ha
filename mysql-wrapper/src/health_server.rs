@@ -8,7 +8,10 @@
 //!   GET /role   — write-routing fence: 200 iff this node is the writable
 //!                 Group Replication primary AND its view of the group has a
 //!                 reachable majority (see sql::role_is_writable_primary).
-//!                 HAProxy's write frontend routes exclusively on this.
+//!                 HAProxy's write frontend routes exclusively on this. The
+//!                 JSON body names the member's own state (see `RoleVerdict`)
+//!                 so a 503 from an ONLINE secondary and one from a member
+//!                 still RECOVERING read differently on the dashboard.
 //!                 In standalone mode (no GR_SEEDS) it degrades to liveness:
 //!                 a lone node is trivially its own primary.
 //!   GET /gr/state — peer exchange (JSON, see peers::GrState): group
@@ -40,7 +43,7 @@
 use crate::archiver::PitrStatus;
 use crate::gr::local_gr_state;
 use crate::health_auth::{self, Guard};
-use crate::sql::{role_is_writable_primary, Sql};
+use crate::sql::{role_is_writable_primary, MemberRow, Sql};
 use anyhow::Context;
 use axum::{
     extract::State,
@@ -109,38 +112,115 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+/// What /role answers, decided by `role_verdict` and rendered by
+/// `role_reply`. The body is JSON in every case, one vocabulary shared with
+/// mongo-ha and redis-ha (the Railway dashboard's cluster pane reads it
+/// engine-blind):
+///
+///   200 {"role":"primary"}
+///   503 {"role":"replica","state":<MEMBER_STATE>,"ready":<bool>} — a member
+///       that is not the primary; `state` is this node's own
+///       `replication_group_members.MEMBER_STATE` (ONLINE, RECOVERING,
+///       OFFLINE, ERROR, UNREACHABLE) and `ready` says whether it serves reads
+///       as a caught-up member (ONLINE only). A dashboard reads three of
+///       these with `ready:false` as "syncing", not as three replicas of
+///       nobody.
+///   503 {"role":"fenced","state":<MEMBER_STATE>,"ready":false} — this node
+///       holds the PRIMARY role but is out of write rotation: its view lacks a
+///       reachable majority, or the membership fence is up.
+///   503 {"role":"unknown","reason":<text>} — mysqld could not be asked.
+///
+/// The status code alone remains the routing contract (HAProxy's
+/// `http-check expect status 200`); the body is for people and dashboards.
+#[derive(Debug, PartialEq)]
+enum RoleVerdict {
+    Primary,
+    Fenced { state: String },
+    Replica { state: String },
+    Unavailable(&'static str),
+}
+
+/// The member states in which a non-primary serves reads as an ordinary,
+/// caught-up member. RECOVERING is still applying the donor's transactions;
+/// OFFLINE, ERROR and UNREACHABLE never serve.
+const READY_REPLICA_STATES: &[&str] = &["ONLINE"];
+
+/// This node's verdict from its own view of the group. `role_is_writable_primary`
+/// stays the single source of the 200 (its majority rule included); this only
+/// names what a non-200 node is: a PRIMARY-role member that lost the majority
+/// or sits behind the membership fence is `Fenced`, anything else is a
+/// `Replica` in its own MEMBER_STATE — OFFLINE when Group Replication has not
+/// listed this node at all (never started, or already removed).
+fn role_verdict(members: &[MemberRow], self_uuid: &str, membership_fenced: bool) -> RoleVerdict {
+    let own = members
+        .iter()
+        .find(|m| m.member_id.eq_ignore_ascii_case(self_uuid));
+    let state = own.map_or_else(|| "OFFLINE".to_string(), |m| m.state.clone());
+    let holds_primary_role = own.is_some_and(|m| m.role == "PRIMARY");
+    if role_is_writable_primary(members, self_uuid) {
+        // The membership fence outranks the view: a lone survivor of a
+        // graceful double stop IS its own view's writable primary, and
+        // is exactly the node that must not take writes.
+        return if membership_fenced {
+            RoleVerdict::Fenced { state }
+        } else {
+            RoleVerdict::Primary
+        };
+    }
+    if holds_primary_role {
+        RoleVerdict::Fenced { state }
+    } else {
+        RoleVerdict::Replica { state }
+    }
+}
+
+fn role_reply(verdict: RoleVerdict) -> (StatusCode, Json<serde_json::Value>) {
+    match verdict {
+        RoleVerdict::Primary => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "role": "primary" })),
+        ),
+        RoleVerdict::Fenced { state } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "role": "fenced", "state": state, "ready": false })),
+        ),
+        RoleVerdict::Replica { state } => {
+            let ready = READY_REPLICA_STATES.contains(&state.as_str());
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "role": "replica", "state": state, "ready": ready })),
+            )
+        }
+        RoleVerdict::Unavailable(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "role": "unknown", "reason": reason })),
+        ),
+    }
+}
+
 async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.standalone {
         // No group to fence against — alive means writable.
         return match state.ping_standalone().await {
-            Ok(()) => (StatusCode::OK, "primary (standalone)"),
-            Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "mysqld not answering"),
+            Ok(()) => role_reply(RoleVerdict::Primary),
+            Err(_) => role_reply(RoleVerdict::Unavailable("mysqld not answering")),
         };
     }
 
     let verdict = async {
         let self_uuid = state.sql.server_uuid().await?;
         let members = state.sql.group_members().await?;
-        anyhow::Ok(role_is_writable_primary(&members, &self_uuid))
+        anyhow::Ok(role_verdict(
+            &members,
+            &self_uuid,
+            state.membership_fenced.load(Ordering::Acquire),
+        ))
     }
     .await;
 
     match verdict {
-        Ok(true) => {
-            // The membership fence outranks the view: a lone survivor of a
-            // graceful double stop IS its own view's writable primary, and
-            // is exactly the node that must not take writes.
-            if state.membership_fenced.load(Ordering::Acquire) {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "fenced: group below a majority of its declared members",
-                )
-            } else {
-                (StatusCode::OK, "primary")
-            }
-        }
-        Ok(false) => (StatusCode::SERVICE_UNAVAILABLE, "not primary"),
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "state unavailable"),
+        Ok(verdict) => role_reply(verdict),
+        Err(_) => role_reply(RoleVerdict::Unavailable("state unavailable")),
     }
 }
 
@@ -402,6 +482,125 @@ mod tests {
             b = b.header(header::AUTHORIZATION, HeaderValue::from_str(a).unwrap());
         }
         b.body(Body::empty()).unwrap()
+    }
+
+    fn member(id: &str, state: &str, role: &str) -> MemberRow {
+        MemberRow {
+            member_id: id.to_string(),
+            host: format!("{id}.railway.internal"),
+            state: state.to_string(),
+            role: role.to_string(),
+        }
+    }
+
+    fn split(reply: (StatusCode, Json<serde_json::Value>)) -> (StatusCode, serde_json::Value) {
+        (reply.0, reply.1 .0)
+    }
+
+    #[test]
+    fn role_verdict_names_what_a_non_primary_is() {
+        let group = [
+            member("p", "ONLINE", "PRIMARY"),
+            member("s", "ONLINE", "SECONDARY"),
+            member("r", "RECOVERING", "SECONDARY"),
+        ];
+        assert_eq!(role_verdict(&group, "p", false), RoleVerdict::Primary);
+        assert_eq!(
+            role_verdict(&group, "s", false),
+            RoleVerdict::Replica {
+                state: "ONLINE".into()
+            }
+        );
+        assert_eq!(
+            role_verdict(&group, "r", false),
+            RoleVerdict::Replica {
+                state: "RECOVERING".into()
+            }
+        );
+        // Not listed at all: Group Replication never started here (or this
+        // node was removed) — a replica of nobody, and it says so.
+        assert_eq!(
+            role_verdict(&group, "x", false),
+            RoleVerdict::Replica {
+                state: "OFFLINE".into()
+            }
+        );
+        assert_eq!(
+            role_verdict(&[], "p", false),
+            RoleVerdict::Replica {
+                state: "OFFLINE".into()
+            }
+        );
+    }
+
+    #[test]
+    fn role_verdict_fences_a_primary_out_of_rotation_without_calling_it_a_replica() {
+        let group = [
+            member("p", "ONLINE", "PRIMARY"),
+            member("s", "ONLINE", "SECONDARY"),
+        ];
+        // The membership fence outranks the view.
+        assert_eq!(
+            role_verdict(&group, "p", true),
+            RoleVerdict::Fenced {
+                state: "ONLINE".into()
+            }
+        );
+        // A primary partitioned into the minority: its own row still says
+        // PRIMARY while the majority reads UNREACHABLE.
+        let minority = [
+            member("p", "ONLINE", "PRIMARY"),
+            member("s", "UNREACHABLE", "SECONDARY"),
+            member("t", "UNREACHABLE", "SECONDARY"),
+        ];
+        assert_eq!(
+            role_verdict(&minority, "p", false),
+            RoleVerdict::Fenced {
+                state: "ONLINE".into()
+            }
+        );
+    }
+
+    #[test]
+    fn role_reply_keeps_the_status_contract_and_marks_readiness() {
+        let (status, json) = split(role_reply(RoleVerdict::Primary));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!({ "role": "primary" }));
+
+        let (status, json) = split(role_reply(RoleVerdict::Replica {
+            state: "ONLINE".into(),
+        }));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json,
+            serde_json::json!({ "role": "replica", "state": "ONLINE", "ready": true })
+        );
+
+        for state in ["RECOVERING", "OFFLINE", "ERROR", "UNREACHABLE"] {
+            let (status, json) = split(role_reply(RoleVerdict::Replica {
+                state: state.into(),
+            }));
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(json["role"], "replica");
+            assert_eq!(json["state"], state);
+            assert_eq!(json["ready"], false, "{state} must not read as ready");
+        }
+
+        let (status, json) = split(role_reply(RoleVerdict::Fenced {
+            state: "ONLINE".into(),
+        }));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json,
+            serde_json::json!({ "role": "fenced", "state": "ONLINE", "ready": false })
+        );
+
+        let (status, json) = split(role_reply(RoleVerdict::Unavailable("mysqld not answering")));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json,
+            serde_json::json!({ "role": "unknown", "reason": "mysqld not answering" })
+        );
     }
 
     #[tokio::test]
