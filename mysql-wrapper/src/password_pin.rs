@@ -96,7 +96,7 @@ pub fn initial_password(env_password: &str, pin: Option<&str>) -> String {
 
 /// Candidate passwords in probe order. At most two, pin first — see
 /// `initial_password` for why.
-fn candidates(env_password: &str, pin: Option<&str>) -> Vec<(&'static str, String)> {
+pub(crate) fn candidates(env_password: &str, pin: Option<&str>) -> Vec<(&'static str, String)> {
     let mut list = Vec::new();
     if let Some(p) = pin {
         if p != env_password {
