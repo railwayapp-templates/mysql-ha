@@ -4275,13 +4275,18 @@ t_interrupted_server_upgrade_is_finished_on_boot() {
     && ok "all $seeded rows survived the interrupted upgrade" \
     || bad "row count after recovery: '$kept', expected $seeded"
 
+  # The record is written shortly after the server first accepts connections;
+  # a restart before it lands is a different case (one extra pass, by design).
+  wait_until 60 "served version recorded" \
+    node_logged "$node" "finish-upgrade: recorded the server version serving this datadir" \
+    || { bad "the wrapper never recorded the served version"; dump_node_log "$node"; return; }
   docker restart -t 60 "$node" >/dev/null
   wait_standalone_sql_ready "$node" 240 \
     || { bad "healthy restart after the recovery never served"; dump_node_log "$node"; return; }
   local passes; passes="$(docker logs "$node" 2>&1 | grep -c "finish-upgrade: minimal boot")"
   [ "$passes" = 1 ] \
     && ok "a healthy restart does not run the pass again" \
-    || bad "the pass ran $passes times across a healthy restart"
+    || { bad "the pass ran $passes times across a healthy restart"; dump_node_log "$node"; }
 
   docker rm -f "$node" >/dev/null
   docker volume rm "$vol" >/dev/null 2>&1
