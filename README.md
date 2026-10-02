@@ -51,7 +51,16 @@ routing decisions:
 - `GET /health` — liveness. 200 if MySQL is up and answering, 503 otherwise.
 - `GET /role` — the routing signal. 200 **only** when this node is the
   current Group Replication primary; 503 in every other case, including when
-  the node cannot confirm its own status.
+  the node cannot confirm its own status. The body is JSON, one vocabulary
+  shared with mongo-ha and redis-ha (the Railway dashboard reads it
+  engine-blind): `{"role":"primary"}` on a 200; on a 503,
+  `{"role":"replica","state":<MEMBER_STATE>,"ready":<bool>}` for a member that
+  is not the primary (`state` is this node's own `MEMBER_STATE` — `ONLINE`,
+  `RECOVERING`, `OFFLINE`, … — and `ready` is true only for `ONLINE`),
+  `{"role":"fenced","state":…,"ready":false}` for a PRIMARY-role member out of
+  write rotation (no reachable majority, or the membership fence),
+  `{"role":"unknown","reason":…}` when mysqld cannot be asked. Only the status
+  code is the routing contract; the body is for people and dashboards.
 
 HAProxy's write frontend (`mysql_primary_backend`) marks a node UP only while
 its `/role` returns 200 (`http-check send meth GET uri /role` / `http-check
