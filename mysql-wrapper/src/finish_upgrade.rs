@@ -4,8 +4,7 @@
 //! steps: the data-dictionary step, then the server step (system tables, sys
 //! schema, help tables). When the container dies during the server step —
 //! app sleep, an OOM kill, a redeploy — every later boot of that binary fails
-//! the upgrade and aborts, forever. Two ways were seen in production
-//! (9.4.0 -> 9.7.2, 2026-09-29/30):
+//! the upgrade and aborts, forever. Two ways, both reproduced on 9.4.0 -> 9.7.2:
 //!
 //!   1. The killed step left a recovered, uncommitted transaction. InnoDB
 //!      rolls recovered transactions back in the background only once the
@@ -17,8 +16,7 @@
 //!      with only an `.sdi` file on disk: `Table 'mysql.#sql-4_4' requires
 //!      repair`, `Failed to upgrade server`, abort.
 //!
-//! The pass below is the recovery that was verified on those volumes, run
-//! before the real mysqld: boot with `--upgrade=MINIMAL` (the dictionary step
+//! The pass below runs before the real mysqld: boot with `--upgrade=MINIMAL` (the dictionary step
 //! runs, the server step is skipped, so the background rollback can start),
 //! wait for every recovered transaction to finish rolling back, drop the
 //! orphaned intermediate tables, shut down cleanly. The normal boot that
