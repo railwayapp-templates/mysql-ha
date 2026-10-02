@@ -101,7 +101,6 @@ COPY --from=rust-binaries --chmod=755 /mysql-wrapper /usr/local/bin/mysql-wrappe
 # the same one deferred there: start as root, chown /var/lib/mysql to the
 # mysql user at runtime, then drop privileges before exec'ing mysqld.
 
-VOLUME ["/var/lib/mysql"]
 
 # 3306   = MySQL client port — also carries Group Replication traffic
 #          (group_replication_communication_stack = MYSQL; no XCom port)
