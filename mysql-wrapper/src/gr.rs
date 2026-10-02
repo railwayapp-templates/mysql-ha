@@ -2635,7 +2635,7 @@ pub fn recovery_credential(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// One live-group member's /gr/state answer as the adopted-data guard
@@ -3534,7 +3534,7 @@ mod tests {
         assert_eq!(current_recovery_credential(&config, ""), "rotated");
     }
 
-    fn test_config() -> Config {
+    pub(crate) fn test_config() -> Config {
         // Construct directly rather than via from_env to keep tests
         // independent of process-global environment state.
         Config {

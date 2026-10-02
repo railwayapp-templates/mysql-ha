@@ -4194,6 +4194,105 @@ wait_uploaded() {
 }
 
 # node_logged <node> <needle> — grep the node's log for a fixed string.
+# A server upgrade killed part-way (app sleep, OOM, redeploy) must be finished
+# by the next wrapper boot instead of failing it forever: the wrapper boots
+# --upgrade=MINIMAL on a private socket, lets InnoDB roll the killed step's
+# transaction back, drops orphaned mysql.#sql-* tables, shuts down and boots
+# normally. The kill is aimed inside the server step itself; whether it also
+# leaves the lock-wait or orphan wedge behind depends on where in the step it
+# lands, so the scenario asserts the pass ran and the data came through, and
+# that a healthy restart afterwards does not run it again.
+t_interrupted_server_upgrade_is_finished_on_boot() {
+  local prev; prev="$(seed_prev_version)"
+  local node=upgrade-node vol=mysql-ha-e2e-vol-upgrade-node
+  log "t_interrupted_server_upgrade_is_finished_on_boot (seed mysql:$prev, kill the $MYSQL_VERSION server upgrade, boot the wrapper)"
+  docker rm -f upgrade-seed upgrade-kill "$node" >/dev/null 2>&1
+  docker volume rm "$vol" >/dev/null 2>&1
+  docker volume create --label "$LABEL" "$vol" >/dev/null
+
+  docker run -d --label "$LABEL" --name upgrade-seed \
+    -v "$vol:/var/lib/mysql" -e MYSQL_ROOT_PASSWORD="$ROOT_PW" -e MYSQL_DATABASE=railway \
+    "mysql:$prev" mysqld --performance_schema=0 >/dev/null
+  wait_until 240 "seed mysqld up" \
+    bash -c 'docker exec upgrade-seed mysql -uroot -p'"$ROOT_PW"' -e "SELECT 1" >/dev/null 2>&1' \
+    || { bad "interrupted-upgrade seed never came up"; dump_node_log upgrade-seed; return; }
+  docker exec upgrade-seed mysql -uroot -p"$ROOT_PW" -e \
+    "CREATE TABLE railway.rows_kept (id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(64));
+     INSERT INTO railway.rows_kept (v) VALUES ('a'),('b'),('c'),('d'),('e');
+     INSERT INTO railway.rows_kept (v) SELECT v FROM railway.rows_kept;
+     INSERT INTO railway.rows_kept (v) SELECT v FROM railway.rows_kept;" 2>/dev/null
+  local seeded; seeded="$(docker exec upgrade-seed mysql -uroot -p"$ROOT_PW" --batch --skip-column-names -e "SELECT COUNT(*) FROM railway.rows_kept" 2>/dev/null)"
+  docker stop -t 60 upgrade-seed >/dev/null && docker rm upgrade-seed >/dev/null
+  [ "$seeded" = 20 ] || { bad "interrupted-upgrade seed has $seeded rows, expected 20"; return; }
+
+  # The wrapper image's own mysqld, booted the way upstream boots it, so the
+  # step being killed is exactly the one the wrapper has to finish.
+  docker run -d --label "$LABEL" --name upgrade-kill \
+    -v "$vol:/var/lib/mysql" -e MYSQL_ROOT_PASSWORD="$ROOT_PW" \
+    --entrypoint docker-entrypoint.sh "$IMAGE" mysqld >/dev/null
+  local deadline=$((SECONDS + 240)) killed=0
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if docker logs upgrade-kill 2>&1 | grep -q "MY-013381.*started"; then
+      sleep "${UPGRADE_KILL_DELAY:-2}"
+      docker kill -s KILL upgrade-kill >/dev/null 2>&1 && killed=1
+      break
+    fi
+    [ "$(docker inspect -f '{{.State.Running}}' upgrade-kill 2>/dev/null)" = true ] || break
+    sleep 0.2
+  done
+  if [ "$killed" != 1 ]; then
+    bad "never saw the server upgrade start (or mysqld exited first)"; dump_node_log upgrade-kill; return
+  fi
+  if docker logs upgrade-kill 2>&1 | grep -q "MY-013381.*completed"; then
+    bad "the kill landed after the server upgrade completed; nothing was interrupted (lower UPGRADE_KILL_DELAY)"; return
+  fi
+  ok "killed mysqld inside the server upgrade step"
+  docker rm -f upgrade-kill >/dev/null
+
+  # mysqld records the new version in mysql_upgrade_history before the
+  # server step runs, which is why the wrapper cannot treat that file as
+  # proof of a completed upgrade.
+  local history
+  history="$(docker run --rm -v "$vol:/d" --entrypoint cat "$IMAGE" /d/mysql_upgrade_history 2>/dev/null)"
+  printf '%s' "$history" | grep -q "\"version\":\"$MYSQL_VERSION" \
+    && ok "the upgrade history already lists $MYSQL_VERSION after the killed step" \
+    || log "upgrade history after the kill: $history"
+
+  start_standalone "$node"
+  wait_standalone_sql_ready "$node" 480 \
+    || { bad "wrapper never served after the interrupted upgrade"; dump_node_log "$node"; return; }
+  node_logged "$node" "finish-upgrade: minimal boot" \
+    && ok "the wrapper ran the finish-upgrade pass" \
+    || bad "the wrapper did not run the finish-upgrade pass"
+  node_logged "$node" "finish-upgrade: normal boot" \
+    && ok "the pass completed and handed over to the normal boot" \
+    || { bad "the pass did not complete"; dump_node_log "$node"; }
+  docker logs "$node" 2>&1 | grep -q "MY-013381.*completed" \
+    && ok "the normal boot completed the server upgrade" \
+    || bad "no completed server upgrade in the wrapper's boot"
+  local kept; kept="$(sql "$node" "SELECT COUNT(*) FROM railway.rows_kept")"
+  [ "$kept" = "$seeded" ] \
+    && ok "all $seeded rows survived the interrupted upgrade" \
+    || bad "row count after recovery: '$kept', expected $seeded"
+
+  # The record is written shortly after the server first accepts connections;
+  # a restart before it lands is a different case (one extra pass, by design).
+  wait_until 60 "served version recorded" \
+    node_logged "$node" "finish-upgrade: recorded the server version serving this datadir" \
+    || { bad "the wrapper never recorded the served version"; dump_node_log "$node"; return; }
+  docker restart -t 60 "$node" >/dev/null
+  wait_standalone_sql_ready "$node" 240 \
+    || { bad "healthy restart after the recovery never served"; dump_node_log "$node"; return; }
+  local passes; passes="$(docker logs "$node" 2>&1 | grep -c "finish-upgrade: minimal boot")"
+  [ "$passes" = 1 ] \
+    && ok "a healthy restart does not run the pass again" \
+    || { bad "the pass ran $passes times across a healthy restart"; dump_node_log "$node"; }
+
+  docker rm -f "$node" >/dev/null
+  docker volume rm "$vol" >/dev/null 2>&1
+}
+
+
 node_logged() { docker logs "$1" 2>&1 | grep -qF "$2"; }
 
 # log_epoch <node> <needle> — docker's timestamp of the first log line holding
@@ -5466,6 +5565,7 @@ ALL_TESTS=(
   t_pitr_restore_silently_stops_short_of_target
   t_binlog_expiry_silently_loses_unshipped_data
   t_conversion_cross_version_upgrade
+  t_interrupted_server_upgrade_is_finished_on_boot
   t_pitr_ha_archives_from_the_primary_and_follows_switchover
   t_pitr_ha_scale_up_then_remove_the_archiver
   t_pitr_ha_revert_to_standalone_keeps_the_archive

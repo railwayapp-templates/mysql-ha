@@ -44,6 +44,7 @@ mod config;
 mod credentials;
 mod demote_on_shutdown;
 mod dns_probe;
+mod finish_upgrade;
 mod gr;
 mod health_auth;
 mod health_server;
@@ -251,6 +252,11 @@ async fn main() -> Result<()> {
         pitr_status.note_refusal(reason);
     }
 
+    // MYSQL_ROOT_PASSWORD and friends reach docker-entrypoint.sh through the
+    // inherited process environment, not as CLI args.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let binary_version = finish_upgrade::binary_version().await;
+
     let mut boot_note = None;
     if config.gr_enabled() {
         // A restore produces a new STANDALONE server; restoring into a group
@@ -279,6 +285,20 @@ async fn main() -> Result<()> {
         // entrypoint spawns — it decides whether this boot's local GTID
         // history is init noise that must be purged (see gr::orchestrate).
         let fresh_datadir = !config.datadir_is_initialized();
+
+        // After the GR config is on disk, so the minimal boot reads the same
+        // server settings as the serving one; before anything that dials
+        // mysqld starts, so nothing waits on (or times out against) the pass.
+        if finish_upgrade::run_if_pending(&config, &args, binary_version, &telemetry).await
+            == finish_upgrade::PassOutcome::ShutdownRequested
+        {
+            self_heal::PlannedShutdownNote {
+                data_dir: config.data_dir.clone(),
+                ready: preboot.ready.clone(),
+            }
+            .note_planned_shutdown();
+            std::process::exit(0);
+        }
 
         // Shared with orchestrate: /gr/state refuses to answer until
         // orchestrate raises this, right after its one-time adoption
@@ -402,6 +422,15 @@ async fn main() -> Result<()> {
             mysql_conf::write_standalone_archive_conf(&config, server_id)?;
         }
 
+        // After restore and the archive conf, for the same reasons as the GR
+        // arm: a restored datadir is initialized by this binary (nothing to
+        // finish), and the minimal boot reads the serving settings.
+        if finish_upgrade::run_if_pending(&config, &args, binary_version, &telemetry).await
+            == finish_upgrade::PassOutcome::ShutdownRequested
+        {
+            std::process::exit(0);
+        }
+
         info!("GR_SEEDS not set — standalone passthrough mode");
         tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
@@ -442,9 +471,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // MYSQL_ROOT_PASSWORD and friends reach docker-entrypoint.sh through the
-    // inherited process environment, not as CLI args.
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    tokio::spawn(finish_upgrade::record_served_version(
+        config.data_dir.clone(),
+        sql.clone(),
+        binary_version,
+    ));
     let child = process_manager::spawn_mysqld(&args).await?;
 
     // HA mode: hand the primary role off before mysqld is signaled, so a

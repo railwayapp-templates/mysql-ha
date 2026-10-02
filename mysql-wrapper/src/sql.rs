@@ -303,7 +303,7 @@ pub struct Sql {
     backup_lock_held: Arc<AtomicBool>,
 }
 
-fn root_opts(socket_path: &str, root_password: &str) -> Opts {
+pub(crate) fn root_opts(socket_path: &str, root_password: &str) -> Opts {
     OptsBuilder::default()
         .socket(Some(socket_path))
         .user(Some("root"))
