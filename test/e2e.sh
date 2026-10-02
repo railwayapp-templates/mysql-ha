@@ -27,16 +27,17 @@ MINIO_ROOT_PASSWORD="e2e-minio-password"
 PITR_BUCKET="mysql-pitr-e2e"
 MINIO_HOST_PORT=""
 
-# The server and its mc client, from quay.io — the registry MinIO's own
-# install docs point at. Docker Hub's `minio/minio` and `minio/mc` stopped
-# resolving on 2026-09-11 (the Hub API answers 404 and the registry 401 for
-# both), so every `docker run minio/...` in this file died on the pull and
-# took all sixteen PITR scenarios with it, on every branch at once. Pinned to
-# a release rather than to `latest` so the next thing that moves upstream
-# cannot do it again: these two tags are the images the suite was already
-# running before the removal.
-MINIO_IMAGE="quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
-MC_IMAGE="quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z"
+# The server and its mc client, from pgsty's community-maintained build of
+# minio/minio and minio/mc. Upstream stopped publishing anonymously pullable
+# images: Docker Hub's `minio/minio` and `minio/mc` stopped resolving on
+# 2026-09-11, and quay.io's copies answer 401 for every tag by 2026-09-29,
+# so every `docker run` against them died on the pull and took all the PITR
+# scenarios with it, on every branch at once. The fork is a drop-in (same
+# `minio server` entrypoint, same `mc`, `sh` in the client image). Pinned to a
+# release rather than to `latest` so the next thing that moves upstream
+# cannot change what the suite runs underneath it.
+MINIO_IMAGE="pgsty/minio:RELEASE.2026-08-04T00-00-00Z"
+MC_IMAGE="pgsty/mc:RELEASE.2026-09-16T00-00-00Z"
 
 PASS=0
 FAIL=0
