@@ -4283,7 +4283,9 @@ t_interrupted_server_upgrade_is_finished_on_boot() {
   docker restart -t 60 "$node" >/dev/null
   wait_standalone_sql_ready "$node" 240 \
     || { bad "healthy restart after the recovery never served"; dump_node_log "$node"; return; }
-  local passes; passes="$(docker logs "$node" 2>&1 | grep -c "finish-upgrade: minimal boot")"
+  # One pass logs several "finish-upgrade: minimal boot …" lines; count the
+  # line that starts one.
+  local passes; passes="$(docker logs "$node" 2>&1 | grep -c '"message":"finish-upgrade: minimal boot",')"
   [ "$passes" = 1 ] \
     && ok "a healthy restart does not run the pass again" \
     || { bad "the pass ran $passes times across a healthy restart"; dump_node_log "$node"; }
