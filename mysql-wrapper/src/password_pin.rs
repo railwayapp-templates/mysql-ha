@@ -172,9 +172,8 @@ pub async fn resolve_and_apply(
                     pitr_status.note_refusal(CREDENTIAL_REFUSAL);
                 }
                 error!(
-                    "mysqld denies every known root password (pin and environment); \
-                     the wrapper cannot manage this node until the variable is \
-                     restored to the active password"
+                    "No known root password works. Regenerate the password from the database's \
+                     Credentials tab."
                 );
                 telemetry.send(TelemetryEvent::ComponentError {
                     component: "mysql-wrapper".to_string(),
@@ -205,8 +204,9 @@ async fn finalize(
         // The drift this module exists for: keep the cluster on the active
         // password and say, loudly, that the variable is lying.
         warn!(
-            "MYSQL_ROOT_PASSWORD differs from the active root password; keeping the \
-             pinned active password — variable edits do not rotate the live credential"
+            "The current password in MYSQL_ROOT_PASSWORD doesn't match the database's. This \
+             node keeps using the database's current password. Regenerate the password from \
+             the database's Credentials tab."
         );
         telemetry.send(TelemetryEvent::ComponentError {
             component: "mysql-wrapper".to_string(),

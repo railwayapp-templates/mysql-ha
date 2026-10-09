@@ -57,7 +57,7 @@ use common::{Telemetry, TelemetryEvent};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub struct AppState {
     pub sql: Sql,
@@ -410,19 +410,19 @@ pub async fn run_health_server_supervised(
             Ok(Ok(())) => {
                 // axum::serve only returns on a graceful-shutdown signal we
                 // never send — unexpected, but the answer is the same.
-                error!("health server returned unexpectedly; restarting");
+                warn!("health server returned unexpectedly; restarting in 5s");
                 "run loop returned cleanly".to_string()
             }
             Ok(Err(e)) => {
-                error!(error = %e, "health server failed; restarting");
+                warn!(error = %e, "health server failed; restarting in 5s");
                 format!("bind/serve failed: {e:#}")
             }
             Err(e) if e.is_panic() => {
-                error!(panic = ?e, "health server panicked; restarting");
+                warn!(panic = ?e, "health server panicked; restarting in 5s");
                 "task panicked".to_string()
             }
             Err(e) => {
-                error!(error = %e, "health server task was cancelled; restarting");
+                warn!(error = %e, "health server task was cancelled; restarting in 5s");
                 "task cancelled".to_string()
             }
         };

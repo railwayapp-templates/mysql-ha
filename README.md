@@ -101,15 +101,14 @@ and every peer's bootstrap guard depend on them and nothing they return can
 change the group. Both halves of the credential are compared in constant
 time, and a refusal is logged by method and path only.
 
-Rollout: the platform callers (the HA rolling-enable switchover, the dashboard
-and the CLI) send the credential whenever the node's variables carry it, and
+How `HEALTH_API_PASSWORD` gets set: the Railway template sets it to the
+cluster's shared `MYSQL_ROOT_PASSWORD` on every node, so a new cluster
+enforces it from its first boot. An existing cluster enforces it once the
+variable is set on its nodes and they redeploy. Each node gates its own routes
+the moment it boots with the variable, so a cluster can adopt it one node at a
+time. Railway sends the credential whenever the node's variables carry it, and
 a node without the variable ignores the header, so callers and images can roll
-out in either order. The Railway template stamps `HEALTH_API_PASSWORD` as the
-cluster's shared `MYSQL_ROOT_PASSWORD` on every data node once that stamp
-lands (mono #38506), so a new cluster enforces from its first boot. An
-existing cluster enforces once the variable is set on its data nodes and they
-redeploy — each node gates its own route the moment
-it boots with the variable, so a cluster may adopt it one node at a time.
+out in either order.
 
 ### Existing databases without `MYSQL_ROOT_PASSWORD`
 
@@ -288,11 +287,10 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     `DEFAULT_BINLOG_RETENTION_DAYS` (7)**, so the image bounds every service's
     archive itself rather than relying on the platform to stamp a value; a
     positive integer sets an explicit horizon, and **`0` is the opt-out** that
-    keeps the archive forever. Defaulting in the image is what bounds the whole
-    FLEET — a template stamp reaches only freshly-seeded template instances,
-    leaving existing and adopted services growing forever — and it is safe
-    because the safety rails below mean the only thing an image bump can expire
-    is archive beyond the presented window. `BINLOG_RETENTION_DRY_RUN=true`
+    keeps the archive forever. The image defaults it so every service,
+    including existing and adopted ones, has a bounded archive. It is safe
+    because the safety rails below mean the only thing an image update can
+    expire is archive beyond the presented window. `BINLOG_RETENTION_DRY_RUN=true`
     logs what the horizon would delete without deleting it.
 
     The horizon is the promise, not the whole rule. Two safety rails are not
@@ -300,11 +298,7 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     `MIN_ACTIVE_FULLS_KEPT` (2) fulls of the live lineage survive regardless
     of age — so an archiver that has been broken for longer than the horizon
     can never be expired into being unrestorable — and no object is deleted
-    while younger than an hour. (The age floor has a TEST-ONLY override,
-    `RAILWAY_TEST_RETENTION_MIN_OBJECT_AGE_SECONDS`, purely because S3 stamps
-    `LastModified` on write, so an e2e test otherwise has no way to prove
-    retention deletes anything without waiting out the hour. Never set it
-    outside a test workspace.)
+    while younger than an hour.
 
     What expires, and why it is safe: replay always starts at a full backup's
     own recorded binlog coordinate, so binlogs *below* the oldest retained
@@ -329,14 +323,12 @@ The `mysql-wrapper` binary (one per data node) is the analogue of redis-ha's
     survive the floor. A binlog whose upload time the listing did not report
     is kept, and a pass that could not read every full expires nothing.
 
-    Two rules exist because their absence was a data-loss bug, not because
-    they were designed up front — both are regression-tested: a lineage whose
-    fulls **exist but could not be read** this pass (an S3 blip, a corrupt
-    meta) is never treated as a lineage with no fulls, since expiring its
-    binlogs would leave those fulls unrestorable past their own coordinates;
-    and nothing expires anywhere until the ACTIVE lineage holds a complete
-    full, so a fresh volume never retires the bucket's last restorable full
-    before its replacement exists.
+    Two more rules: a lineage whose fulls **exist but could not be read** this
+    pass (an S3 blip, a corrupt meta) is never treated as a lineage with no
+    fulls, since expiring its binlogs would leave those fulls unrestorable past
+    their own coordinates. And nothing expires anywhere until the ACTIVE
+    lineage holds a complete full, so a fresh volume never retires the bucket's
+    last restorable full before its replacement exists.
 
     Note there is no diff/incremental tier here as pgBackRest has: storage is
     (retained fulls x dump size) + (binlogs since the oldest retained full),
@@ -460,12 +452,12 @@ Deliberately out of scope for v1:
   standalone server; converting that server to HA afterwards is the platform's
   ordinary conversion flow, not a restore feature.
 - **Rolling upgrades are not coordinated — and don't need to be, within a
-  series.** Data nodes carry a series tag with no auto-update; any redeploy
+  series.** Nodes carry a series tag with no auto-update; any redeploy
   re-pulls the tag's current patch. This is safe by the LTS model: Group
   Replication tolerates the skew, clone works across patch releases of the
-  same series, and a rollback of an upgraded member performs MySQL's
+  same series, and a rollback of an upgraded node performs MySQL's
   automatic in-place downgrade on boot ("Server downgrade from X to Y") and
-  rejoins with its data — the e2e locks both directions. Cross-SERIES moves
+  rejoins with its data. Cross-SERIES moves
   (8.4 → 9.x) remain one-way (dump/reload only), which is exactly why the
   tags pin the series and conversions match the source's major.
 - **Runs as root** — same posture (and same deferred fix) as redis-ha; see

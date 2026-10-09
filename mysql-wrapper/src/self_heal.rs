@@ -512,7 +512,7 @@ pub async fn boot_watch(
                 error!(
                     budget = ?budget,
                     %primary,
-                    "mysqld did not accept connections within the boot budget while the group is healthy; exiting so the restart counts this boot attempt"
+                    "Stopping: the database didn't accept connections in time while the cluster is healthy. It restarts and tries again."
                 );
                 telemetry.send(TelemetryEvent::ComponentError {
                     component: "mysql-wrapper".to_string(),

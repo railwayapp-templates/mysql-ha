@@ -705,7 +705,7 @@ t_fresh_members_wait_for_a_seed_they_never_met() {
   # A fresh node initialises its datadir before it probes anyone; CI takes
   # minutes for that, so the budget is the same as the other fresh-node waits.
   wait_until 300 "fresh pair sees the root's name gone" \
-    node_logged "$n2" "authoritatively gone" \
+    node_logged "$n2" "is no longer on the private network. Giving up on it if that persists" \
     || { bad "$t" "$n2 never noticed the root's name was gone"; dump_node_log "$n2"; teardown_trio; return; }
   # Past the dwell (20 s) with a wide margin: no waiver, no bootstrap.
   sleep 75
@@ -714,7 +714,7 @@ t_fresh_members_wait_for_a_seed_they_never_met() {
   else
     ok "fresh pair holds: no primary without the adopted root, well past the dwell"
   fi
-  node_logged "$n2" "has never been a group member" \
+  node_logged "$n2" "This node has no data of its own yet, so it won't start a cluster without them" \
     && ok "$n2 said why it is not waiving the gone peer" \
     || bad "$t" "$n2 did not log the never-a-member reason for holding"
   node_logged "$n2" "bootstrapping a new group" \
@@ -774,7 +774,7 @@ t_adopted_root_refuses_a_group_that_formed_without_its_data() {
   node_logged mysql-1 "cloning instead of binlog recovery" \
     && bad "$t" "the adopted root cloned off the empty group — its data would be gone" \
     || ok "the adopted root never cloned off the empty group"
-  node_logged mysql-1 "discarding the orphaned transactions and recloning" \
+  node_logged mysql-1 "the writes it had that the primary never received are discarded" \
     && bad "$t" "the adopted root's data was treated as a stale fork" \
     || ok "the adopted root's data was not treated as a stale fork"
   [ "$(sql mysql-1 "SELECT v FROM railway.legacy WHERE id=1")" = "pre-conversion" ] \
@@ -1392,7 +1392,7 @@ t_password_variable_edit_does_not_rotate() {
     || { bad "post-drift write never replicated"; return; }
   ok "writes replicate after the drifted redeploy"
 
-  docker logs mysql-1 2>&1 | grep -q "MYSQL_ROOT_PASSWORD differs from the active root password" \
+  docker logs mysql-1 2>&1 | grep -q "The current password in MYSQL_ROOT_PASSWORD doesn't match the database's" \
     && ok "wrapper warned about the drifted variable" \
     || bad "no drift warning in the wrapper log"
 }
@@ -1878,8 +1878,8 @@ t_deleted_peer_unfences_bootstrap() {
     && ok "dataset survived the scale-down outage recovery" \
     || bad "dataset missing after the waiver recovery"
 
-  docker logs "$n1" 2>&1 | grep -q "no longer waiting on them" \
-    || docker logs "$n2" 2>&1 | grep -q "no longer waiting on them" \
+  docker logs "$n1" 2>&1 | grep -q "No longer waiting for them" \
+    || docker logs "$n2" 2>&1 | grep -q "No longer waiting for them" \
     && ok "a survivor logged the deletion waiver" \
     || bad "no waiver log line on either survivor"
 
@@ -2206,8 +2206,8 @@ t_split_brain_fork_self_heals() {
     || bad "pre-fork data lost on a healed node"
 
   # And it was a genuine self-heal, logged as a discard — not a silent merge.
-  docker logs "$n1" 2>&1 | grep -q "discarding the orphaned transactions and recloning" \
-    || docker logs "$n2" 2>&1 | grep -q "discarding the orphaned transactions and recloning" \
+  docker logs "$n1" 2>&1 | grep -q "the writes it had that the primary never received are discarded" \
+    || docker logs "$n2" 2>&1 | grep -q "the writes it had that the primary never received are discarded" \
     && ok "a stale node logged the divergence self-heal (orphaned tail discarded, not merged)" \
     || bad "no divergence self-heal log line — convergence may have been a silent merge"
 
@@ -2643,7 +2643,7 @@ t_pitr_malformed_archive_config_refuses_archiving_not_the_database() {
   [ "$configured" = "true" ] && [ "$archiving" = "false" ] \
     && ok "/pitr reports the contract present (archive_configured=true) and archiving off" \
     || bad "/pitr should report archive_configured=true archiving=false; got configured=$configured archiving=$archiving"
-  docker logs mysql-pitr-badshape 2>&1 | grep -q '"message":"PITR archiving refused' \
+  docker logs mysql-pitr-badshape 2>&1 | grep -q '"message":"Fix the archive variable named in the reason and redeploy' \
     && ok "the refusal is logged" \
     || bad "no 'PITR archiving refused' log line on the malformed-endpoint node"
   docker logs mysql-pitr-badshape 2>&1 | grep -qE 'initial full backup|binlog uploaded|building the PITR' \
@@ -4261,10 +4261,10 @@ t_interrupted_server_upgrade_is_finished_on_boot() {
   start_standalone "$node"
   wait_standalone_sql_ready "$node" 480 \
     || { bad "wrapper never served after the interrupted upgrade"; dump_node_log "$node"; return; }
-  node_logged "$node" "finish-upgrade: minimal boot" \
+  node_logged "$node" "finish-upgrade: finishing an interrupted server upgrade" \
     && ok "the wrapper ran the finish-upgrade pass" \
     || bad "the wrapper did not run the finish-upgrade pass"
-  node_logged "$node" "finish-upgrade: normal boot" \
+  node_logged "$node" "finish-upgrade: server upgrade finished; starting the database" \
     && ok "the pass completed and handed over to the normal boot" \
     || { bad "the pass did not complete"; dump_node_log "$node"; }
   docker logs "$node" 2>&1 | grep -q "MY-013381.*completed" \
@@ -4283,9 +4283,9 @@ t_interrupted_server_upgrade_is_finished_on_boot() {
   docker restart -t 60 "$node" >/dev/null
   wait_standalone_sql_ready "$node" 240 \
     || { bad "healthy restart after the recovery never served"; dump_node_log "$node"; return; }
-  # One pass logs several "finish-upgrade: minimal boot …" lines; count the
-  # line that starts one.
-  local passes; passes="$(docker logs "$node" 2>&1 | grep -c '"message":"finish-upgrade: minimal boot",')"
+  # One pass logs several "finish-upgrade: …" lines; count the one that
+  # starts a pass.
+  local passes; passes="$(docker logs "$node" 2>&1 | grep -c '"message":"finish-upgrade: finishing an interrupted server upgrade before the database starts",')"
   [ "$passes" = 1 ] \
     && ok "a healthy restart does not run the pass again" \
     || { bad "the pass ran $passes times across a healthy restart"; dump_node_log "$node"; }
