@@ -705,7 +705,7 @@ t_fresh_members_wait_for_a_seed_they_never_met() {
   # A fresh node initialises its datadir before it probes anyone; CI takes
   # minutes for that, so the budget is the same as the other fresh-node waits.
   wait_until 300 "fresh pair sees the root's name gone" \
-    node_logged "$n2" "authoritatively gone" \
+    node_logged "$n2" "is no longer on the private network. Giving up on it if that persists" \
     || { bad "$t" "$n2 never noticed the root's name was gone"; dump_node_log "$n2"; teardown_trio; return; }
   # Past the dwell (20 s) with a wide margin: no waiver, no bootstrap.
   sleep 75
@@ -714,7 +714,7 @@ t_fresh_members_wait_for_a_seed_they_never_met() {
   else
     ok "fresh pair holds: no primary without the adopted root, well past the dwell"
   fi
-  node_logged "$n2" "has never been a group member" \
+  node_logged "$n2" "This node has no data of its own yet, so it won't start a cluster without them" \
     && ok "$n2 said why it is not waiving the gone peer" \
     || bad "$t" "$n2 did not log the never-a-member reason for holding"
   node_logged "$n2" "bootstrapping a new group" \
@@ -1878,8 +1878,8 @@ t_deleted_peer_unfences_bootstrap() {
     && ok "dataset survived the scale-down outage recovery" \
     || bad "dataset missing after the waiver recovery"
 
-  docker logs "$n1" 2>&1 | grep -q "no longer waiting on them" \
-    || docker logs "$n2" 2>&1 | grep -q "no longer waiting on them" \
+  docker logs "$n1" 2>&1 | grep -q "No longer waiting for them" \
+    || docker logs "$n2" 2>&1 | grep -q "No longer waiting for them" \
     && ok "a survivor logged the deletion waiver" \
     || bad "no waiver log line on either survivor"
 
@@ -2643,7 +2643,7 @@ t_pitr_malformed_archive_config_refuses_archiving_not_the_database() {
   [ "$configured" = "true" ] && [ "$archiving" = "false" ] \
     && ok "/pitr reports the contract present (archive_configured=true) and archiving off" \
     || bad "/pitr should report archive_configured=true archiving=false; got configured=$configured archiving=$archiving"
-  docker logs mysql-pitr-badshape 2>&1 | grep -q '"message":"PITR archiving refused' \
+  docker logs mysql-pitr-badshape 2>&1 | grep -q '"message":"Fix the archive variable named in the reason and redeploy' \
     && ok "the refusal is logged" \
     || bad "no 'PITR archiving refused' log line on the malformed-endpoint node"
   docker logs mysql-pitr-badshape 2>&1 | grep -qE 'initial full backup|binlog uploaded|building the PITR' \
