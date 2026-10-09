@@ -237,12 +237,9 @@ async fn main() -> Result<()> {
     if let Some(reason) = config.archive_refusal.as_deref() {
         error!(
             reason,
-            "PITR archiving refused: the archive configuration is not usable; archiving is \
-             disabled for this boot and mysqld serves with the no-archive-contract server \
-             settings (the archive conf is not rendered: innodb_buffer_pool_size is the \
-             server default instead of the container-sized value and closed binlogs expire \
-             on the server default instead of being kept for the archiver) until the variable \
-             named is fixed and the service redeployed"
+            "Fix the archive variable named in the reason and redeploy. Binlog archiving is off \
+             for this boot because the archive configuration isn't usable. Until then the \
+             server runs with its default buffer pool size and binlog retention."
         );
         telemetry.send(TelemetryEvent::ComponentError {
             component: "mysql-wrapper".to_string(),

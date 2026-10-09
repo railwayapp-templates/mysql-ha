@@ -1171,12 +1171,12 @@ async fn classify_round(
                             *waiver_generation,
                             peer_rank,
                         );
-                        warn!(
+                        error!(
                             %host,
                             peer_generation = waiver_generation,
                             my_generation,
                             peer_wins,
-                            "GTID histories DIVERGED; auto-resolving by waiver generation then seed order — the losing side will discard its orphaned tail and reclone"
+                            "This node's history diverged from {host}'s. The side with the older history is rebuilt from the primary, and the writes it had that the primary never received are discarded."
                         );
                         if peer_wins {
                             PeerRelation::Ahead
@@ -1540,7 +1540,7 @@ pub async fn orchestrate(
         }
         // mysqld is still answering: the graceful path itself failed. The
         // hard exit is the last resort that keeps the fence fail-closed.
-        error!("mysqld is still answering after the clean shutdown was issued; exiting hard to keep the fence fail-closed");
+        error!("Stopping: this node can't join the cluster safely. It restarts and tries again.");
         std::process::exit(1);
     }
 
@@ -1682,12 +1682,13 @@ pub async fn orchestrate(
                         %host,
                         ?detail,
                         dwell = ?gone_dwell,
-                        "unreachable peer's name is authoritatively gone; will stop waiting on it if this persists for the whole dwell"
+                        "{host} is no longer on the private network. Giving up on it if that persists."
                     );
                 } else if verdict == NameVerdict::Gone && !may_waive {
                     never_member_holds.push(host);
                 } else if verdict == NameVerdict::ExistsOrUnknown {
-                    unproven_gone.push(format!("{host} ({detail:?})"));
+                    debug!(%host, ?detail, "node unreachable; its name is not provably gone");
+                    unproven_gone.push(host.clone());
                 }
             } else {
                 gone_tracker.observe_reachable(host);
@@ -1703,7 +1704,8 @@ pub async fn orchestrate(
             String::new()
         } else {
             format!(
-                "unreachable peers whose names are not provably gone: {unproven_gone:?} — waiting for them (only an authoritative NXDOMAIN across the whole dwell can retire a peer)"
+                "Waiting for {} to be reachable on the private network.",
+                unproven_gone.join(", ")
             )
         };
         if last_unproven_gone_note != unproven_note {
@@ -1716,7 +1718,12 @@ pub async fn orchestrate(
             String::new()
         } else {
             format!(
-                "peers {never_member_holds:?} are gone past the dwell, but this node has never been a group member and holds no data of its own: not waiving them — a declared seed that never came up may hold the only copy of the data (an adopted volume whose deploy is failing); waiting for it"
+                "Waiting for {} to be reachable on the private network. This node has no data of its own yet, so it won't start a cluster without them.",
+                never_member_holds
+                    .iter()
+                    .map(|h| h.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         };
         if last_never_member_note != never_member_note {
@@ -1738,7 +1745,12 @@ pub async fn orchestrate(
             String::new()
         } else {
             format!(
-                "peers {waived:?} are deleted (name gone past the dwell); no longer waiting on them"
+                "{} are no longer on the private network. No longer waiting for them.",
+                waived
+                    .iter()
+                    .map(|h| h.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         };
         if last_waiver_note != waiver_note {
@@ -1915,9 +1927,9 @@ pub async fn orchestrate(
                                 .gtid_subtract(&my_gtid_now, &peer_gtid)
                                 .await
                                 .unwrap_or_else(|_| "unavailable".to_string());
-                            warn!(
+                            error!(
                                 %orphaned,
-                                "this node's history diverged from the live group; discarding the orphaned transactions and recloning"
+                                "This node's history diverged from the primary. Railway is rebuilding it from the primary, and the writes it had that the primary never received are discarded."
                             );
                             telemetry.send(TelemetryEvent::ComponentError {
                                 component: "mysql-wrapper".to_string(),
@@ -2392,7 +2404,7 @@ pub async fn orchestrate(
                 // failed to apply. Telemetry on the transition only.
                 let changed = wait_log_once(
                     &mut last_wait_reason,
-                    &format!("GTID history DIVERGED from peer {host} and did not auto-resolve; holding (unexpected — classify_round should have resolved this)"),
+                    &format!("This node's history diverged from {host}'s and wasn't resolved automatically. Holding without joining the cluster. If this persists, contact support."),
                 );
                 if changed {
                     telemetry.send(TelemetryEvent::ComponentError {

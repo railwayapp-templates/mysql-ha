@@ -351,7 +351,7 @@ pub async fn run_if_pending(
     let candidates = root_candidates(config);
     if candidates.is_empty() {
         let message = "finish-upgrade: a server upgrade may be unfinished, but no root password \
-                       is available to finish it with; booting normally";
+                       is available to finish it; starting the database anyway";
         error!(binary = %binary, reason, "{message}");
         report(telemetry, message.to_string());
         return PassOutcome::Continue;
@@ -363,20 +363,20 @@ pub async fn run_if_pending(
     ) {
         (Ok(term), Ok(int)) => Signals { term, int },
         (Err(e), _) | (_, Err(e)) => {
-            error!(error = %e, "finish-upgrade: could not install signal handlers; booting normally");
+            error!(error = %e, "finish-upgrade: could not install signal handlers; starting the database anyway");
             return PassOutcome::Continue;
         }
     };
 
-    info!(binary = %binary, served = ?served.map(|v| v.to_string()), reason, socket = PRIVATE_SOCKET, "finish-upgrade: minimal boot");
+    info!(binary = %binary, served = ?served.map(|v| v.to_string()), reason, socket = PRIVATE_SOCKET, "finish-upgrade: finishing an interrupted server upgrade before the database starts");
     process_manager::clear_stale_socket_locks(PRIVATE_SOCKET);
     let mut child = match process_manager::spawn_mysqld(&minimal_boot_args(args)).await {
         Ok(child) => child,
         Err(e) => {
-            error!(error = %e, "finish-upgrade: could not start the minimal boot; booting normally");
+            error!(error = %e, "finish-upgrade: could not start the server to finish the upgrade; starting the database anyway");
             report(
                 telemetry,
-                format!("could not start the minimal boot: {e:#}"),
+                format!("could not start the server to finish the upgrade: {e:#}"),
             );
             return PassOutcome::Continue;
         }
@@ -389,16 +389,16 @@ pub async fn run_if_pending(
         Ok(()) => {
             info!(
                 elapsed_seconds = started.elapsed().as_secs(),
-                "finish-upgrade: normal boot"
+                "finish-upgrade: server upgrade finished; starting the database"
             );
             PassOutcome::Continue
         }
         Err(DriveError::Signaled) => {
-            info!("finish-upgrade: stop requested during the minimal boot; it was shut down");
+            info!("finish-upgrade: stop requested; the server was shut down");
             PassOutcome::ShutdownRequested
         }
         Err(DriveError::Failed(e)) => {
-            error!(error = %format!("{e:#}"), "finish-upgrade: the pass failed; booting normally");
+            error!(error = %format!("{e:#}"), "finish-upgrade: the server upgrade did not finish; starting the database anyway");
             report(telemetry, format!("{e:#}"));
             PassOutcome::Continue
         }
@@ -502,8 +502,8 @@ async fn with_timeout<T>(
 
 async fn child_exited(child: &mut Child) -> anyhow::Error {
     match child.wait().await {
-        Ok(status) => anyhow!("the minimal boot exited on its own ({status})"),
-        Err(e) => anyhow!("waiting for the minimal boot: {e}"),
+        Ok(status) => anyhow!("the server exited on its own ({status})"),
+        Err(e) => anyhow!("waiting for the server: {e}"),
     }
 }
 
@@ -540,18 +540,18 @@ async fn drive(
         }
         if denied == candidates.len() {
             return Err(
-                anyhow!("the minimal boot refused every root password the wrapper holds").into(),
+                anyhow!("the server refused every known root password").into(),
             );
         }
         if started.elapsed() >= budget {
             return Err(
-                anyhow!("the minimal boot did not accept connections within {budget:?}").into(),
+                anyhow!("the server did not accept connections within {budget:?}").into(),
             );
         }
     };
     info!(
         elapsed_seconds = started.elapsed().as_secs(),
-        "finish-upgrade: minimal boot accepting connections"
+        "finish-upgrade: server accepting connections"
     );
 
     // Recovered transactions roll back in the background now that the server
@@ -656,9 +656,9 @@ async fn stop(child: &mut Child) {
         let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
     }
     match tokio::time::timeout(SHUTDOWN_LIMIT, child.wait()).await {
-        Ok(status) => info!(status = ?status.ok(), "finish-upgrade: minimal boot shut down"),
+        Ok(status) => info!(status = ?status.ok(), "finish-upgrade: server shut down"),
         Err(_) => {
-            warn!(limit = ?SHUTDOWN_LIMIT, "finish-upgrade: minimal boot did not shut down in time; killing it");
+            warn!(limit = ?SHUTDOWN_LIMIT, "finish-upgrade: the server did not shut down in time; killing it");
             let _ = child.kill().await;
             let _ = child.wait().await;
         }

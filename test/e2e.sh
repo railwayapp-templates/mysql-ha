@@ -774,7 +774,7 @@ t_adopted_root_refuses_a_group_that_formed_without_its_data() {
   node_logged mysql-1 "cloning instead of binlog recovery" \
     && bad "$t" "the adopted root cloned off the empty group — its data would be gone" \
     || ok "the adopted root never cloned off the empty group"
-  node_logged mysql-1 "discarding the orphaned transactions and recloning" \
+  node_logged mysql-1 "the writes it had that the primary never received are discarded" \
     && bad "$t" "the adopted root's data was treated as a stale fork" \
     || ok "the adopted root's data was not treated as a stale fork"
   [ "$(sql mysql-1 "SELECT v FROM railway.legacy WHERE id=1")" = "pre-conversion" ] \
@@ -1392,7 +1392,7 @@ t_password_variable_edit_does_not_rotate() {
     || { bad "post-drift write never replicated"; return; }
   ok "writes replicate after the drifted redeploy"
 
-  docker logs mysql-1 2>&1 | grep -q "MYSQL_ROOT_PASSWORD differs from the active root password" \
+  docker logs mysql-1 2>&1 | grep -q "The current password in MYSQL_ROOT_PASSWORD doesn't match the database's" \
     && ok "wrapper warned about the drifted variable" \
     || bad "no drift warning in the wrapper log"
 }
@@ -2206,8 +2206,8 @@ t_split_brain_fork_self_heals() {
     || bad "pre-fork data lost on a healed node"
 
   # And it was a genuine self-heal, logged as a discard — not a silent merge.
-  docker logs "$n1" 2>&1 | grep -q "discarding the orphaned transactions and recloning" \
-    || docker logs "$n2" 2>&1 | grep -q "discarding the orphaned transactions and recloning" \
+  docker logs "$n1" 2>&1 | grep -q "the writes it had that the primary never received are discarded" \
+    || docker logs "$n2" 2>&1 | grep -q "the writes it had that the primary never received are discarded" \
     && ok "a stale node logged the divergence self-heal (orphaned tail discarded, not merged)" \
     || bad "no divergence self-heal log line — convergence may have been a silent merge"
 
@@ -4261,10 +4261,10 @@ t_interrupted_server_upgrade_is_finished_on_boot() {
   start_standalone "$node"
   wait_standalone_sql_ready "$node" 480 \
     || { bad "wrapper never served after the interrupted upgrade"; dump_node_log "$node"; return; }
-  node_logged "$node" "finish-upgrade: minimal boot" \
+  node_logged "$node" "finish-upgrade: finishing an interrupted server upgrade" \
     && ok "the wrapper ran the finish-upgrade pass" \
     || bad "the wrapper did not run the finish-upgrade pass"
-  node_logged "$node" "finish-upgrade: normal boot" \
+  node_logged "$node" "finish-upgrade: server upgrade finished; starting the database" \
     && ok "the pass completed and handed over to the normal boot" \
     || { bad "the pass did not complete"; dump_node_log "$node"; }
   docker logs "$node" 2>&1 | grep -q "MY-013381.*completed" \
@@ -4283,9 +4283,9 @@ t_interrupted_server_upgrade_is_finished_on_boot() {
   docker restart -t 60 "$node" >/dev/null
   wait_standalone_sql_ready "$node" 240 \
     || { bad "healthy restart after the recovery never served"; dump_node_log "$node"; return; }
-  # One pass logs several "finish-upgrade: minimal boot …" lines; count the
-  # line that starts one.
-  local passes; passes="$(docker logs "$node" 2>&1 | grep -c '"message":"finish-upgrade: minimal boot",')"
+  # One pass logs several "finish-upgrade: …" lines; count the one that
+  # starts a pass.
+  local passes; passes="$(docker logs "$node" 2>&1 | grep -c '"message":"finish-upgrade: finishing an interrupted server upgrade before the database starts",')"
   [ "$passes" = 1 ] \
     && ok "a healthy restart does not run the pass again" \
     || { bad "the pass ran $passes times across a healthy restart"; dump_node_log "$node"; }
