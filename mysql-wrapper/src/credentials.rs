@@ -1,5 +1,9 @@
 //! The platform orders these idempotent phases across the cluster.
-use crate::{health_server::AppState, password_pin, sql::RootPasswordProbe};
+use crate::{
+    health_server::AppState,
+    password_pin,
+    sql::{MemberRow, RootPasswordProbe},
+};
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -31,6 +35,16 @@ enum Operation {
     Member,
     Finalize,
     Verify,
+}
+
+/// The group as Group Replication reports it: every member it still lists
+/// is ONLINE. A member whose service was deleted leaves the group on its own,
+/// so a cluster running with one member fewer rotates on the members it has;
+/// a member RECOVERING, UNREACHABLE or in ERROR is still waited on. Nothing
+/// is required of the count: how many members a rotation needs is the
+/// coordinator's call.
+fn group_healthy(members: &[MemberRow]) -> bool {
+    !members.is_empty() && members.iter().all(|m| m.state == "ONLINE")
 }
 
 pub async fn rotate(
@@ -82,9 +96,8 @@ async fn apply(state: &AppState, mut request: Rotation) -> anyhow::Result<Value>
                 ),
                 "current password refused"
             );
-            let members = state.sql.group_members().await?;
             anyhow::ensure!(
-                members.len() >= 3 && members.iter().all(|m| m.state == "ONLINE"),
+                group_healthy(&state.sql.group_members().await?),
                 "group not healthy"
             );
         }
@@ -156,9 +169,8 @@ async fn apply(state: &AppState, mut request: Rotation) -> anyhow::Result<Value>
             state.sql.finalize_cluster_password().await?;
         }
         Operation::Verify => {
-            let members = state.sql.group_members().await?;
             anyhow::ensure!(
-                members.len() >= 3 && members.iter().all(|m| m.state == "ONLINE"),
+                group_healthy(&state.sql.group_members().await?),
                 "group not healthy"
             );
             if request.current_password != request.new_password {
@@ -242,6 +254,38 @@ mod tests {
     use super::*;
     use crate::{archiver::PitrStatus, sql::Sql};
     use std::sync::atomic::AtomicBool;
+
+    fn member(host: &str, state: &str) -> MemberRow {
+        MemberRow {
+            member_id: host.to_string(),
+            host: host.to_string(),
+            state: state.to_string(),
+            role: "SECONDARY".to_string(),
+        }
+    }
+
+    #[test]
+    fn group_health_is_every_listed_member_online_whatever_the_count() {
+        // A deleted member left the group: two ONLINE members rotate.
+        assert!(group_healthy(&[
+            member("a", "ONLINE"),
+            member("b", "ONLINE")
+        ]));
+        // A lone member is still a group.
+        assert!(group_healthy(&[member("a", "ONLINE")]));
+        // A member still listed but not ONLINE is waited on, at any size.
+        assert!(!group_healthy(&[
+            member("a", "ONLINE"),
+            member("b", "ONLINE"),
+            member("c", "RECOVERING")
+        ]));
+        assert!(!group_healthy(&[
+            member("a", "ONLINE"),
+            member("b", "UNREACHABLE")
+        ]));
+        // Not in a group at all.
+        assert!(!group_healthy(&[]));
+    }
 
     // Uses an isolated server created by test/password-rotation-local.py.
     #[tokio::test]
