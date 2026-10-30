@@ -3333,6 +3333,100 @@ t_pitr_archive_and_restore_to_point_in_time() {
   docker volume rm mysql-ha-e2e-vol-mysql-pitr-src mysql-ha-e2e-vol-mysql-pitr-restore mysql-ha-e2e-vol-mysql-pitr-crash mysql-ha-e2e-vol-mysql-pitr-rotated mysql-ha-e2e-minio-data >/dev/null 2>&1
 }
 
+# Account statements replay against the accounts the full backup carried.
+# mysqldump writes the grant tables as plain rows with no FLUSH PRIVILEGES, so
+# a restore that replays right after loading them runs every ALTER USER /
+# GRANT against the accounts the fork's empty datadir was initialised with.
+# An HA password rotation binlogs `ALTER USER 'gr_recovery'@'%' ... RETAIN
+# CURRENT PASSWORD` (plus root and the app user), and every HA restore that
+# replayed across it failed with ERROR 1396 — the fork never had gr_recovery
+# (production e2e, 2026-10-30). This replays the same statement shape on a
+# standalone: the accounts exist only in the full, the rotation and its
+# DISCARD OLD PASSWORD only in the binlogs, root rotated too, and the fork
+# deployed with the rotated root password the way the platform deploys it.
+t_pitr_restore_replays_account_statements_on_the_dumped_accounts() {
+  log "t_pitr_restore_replays_account_statements_on_the_dumped_accounts (a rotation in the binlogs replays onto the full's accounts)"
+  local src=mysql-pitr-acct-src fork=mysql-pitr-acct-fork prefix=e2e-pitr-acct
+  docker rm -f "$src" "$fork" mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm "mysql-ha-e2e-vol-$src" "mysql-ha-e2e-vol-$fork" mysql-ha-e2e-minio-data >/dev/null 2>&1
+
+  start_minio || { bad "minio never became healthy"; return; }
+  start_standalone "$src" \
+    -e "BINLOG_ARCHIVE_BUCKET=$PITR_BUCKET" \
+    -e "BINLOG_ARCHIVE_KEY=$MINIO_ROOT_USER" \
+    -e "BINLOG_ARCHIVE_SECRET=$MINIO_ROOT_PASSWORD" \
+    -e "BINLOG_ARCHIVE_REGION=us-east-1" \
+    -e "BINLOG_ARCHIVE_ENDPOINT=http://mysql-ha-e2e-minio:9000" \
+    -e "BINLOG_ARCHIVE_PATH=/$prefix" \
+    -e "BINLOG_FULL_BACKUP_INTERVAL_SECONDS=86400" \
+    -e "HEALTH_API_PASSWORD=$API_PW"
+  wait_standalone_sql_ready "$src" 120 \
+    || { bad "PITR source node never became healthy"; return; }
+  wait_until 120 "initial full backup completed" \
+    bash -c 'docker logs '"$src"' 2>&1 | grep -q "initial full backup completed"' \
+    || { bad "initial full backup never completed"; docker logs "$src" 2>&1 | tail -40; return; }
+
+  # The accounts exist before the full the restore will load, so they reach
+  # the fork only as the dump's mysql.user rows.
+  sql "$src" "CREATE USER 'gr_recovery'@'%' IDENTIFIED BY 'acct-old'; CREATE USER 'app_rot'@'%' IDENTIFIED BY 'acct-old'; GRANT SELECT ON *.* TO 'app_rot'@'%'; CREATE DATABASE t; CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'in-the-full');" \
+    || { bad "could not create the accounts on the source"; return; }
+  [ "$(http_code "$src" "http://localhost:8080/pitr/full-backup" --post-data="" --header="$(basic_auth_header railway "$API_PW")")" = "202" ] \
+    || { bad "the full-backup trigger was not accepted"; return; }
+  two_acct_fulls() { [ "$(mc_count_matching "$prefix/" .meta.json)" -ge 2 ]; }
+  wait_until 180 "the full carrying the accounts lands" two_acct_fulls \
+    || { bad "the second full never landed"; docker logs "$src" 2>&1 | tail -40; return; }
+  ok "a full backup carries gr_recovery and app_rot"
+  sleep 2
+
+  # The coordinated rotation's two statements, as the HA primary binlogs them.
+  local new_root="rotated-root-$RANDOM$RANDOM"
+  sql "$src" "ALTER USER 'app_rot'@'%' IDENTIFIED BY 'acct-new' RETAIN CURRENT PASSWORD, 'gr_recovery'@'%' IDENTIFIED BY 'acct-new' RETAIN CURRENT PASSWORD, 'root'@'%' IDENTIFIED BY '$new_root' RETAIN CURRENT PASSWORD, 'root'@'localhost' IDENTIFIED BY '$new_root' RETAIN CURRENT PASSWORD;" \
+    || { bad "the rotation's ALTER USER failed on the source"; return; }
+  ROOT_PW="$new_root" sql "$src" "ALTER USER 'app_rot'@'%' DISCARD OLD PASSWORD, 'gr_recovery'@'%' DISCARD OLD PASSWORD, 'root'@'%' DISCARD OLD PASSWORD, 'root'@'localhost' DISCARD OLD PASSWORD; INSERT INTO t.kv VALUES (2,'after-the-rotation');" \
+    || { bad "the rotation's DISCARD OLD PASSWORD failed on the source"; return; }
+  local uploads
+  uploads="$(docker logs "$src" 2>&1 | grep -c "binlog uploaded")"
+  sleep 2
+  local target
+  target="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+  sleep 2
+  ROOT_PW="$new_root" sql "$src" "FLUSH BINARY LOGS;"
+  wait_until 60 "the rotation's binlog shipped" \
+    bash -c '[ "$(docker logs '"$src"' 2>&1 | grep -c "binlog uploaded")" -gt '"$uploads"' ]' \
+    || { bad "the rotation's binlog was never shipped"; docker logs "$src" 2>&1 | tail -40; return; }
+  ok "the rotation is in the shipped binlogs, after the full"
+
+  ROOT_PW="$new_root" start_standalone "$fork" \
+    -e "BINLOG_RECOVER_FROM_BUCKET=$PITR_BUCKET" \
+    -e "BINLOG_RECOVER_FROM_KEY=$MINIO_ROOT_USER" \
+    -e "BINLOG_RECOVER_FROM_SECRET=$MINIO_ROOT_PASSWORD" \
+    -e "BINLOG_RECOVER_FROM_REGION=us-east-1" \
+    -e "BINLOG_RECOVER_FROM_ENDPOINT=http://mysql-ha-e2e-minio:9000" \
+    -e "BINLOG_RECOVER_FROM_PATH=/$prefix" \
+    -e "MYSQL_RECOVERY_TARGET_TIME=$target"
+  if ! wait_until 180 "restore across the rotation completed and serving" \
+    bash -c 'docker exec '"$fork"' wget -q -O /dev/null http://localhost:8080/health 2>/dev/null'; then
+    bad "the restore across the rotation never served: $(docker logs "$fork" 2>&1 | grep -o 'ERROR 1396[^"]*' | head -1)"
+    docker logs "$fork" 2>&1 | tail -40
+    return
+  fi
+  docker logs "$fork" 2>&1 | grep -q "ERROR 1396" \
+    && bad "the replay hit ERROR 1396 on an account the full carried" \
+    || ok "the rotation's ALTER USER replayed onto the full's accounts"
+  [ "$(ROOT_PW="$new_root" sql "$fork" "SELECT v FROM t.kv WHERE k=2")" = "after-the-rotation" ] \
+    && ok "the write after the rotation is restored" \
+    || bad "the write after the rotation is missing on the fork"
+  docker exec "$fork" mysql -h 127.0.0.1 -uapp_rot -pacct-new --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=1" 2>/dev/null | grep -q "in-the-full" \
+    && ok "app_rot authenticates with the rotated password and keeps its grant" \
+    || bad "app_rot does not authenticate with the rotated password on the fork"
+  docker exec "$fork" mysql -h 127.0.0.1 -uapp_rot -pacct-old -e "SELECT 1" >/dev/null 2>&1 \
+    && bad "app_rot still takes the discarded password on the fork" \
+    || ok "the discarded password is refused on the fork, as on the source"
+
+  docker rm -f "$src" "$fork" mysql-ha-e2e-minio >/dev/null 2>&1
+  docker volume rm "mysql-ha-e2e-vol-$src" "mysql-ha-e2e-vol-$fork" mysql-ha-e2e-minio-data >/dev/null 2>&1
+}
+
 # Retention: the archive must be expired on its horizon WITHOUT ever becoming
 # unrestorable. Both halves matter, because deleting too much is irreversible.
 #
@@ -5552,6 +5646,7 @@ ALL_TESTS=(
   t_stuck_error_member_self_heals
   t_no_quorum_no_wipe
   t_pitr_archive_and_restore_to_point_in_time
+  t_pitr_restore_replays_account_statements_on_the_dumped_accounts
   t_pitr_full_backup_endpoint_wakes_the_archiver
   t_pitr_full_backup_holds_ddl_and_stays_consistent
   t_pitr_restore_keeps_scheduled_events_quiet_during_replay

@@ -827,8 +827,9 @@ impl Sql {
     }
 
     /// Make MYSQL_ROOT_PASSWORD the password of every `root@<host>` account
-    /// the grant tables carry. Called on the restore-phase server after a
-    /// point-in-time restore: the dump brought the SOURCE's `mysql.user` as
+    /// the grant tables carry. Called on the restore-phase server once the
+    /// full backup is loaded, before each lineage's binlog replay, and after
+    /// the replay: the dump brought the SOURCE's `mysql.user` as
     /// of the target time, root included, and those rows go live the moment
     /// privileges are reloaded — while the wrapper, the health server and
     /// the platform's connection URL all hold this service's own variable.
