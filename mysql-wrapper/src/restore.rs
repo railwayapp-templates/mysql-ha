@@ -633,6 +633,19 @@ pub async fn run(config: &Config, started: std::time::Instant, attempt: u32) -> 
         .await
         .context("loading the full backup")?;
     info!("full backup loaded");
+    // The dump's grant tables are rows, not live accounts: mysqldump writes
+    // mysql.user and the other privilege tables as plain INSERTs and no FLUSH
+    // PRIVILEGES, so until privileges are reloaded the server still enforces
+    // the accounts docker-entrypoint created on the empty datadir. An account
+    // statement the binlogs replay must find the accounts the source had at
+    // the full: an HA password rotation's `ALTER USER 'gr_recovery'@'%' ...`
+    // failed the replay with ERROR 1396 because the freshly-initialised
+    // server never had that account (2026-10-30). Load them now, with root
+    // back on MYSQL_ROOT_PASSWORD so the replay client still authenticates.
+    sql.set_root_password_everywhere(&config.mysql_root_password)
+        .await
+        .context("loading the dumped accounts before the binlog replay")?;
+    info!("the full backup's accounts are live for the binlog replay");
 
     let achieved = if shared_history {
         replay_shared_history(&s3, &location, &fulls, &full, target, config, &sql).await
@@ -1276,6 +1289,18 @@ async fn replay_shared_history(
                 }
                 local_paths.push(local);
             }
+            // Each lineage replays through a client that logs in as root with
+            // MYSQL_ROOT_PASSWORD, and the lineage before it may have replayed
+            // a rotation of root's password (`ALTER USER ... DISCARD OLD
+            // PASSWORD`). The control connection is already authenticated.
+            sql.set_root_password_everywhere(&config.mysql_root_password)
+                .await
+                .with_context(|| {
+                    format!(
+                        "keeping root on MYSQL_ROOT_PASSWORD before replaying lineage {}",
+                        run.server_uuid
+                    )
+                })?;
             info!(
                 lineage = %run.server_uuid,
                 files = ?run.files,
