@@ -668,10 +668,21 @@ pub(crate) fn membership_fence_wanted(
 /// the survivor's election, and that gap is a real writable window on a
 /// node that must not take writes — the poll interval is its upper bound.
 const MAJORITY_WATCH_POLL: Duration = Duration::from_secs(2);
-/// Consecutive Force verdicts required before acting — the proof must hold
-/// continuously (~30s at the poll interval), so a member observed
-/// mid-rejoin never triggers a force.
-const FORCE_DWELL_ROUNDS: u32 = 15;
+/// How long the Force verdict must hold, continuously, before acting — so a
+/// member observed mid-rejoin never triggers a force. Measured by the wall
+/// clock, not in rounds: a round is not the poll interval when the fence
+/// SET above blocks behind quorum-blocked transactions (up to
+/// FENCE_STATEMENT_TIMEOUT, 90s, every round), and 15 such rounds kept a
+/// lone survivor from re-forming for over twenty minutes while its two
+/// returning peers hammered a view nobody could join (live, 2026-11-11).
+const FORCE_DWELL: Duration = Duration::from_secs(30);
+
+/// The dwell bookkeeping: `since` is when the Force verdict started holding
+/// (None = it does not hold). Returns true once it has held for `dwell`.
+fn force_dwell_elapsed(since: &mut Option<Instant>, now: Instant, dwell: Duration) -> bool {
+    let started = *since.get_or_insert(now);
+    now.duration_since(started) >= dwell
+}
 /// Lifetime cap on forced reconfigurations: a flapping network must not turn
 /// this into a view chainsaw. Past the cap the node stays fenced and logs
 /// the manual escape hatch.
@@ -704,7 +715,7 @@ pub async fn majority_watch(
             None => (0, true),
         };
     let mut seed_gone = GoneTracker::new();
-    let mut consecutive_force = 0u32;
+    let mut force_since: Option<Instant> = None;
     let mut attempts = 0u32;
     let mut last_hold = String::new();
     let mut last_fence_note = String::new();
@@ -715,14 +726,14 @@ pub async fn majority_watch(
         let members = match sql.group_members().await {
             Ok(members) => members,
             Err(_) => {
-                consecutive_force = 0;
+                force_since = None;
                 continue;
             }
         };
         let self_uuid = match sql.server_uuid().await {
             Ok(uuid) => uuid,
             Err(_) => {
-                consecutive_force = 0;
+                force_since = None;
                 continue;
             }
         };
@@ -732,7 +743,7 @@ pub async fn majority_watch(
             .iter()
             .any(|m| m.member_id.eq_ignore_ascii_case(&self_uuid) && m.state == "ONLINE");
         if !me_online {
-            consecutive_force = 0;
+            force_since = None;
             continue;
         }
         // This node is ONLINE in the group: it has standing to waive a gone
@@ -843,7 +854,7 @@ pub async fn majority_watch(
 
         let reachable = members.iter().filter(|m| m.state != "UNREACHABLE").count();
         if reachable * 2 > members.len() {
-            consecutive_force = 0;
+            force_since = None;
             last_hold.clear();
             continue;
         }
@@ -867,18 +878,18 @@ pub async fn majority_watch(
 
         match majority_loss_recovery_verdict(group_name.as_deref(), &members, &answers) {
             MajorityVerdict::Healthy => {
-                consecutive_force = 0;
+                force_since = None;
             }
             MajorityVerdict::Hold(reason) => {
-                consecutive_force = 0;
+                force_since = None;
                 wait_log_once(&mut last_hold, &reason);
             }
             MajorityVerdict::Force => {
-                consecutive_force += 1;
-                if consecutive_force < FORCE_DWELL_ROUNDS {
+                let now = Instant::now();
+                if !force_dwell_elapsed(&mut force_since, now, FORCE_DWELL) {
                     info!(
-                        round = consecutive_force,
-                        needed = FORCE_DWELL_ROUNDS,
+                        held_secs = now.duration_since(force_since.unwrap_or(now)).as_secs(),
+                        needed_secs = FORCE_DWELL.as_secs(),
                         "every missing member is provably departed; dwelling before forcing the view"
                     );
                     continue;
@@ -892,7 +903,7 @@ pub async fn majority_watch(
                 let mine = match sql.executed_gtid_set().await {
                     Ok(set) => set,
                     Err(_) => {
-                        consecutive_force = 0;
+                        force_since = None;
                         continue;
                     }
                 };
@@ -927,7 +938,7 @@ pub async fn majority_watch(
                         error: reason,
                         context: "majority_loss_recovery".to_string(),
                     });
-                    consecutive_force = 0;
+                    force_since = None;
                     continue;
                 }
 
@@ -962,7 +973,7 @@ pub async fn majority_watch(
                         error: e.to_string(),
                         context: "majority_loss_recovery".to_string(),
                     });
-                    consecutive_force = 0;
+                    force_since = None;
                     continue;
                 }
                 match sql.bootstrap_group().await {
@@ -1002,7 +1013,7 @@ pub async fn majority_watch(
                         let _ = sql.shutdown_server().await;
                     }
                 }
-                consecutive_force = 0;
+                force_since = None;
                 last_hold.clear();
             }
         }
@@ -3765,5 +3776,35 @@ pub(crate) mod tests {
             Some("ERROR"),
             &[member("a", "mysql-1", "ERROR", "")]
         ));
+    }
+
+    #[test]
+    fn force_dwell_is_measured_by_the_wall_clock_not_in_rounds() {
+        let t0 = Instant::now();
+        let dwell = Duration::from_secs(30);
+        let mut since = None;
+        // First round starts the clock and does not act.
+        assert!(!force_dwell_elapsed(&mut since, t0, dwell));
+        assert_eq!(since, Some(t0));
+        // Three rounds stretched to 90s each by a blocked fence SET: the
+        // dwell is over after the first stretched round, not after fifteen.
+        assert!(!force_dwell_elapsed(
+            &mut since,
+            t0 + Duration::from_secs(2),
+            dwell
+        ));
+        assert!(force_dwell_elapsed(
+            &mut since,
+            t0 + Duration::from_secs(92),
+            dwell
+        ));
+        // A verdict that stopped holding resets the clock (the caller sets None).
+        since = None;
+        assert!(!force_dwell_elapsed(
+            &mut since,
+            t0 + Duration::from_secs(200),
+            dwell
+        ));
+        assert_eq!(since, Some(t0 + Duration::from_secs(200)));
     }
 }
