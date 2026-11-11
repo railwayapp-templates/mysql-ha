@@ -1740,6 +1740,82 @@ t_graceful_double_stop_reforms() {
   ok "graceful double stop: fence held alone, group self-reformed, data intact"
 }
 
+# The live shape of 2026-11-11 (e2e project, mysql-ha lane): the survivor
+# is the PRIMARY when the majority falls (a redeploy's demote-on-shutdown
+# handed primacy over, then the old primary went down hard), so its
+# super_read_only is OFF and a client write does not get refused — it hangs
+# in certification, quorum-blocked. The membership fence's SET
+# super_read_only then blocks behind that transaction (90s, every round),
+# and a dwell counted in rounds stretched from 30s to over twenty minutes
+# while both peers returned and hammered a view nobody could join. The
+# dwell is wall-clock now; the group must re-form within the same budget
+# as the scenario above, hung writer or not.
+t_double_stop_reforms_under_quorum_blocked_writes() {
+  log "t_double_stop_reforms_under_quorum_blocked_writes (survivor is primary, a client write hangs, group still self-reforms)"
+  teardown_trio
+  start_trio
+
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 || { bad "group never formed"; return; }
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" \
+    || { bad "no primary to start from"; return; }
+  local victim survivor
+  case "$primary" in
+    mysql-1) victim=mysql-2; survivor=mysql-3 ;;
+    mysql-2) victim=mysql-1; survivor=mysql-3 ;;
+    *)       victim=mysql-1; survivor=mysql-2 ;;
+  esac
+  sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (50,'pre-double-stop') ON DUPLICATE KEY UPDATE v='pre-double-stop';" \
+    || { bad "pre-double-stop write failed on $primary"; return; }
+
+  # The secondary leaves cleanly first (2-member view), then primacy is handed
+  # to the survivor the way a redeploy's demote-on-shutdown does, and the old
+  # primary goes down hard: the survivor is a writable primary in a view
+  # whose other member is UNREACHABLE.
+  docker stop -t 60 "$victim" >/dev/null
+  wait_until 120 "victim's departure settles to a 2-member view" \
+    bash -c '[ "$(docker exec '"$survivor"' mysql -uroot -p'"$ROOT_PW"' --batch --skip-column-names -e "SELECT COUNT(*) FROM performance_schema.replication_group_members" 2>/dev/null)" = 2 ]' \
+    || { bad "quorum-blocked: victim was never expelled from the view"; return; }
+  local survivor_uuid
+  survivor_uuid="$(sql "$survivor" "SELECT @@server_uuid")"
+  sql "$primary" "SELECT group_replication_set_as_primary('$survivor_uuid')" >/dev/null \
+    || { bad "quorum-blocked: could not hand primacy to $survivor"; return; }
+  wait_until 60 "$survivor is the primary" \
+    bash -c 'docker exec '"$survivor"' wget -q -O /dev/null http://localhost:8080/role 2>/dev/null' \
+    || { bad "quorum-blocked: $survivor never became primary after the handoff"; return; }
+  docker kill "$primary" >/dev/null
+  log "primary handed to $survivor, then $primary killed hard — a client write now hangs quorum-blocked"
+
+  # The write that the live run's probes made: it must not land, and it must
+  # not keep the fence from engaging or the group from re-forming.
+  docker exec -d "$survivor" mysql -uroot -p"$ROOT_PW" -e "INSERT INTO t.kv VALUES (51,'must-not-land')"
+  wait_until 120 "survivor fences itself (/role 503) with a quorum-blocked write in flight" \
+    bash -c '! docker exec '"$survivor"' wget -q -O /dev/null http://localhost:8080/role 2>/dev/null' \
+    || { bad "quorum-blocked: survivor kept answering /role 200 alone"; return; }
+  ok "survivor fenced with a quorum-blocked write in flight"
+
+  docker start "$victim" "$primary" >/dev/null
+  wait_until 420 "group self-reforms to 3 ONLINE with a quorum-blocked write in flight" group_is_fully_online "$survivor" \
+    || { bad "quorum-blocked: group never reformed after both members returned (the dwell stretched by the blocked fence SET)"; return; }
+  docker logs "$survivor" 2>&1 | grep -q "re-forming the group from this lone survivor" \
+    && ok "survivor's majority-loss recovery forced the blocked view down within budget" \
+    || bad "group reformed but not through majority_watch (no force log line)"
+
+  writable_primary_appears() { current_primary "$survivor" mysql-1 mysql-2 mysql-3 >/dev/null; }
+  wait_until 90 "a writable primary after the fence lifts" writable_primary_appears \
+    || { bad "quorum-blocked: no writable primary after reform"; return; }
+  local new_primary
+  new_primary="$(current_primary "$survivor" mysql-1 mysql-2 mysql-3)"
+  [ "$(sql "$new_primary" "SELECT v FROM t.kv WHERE k=50")" = "pre-double-stop" ] \
+    || { bad "quorum-blocked: pre-failure row lost across the reform"; return; }
+  [ -z "$(sql "$new_primary" "SELECT v FROM t.kv WHERE k=51")" ] \
+    && ok "the quorum-blocked write never landed" \
+    || bad "quorum-blocked: the write that hung without a majority landed after the reform"
+  sql "$new_primary" "INSERT INTO t.kv VALUES (52,'post-reform') ON DUPLICATE KEY UPDATE v='post-reform';" \
+    || { bad "quorum-blocked: post-reform write failed on $new_primary"; return; }
+  ok "double stop under a quorum-blocked write: fence held, group self-reformed, data intact"
+}
+
 # The clean-leave sibling of the scenario above (issue #33): both departures
 # get a FULL stop grace, so mysqld completes each Group Replication leave
 # handshake and the view legitimately shrinks 3 -> 2 -> 1. Without the
@@ -5634,6 +5710,7 @@ ALL_TESTS=(
   t_revert_to_standalone_drops_recovery_user
   t_sigterm_primary_demotes_before_exit
   t_graceful_double_stop_reforms
+  t_double_stop_reforms_under_quorum_blocked_writes
   t_clean_double_stop_keeps_fence
   t_deleted_peer_unfences_bootstrap
   t_paused_peer_keeps_the_fence
