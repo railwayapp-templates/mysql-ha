@@ -1050,6 +1050,8 @@ t_fresh_restarted_node_joins_formed_group() {
   else
     bad "$t" "mysql-3 never joined the group (state: '$(sql mysql-3 "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@GLOBAL.server_uuid")')"
     docker logs mysql-3 2>&1 | grep -F "$REFUSE_LINE" | tail -2
+    log "group as seen by mysql-1: $(group_fingerprint mysql-1) / by mysql-3: $(group_fingerprint mysql-3)"
+    dump_node_log mysql-3 | tail -60
   fi
   node_logged mysql-3 "$REFUSE_LINE" \
     && bad "$t" "mysql-3 refused to join as if its empty volume held adopted data: $(docker logs mysql-3 2>&1 | grep -F "$REFUSE_LINE" | tail -1 | cut -c1-200)" \
