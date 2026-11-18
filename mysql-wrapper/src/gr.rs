@@ -84,6 +84,7 @@ pub const RECOVERY_USER: &str = "gr_recovery";
 const GROUP_NAME_MARKER: &str = ".railway_gr_group_name";
 const PRE_GTID_DATA_MARKER: &str = ".railway_pre_gtid_data";
 const WAIVER_GENERATION_MARKER: &str = ".railway_gr_waiver_generation";
+const BORN_EMPTY_MARKER: &str = ".railway_born_empty";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Bounded retries for the standalone recovery-account cleanup
 /// (`retire_recovery_user`): 5 s apart, so a pool the password resolver is
@@ -272,6 +273,22 @@ fn persist_atomically(path: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("writing {}", tmp.display()))?;
     drop(file);
     std::fs::rename(&tmp, path).with_context(|| format!("renaming {} into place", path.display()))
+}
+
+/// Record that this instance was initialized by this image on an empty
+/// volume. Written on the initializing boot, before its init GTID history is
+/// reset: from that reset on, "data present, GTID set empty" is true of this
+/// node too, and without the record a restart before it joins a group would
+/// read its own empty dataset as an adopted volume.
+pub(crate) fn record_born_empty(data_dir: &str) -> Result<()> {
+    persist_atomically(&Path::new(data_dir).join(BORN_EMPTY_MARKER), "1\n")
+}
+
+/// Was this instance initialized by this image on an empty volume? Such a
+/// node has had GTIDs on since its first transaction, so it can never hold
+/// data that predates its GTID history.
+pub fn was_born_empty(data_dir: &str) -> bool {
+    Path::new(data_dir).join(BORN_EMPTY_MARKER).exists()
 }
 
 /// Does this node hold data that predates its GTID history? True for an
@@ -1345,6 +1362,14 @@ pub async fn orchestrate(
     //     they wedge both the bootstrap guard and Group Replication joins).
     //     Must happen before the write fence — RESET needs a writable server.
     if fresh_datadir {
+        if let Err(e) = record_born_empty(&config.data_dir) {
+            error!(error = %e, "could not record that this instance was initialized empty");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "mysql-wrapper".to_string(),
+                error: format!("{e:#}"),
+                context: "record_born_empty".to_string(),
+            });
+        }
         match sql.reset_fresh_instance_gtid_history().await {
             Ok(()) => info!("fresh instance: local init GTID history reset"),
             Err(e) => {
@@ -1359,10 +1384,12 @@ pub async fn orchestrate(
         // Fresh identity is settled even if the GTID reset failed — peers
         // may observe /gr/state. Do not leave the gate closed forever.
         adoption_checked.store(true, std::sync::atomic::Ordering::Release);
-    } else if !has_pre_gtid_data(&config.data_dir) {
+    } else if !has_pre_gtid_data(&config.data_dir) && !was_born_empty(&config.data_dir) {
         // Adoption detection: a NON-fresh datadir with an EMPTY GTID set is
         // pre-existing data that was never binlogged — an adopted standalone
-        // volume (Railway's standalone template runs --disable-log-bin).
+        // volume (Railway's standalone template runs --disable-log-bin). A
+        // node this image initialized empty is excluded: its GTID set is
+        // empty because the fresh-instance reset above emptied it.
         // Persist the fact now: once the group starts minting GTIDs the
         // condition becomes unobservable, and joiners need it forever to
         // know that binlog-based recovery can never reconstruct this node's
@@ -3293,6 +3320,19 @@ pub(crate) mod tests {
         let a = diverged_peer_wins(1, 0, 1, 1);
         let b = diverged_peer_wins(1, 1, 1, 0);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_node_initialized_empty_is_recorded_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        // An adopted standalone volume never gets the record: nothing says
+        // this image initialized it.
+        assert!(!was_born_empty(data_dir));
+        record_born_empty(data_dir).unwrap();
+        assert!(was_born_empty(data_dir));
+        // The record says nothing about adopted data either way.
+        assert!(!has_pre_gtid_data(data_dir));
     }
 
     #[test]
