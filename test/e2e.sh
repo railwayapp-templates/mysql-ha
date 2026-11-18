@@ -786,6 +786,279 @@ t_adopted_root_refuses_a_group_that_formed_without_its_data() {
   teardown_trio
 }
 
+# ---------------------------------------------------------------------------
+# Fresh-cluster start ordering. Every volume is empty, so no node holds data
+# of its own: whatever order the platform happens to start them in, the trio
+# must form exactly ONE group, the declared first seed (mysql-1, seed rank 0)
+# must be the one that bootstraps it, and no node may come out of it carrying
+# the adopted-volume marker — that marker means "this volume holds base data
+# that predates any GTID history", and a fresh node never held any.
+
+FRESH_RESET_LINE="fresh instance: local init GTID history reset"
+BOOTSTRAP_LINE="bootstrapping a new group"
+ADOPTED_LINE="adopted volume detected (data present, no GTID history)"
+REFUSE_LINE="refusing to join"
+PRE_GTID_MARKER="/var/lib/mysql/.railway_pre_gtid_data"
+
+# log_count <node> <needle> — how many log lines of the container (every
+# boot of it) hold <needle>.
+log_count() { docker logs "$1" 2>&1 | grep -cF -- "$2"; }
+
+# boots_answering <node> <n> — wait_until predicate: the wrapper has seen
+# mysqld answer at least <n> times, i.e. the n-th boot reached orchestration.
+boots_answering() { [ "$(log_count "$1" "mysqld is answering")" -ge "$2" ]; }
+
+# has_pre_gtid_marker <node> — the adopted-volume marker is on the volume.
+has_pre_gtid_marker() { docker exec "$1" test -e "$PRE_GTID_MARKER" 2>/dev/null; }
+
+# bootstrapped_nodes <node>... — the nodes whose log says they bootstrapped a
+# group, space-separated.
+bootstrapped_nodes() {
+  local out="" n
+  for n in "$@"; do node_logged "$n" "$BOOTSTRAP_LINE" && out="${out:+$out }$n"; done
+  printf '%s' "$out"
+}
+
+# group_fingerprint <node> — group name | ONLINE member uuids | this member's
+# view id, as the node itself sees it. Identical on every node of one group.
+group_fingerprint() {
+  sql "$1" "SELECT CONCAT_WS('|', @@GLOBAL.group_replication_group_name,
+      (SELECT GROUP_CONCAT(MEMBER_ID ORDER BY MEMBER_ID) FROM performance_schema.replication_group_members WHERE MEMBER_STATE='ONLINE'),
+      (SELECT VIEW_ID FROM performance_schema.replication_group_member_stats WHERE MEMBER_ID=@@GLOBAL.server_uuid))"
+}
+
+# one_group_of_three <node>... — wait_until predicate: every node counts 3
+# ONLINE members and all of them report the same group, membership and view.
+one_group_of_three() {
+  local first="" n fp
+  for n in "$@"; do
+    has_n_online "$n" 3 || return 1
+    fp="$(group_fingerprint "$n")"
+    [ -n "$fp" ] || return 1
+    [ -z "$first" ] && first="$fp"
+    [ "$fp" = "$first" ] || return 1
+  done
+}
+
+# all_three_online — wait_until predicate: mysql-1, mysql-2 and mysql-3 each
+# count 3 ONLINE members.
+all_three_online() {
+  local n
+  for n in mysql-1 mysql-2 mysql-3; do has_n_online "$n" 3 || return 1; done
+}
+
+# row_on <node> <k> <v> — wait_until predicate: t.kv[k] = v on that node.
+row_on() { [ "$(sql "$1" "SELECT v FROM t.kv WHERE k=$2")" = "$3" ]; }
+
+# assert_fresh_trio_converges <t> <want-bootstrapper> — the shared end state
+# of every fresh start-order scenario: one group, three ONLINE, one primary,
+# exactly <want-bootstrapper> bootstrapped, a write reaches every node, and
+# no node carries the adopted-volume marker. Returns 1 when the group never
+# formed (the caller tears down).
+assert_fresh_trio_converges() {
+  local t="$1" want="$2" n
+  wait_until 400 "3 ONLINE members on every node" all_three_online \
+    || {
+      bad "$t" "the trio never reached 3 ONLINE on every node ($(online_members mysql-1 | tr -d '[:space:]')/$(online_members mysql-2 | tr -d '[:space:]')/$(online_members mysql-3 | tr -d '[:space:]') ONLINE as seen by mysql-1/2/3)"
+      for n in mysql-1 mysql-2 mysql-3; do
+        log "--- $n (last lines)"; dump_node_log "$n" | tail -25
+      done
+      return 1
+    }
+  ok "3 ONLINE members as seen from every node"
+
+  if wait_until 60 "every node reports the same group, membership and view" \
+      one_group_of_three mysql-1 mysql-2 mysql-3; then
+    ok "exactly one group: $(group_fingerprint mysql-1)"
+  else
+    bad "$t" "nodes disagree on the group: $(group_fingerprint mysql-1) / $(group_fingerprint mysql-2) / $(group_fingerprint mysql-3)"
+  fi
+
+  wait_until 30 "exactly one /role 200" exactly_one_primary mysql-2 mysql-1 mysql-2 mysql-3 \
+    && ok "exactly one primary ($(current_primary mysql-2 mysql-1 mysql-2 mysql-3))" \
+    || bad "$t" "expected exactly one /role 200, got $(role_codes mysql-2 mysql-1 mysql-2 mysql-3)"
+
+  local booted
+  booted="$(bootstrapped_nodes mysql-1 mysql-2 mysql-3)"
+  if [ "$booted" = "$want" ]; then
+    ok "$want bootstrapped the group, and nobody else did"
+  else
+    bad "$t" "bootstrapped by '$booted', want exactly '$want'"
+  fi
+
+  local primary
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)"
+  if [ -n "$primary" ] && sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'fresh-start') ON DUPLICATE KEY UPDATE v='fresh-start';" >/dev/null; then
+    local missing=""
+    for n in mysql-1 mysql-2 mysql-3; do
+      wait_until 60 "the write reached $n" row_on "$n" 1 fresh-start || missing="${missing:+$missing }$n"
+    done
+    [ -z "$missing" ] \
+      && ok "a write on the primary ($primary) reached all three nodes" \
+      || bad "$t" "the write on $primary never reached: $missing"
+  else
+    bad "$t" "could not write on the primary ('$primary')"
+  fi
+
+  for n in mysql-1 mysql-2 mysql-3; do
+    if has_pre_gtid_marker "$n"; then
+      bad "$t" "$n carries the adopted-volume marker $PRE_GTID_MARKER, but it started on an empty volume"
+    fi
+  done
+  return 0
+}
+
+# fresh_node_restarted_before_join <t> <how> — boots mysql-3 alone on an
+# empty volume, lets it finish its fresh init (the wrapper purges the init
+# GTIDs) and sit polling for peers that are not there, then takes it down
+# before it ever joined anything: <how> = restart (docker restart) or stop
+# (left stopped; the caller starts it again). Records what the first boot
+# looked like for the report.
+fresh_node_restarted_before_join() {
+  local t="$1" how="$2"
+  start_node 3
+  wait_until 300 "mysql-3 finished its fresh init" node_logged mysql-3 "$FRESH_RESET_LINE" \
+    || { bad "$t" "mysql-3 never logged its fresh-instance GTID reset"; dump_node_log mysql-3 | tail -40; return 1; }
+  sleep 10
+  log "mysql-3 first boot: gtid_executed='$(sql mysql-3 "SELECT @@GLOBAL.gtid_executed")' mysql.gtid_executed rows=$(sql mysql-3 "SELECT COUNT(*) FROM mysql.gtid_executed")"
+  has_pre_gtid_marker mysql-3 \
+    && bad "$t" "mysql-3 carries the adopted-volume marker on its FIRST boot of an empty volume" \
+    || ok "first boot of an empty volume: no adopted-volume marker"
+  node_logged mysql-3 "$BOOTSTRAP_LINE" \
+    && { bad "$t" "mysql-3 bootstrapped alone while its peers were absent"; return 1; }
+  case "$how" in
+    restart) docker restart mysql-3 >/dev/null ;;
+    stop)    docker stop mysql-3 >/dev/null ;;
+  esac
+  log "mysql-3 taken down ($how) before it ever joined a group"
+}
+
+# second_boot_report <t> — once mysql-3's second boot is orchestrating, read
+# what that boot sees: its GTID set and whether it marked itself adopted.
+second_boot_report() {
+  local t="$1"
+  wait_until 240 "mysql-3's second boot reaches orchestration" boots_answering mysql-3 2 \
+    || { bad "$t" "mysql-3's second boot never got mysqld answering"; dump_node_log mysql-3 | tail -40; return 1; }
+  sleep 4
+  log "mysql-3 second boot: gtid_executed='$(sql mysql-3 "SELECT @@GLOBAL.gtid_executed")' mysql.gtid_executed rows=$(sql mysql-3 "SELECT COUNT(*) FROM mysql.gtid_executed") fresh-reset lines=$(log_count mysql-3 "$FRESH_RESET_LINE")"
+  if node_logged mysql-3 "$ADOPTED_LINE" || has_pre_gtid_marker mysql-3; then
+    bad "$t" "mysql-3 marked its EMPTY volume as adopted on the second boot: $(docker logs mysql-3 2>&1 | grep -F "$ADOPTED_LINE" | tail -1)"
+  else
+    ok "mysql-3's second boot did not mistake its empty volume for adopted data"
+  fi
+}
+
+# All volumes empty; mysql-2 and mysql-3 come up first and wait; the declared
+# first seed arrives last. The waiting pair must not bootstrap without it,
+# and once it arrives it is the one that does.
+t_fresh_seed_starts_last() {
+  local t=t_fresh_seed_starts_last
+  log "$t"
+  teardown_trio
+  start_node 2
+  start_node 3
+  local n
+  for n in mysql-2 mysql-3; do
+    wait_until 300 "$n finished its fresh init" node_logged "$n" "$FRESH_RESET_LINE" \
+      || { bad "$t" "$n never finished its fresh init"; dump_node_log "$n" | tail -40; teardown_trio; return; }
+  done
+  # Long past a few poll rounds (3 s) and the bootstrap dwell (5 s here).
+  sleep 15
+  if any_role_200 mysql-2 mysql-2 mysql-3; then
+    bad "$t" "a primary exists while mysql-1 is absent ($(role_codes mysql-2 mysql-2 mysql-3))"
+  else
+    ok "mysql-2/mysql-3 serve no primary while mysql-1 is absent"
+  fi
+  local early
+  early="$(bootstrapped_nodes mysql-2 mysql-3)"
+  [ -z "$early" ] \
+    && ok "neither mysql-2 nor mysql-3 bootstrapped while mysql-1 was absent" \
+    || bad "$t" "$early bootstrapped while mysql-1 was absent"
+  [ "$(online_members mysql-2 | tr -d '[:space:]')" = "0" ] \
+    && ok "no group member ONLINE before mysql-1 arrives" \
+    || bad "$t" "$(online_members mysql-2 | tr -d '[:space:]') member(s) ONLINE before mysql-1 arrived"
+
+  start_node 1
+  assert_fresh_trio_converges "$t" mysql-1
+  teardown_trio
+}
+
+# All volumes empty, all three containers started at once.
+t_fresh_simultaneous_start() {
+  local t=t_fresh_simultaneous_start
+  log "$t"
+  teardown_trio
+  start_node 1 &
+  start_node 2 &
+  start_node 3 &
+  wait
+  assert_fresh_trio_converges "$t" mysql-1
+  teardown_trio
+}
+
+# A fresh, non-seed node restarted before it ever joined, while NO group
+# exists yet: on its second boot the datadir is initialised but holds no
+# GTIDs (the first boot purged the init ones), the same shape as an adopted
+# standalone volume. The empty node must still lose the bootstrap tie-break
+# to the declared first seed, and must not be treated as holding data.
+t_fresh_restarted_node_does_not_win_bootstrap() {
+  local t=t_fresh_restarted_node_does_not_win_bootstrap
+  log "$t"
+  teardown_trio
+  fresh_node_restarted_before_join "$t" restart || { teardown_trio; return; }
+  # mysql-3 alone: its peers are absent, so it cannot bootstrap — this read
+  # sees the second boot's GTID set before any group exists.
+  second_boot_report "$t" || { teardown_trio; return; }
+  start_node 1
+  start_node 2
+  assert_fresh_trio_converges "$t" mysql-1
+  teardown_trio
+}
+
+# A fresh node restarted before it joined, coming back to a group that formed
+# while it was down — the scale-up shape: mysql-1/mysql-2 are the group (they
+# declare each other only), mysql-3 is added with all three seeds. An empty
+# node has nothing a group could lack, so it must join and catch up, not
+# refuse the group as one that "formed without its data".
+t_fresh_restarted_node_joins_formed_group() {
+  local t=t_fresh_restarted_node_joins_formed_group
+  log "$t"
+  teardown_trio
+  fresh_node_restarted_before_join "$t" stop || { teardown_trio; return; }
+  (
+    SEEDS="mysql-1:3306,mysql-2:3306"
+    start_node 1
+    start_node 2
+  )
+  wait_until 300 "mysql-1/mysql-2 form their group" has_n_online mysql-1 2 \
+    || { bad "$t" "mysql-1/mysql-2 never formed a group"; dump_node_log mysql-1 | tail -40; teardown_trio; return; }
+  ok "a group of mysql-1/mysql-2 formed while mysql-3 was down"
+  docker start mysql-3 >/dev/null
+  second_boot_report "$t" || { teardown_trio; return; }
+  if wait_until 300 "mysql-3 joins the group (3 ONLINE)" has_n_online mysql-1 3; then
+    ok "mysql-3 joined the group after its restart"
+    wait_until 60 "every node reports the same group, membership and view" \
+      one_group_of_three mysql-1 mysql-2 mysql-3 \
+      && ok "exactly one group: $(group_fingerprint mysql-1)" \
+      || bad "$t" "nodes disagree on the group: $(group_fingerprint mysql-1) / $(group_fingerprint mysql-2) / $(group_fingerprint mysql-3)"
+    local primary
+    primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)"
+    sql "$primary" "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (1,'after-restart') ON DUPLICATE KEY UPDATE v='after-restart';" >/dev/null
+    wait_until 60 "the write reached mysql-3" row_on mysql-3 1 after-restart \
+      && ok "a write on the primary ($primary) reached mysql-3" \
+      || bad "$t" "the write on $primary never reached mysql-3"
+  else
+    bad "$t" "mysql-3 never joined the group (state: '$(sql mysql-3 "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@GLOBAL.server_uuid")')"
+    docker logs mysql-3 2>&1 | grep -F "$REFUSE_LINE" | tail -2
+  fi
+  node_logged mysql-3 "$REFUSE_LINE" \
+    && bad "$t" "mysql-3 refused to join as if its empty volume held adopted data: $(docker logs mysql-3 2>&1 | grep -F "$REFUSE_LINE" | tail -1 | cut -c1-200)" \
+    || ok "mysql-3 never refused the group"
+  has_pre_gtid_marker mysql-3 \
+    && bad "$t" "mysql-3 carries the adopted-volume marker $PRE_GTID_MARKER, but it started on an empty volume"
+  teardown_trio
+}
+
 t_conversion_adopts_standalone_volume() {
   log "t_conversion_adopts_standalone_volume (fresh environment)"
   teardown_trio
@@ -5698,6 +5971,10 @@ ALL_TESTS=(
   t_adoption_survives_seed_disadvantaged_race
   t_fresh_members_wait_for_a_seed_they_never_met
   t_adopted_root_refuses_a_group_that_formed_without_its_data
+  t_fresh_seed_starts_last
+  t_fresh_simultaneous_start
+  t_fresh_restarted_node_does_not_win_bootstrap
+  t_fresh_restarted_node_joins_formed_group
   t_conversion_adopts_standalone_volume
   t_scale_up_to_five
   t_minority_partition_write_fence
