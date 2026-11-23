@@ -1881,6 +1881,159 @@ t_coupled_password_edit_keeps_the_member_in_the_group() {
   REPL_PW="$real_repl"
 }
 
+# ----- a member that was away while the group rotated its password ----------
+#
+# The control plane rotates credentials on the members that are running:
+# `POST /credentials/rotate` on each, in order (preflight and prepare on every
+# member, the account change and later the finalize on the primary, the member
+# step and the verification on every member). A member whose container was not
+# running takes part in no step. Its datadir and pin still carry the previous
+# password, and it comes back with MYSQL_ROOT_PASSWORD (and the coupled
+# GR_REPLICATION_PASSWORD) already on the new one. It has to rejoin the group
+# on its own, without anyone redeploying it again or reverting the variable.
+
+# rotate_call <container> <operation> <new> <current> <request password>
+# One rotation step on one member; echoes the HTTP status.
+rotate_call() {
+  docker exec "$1" wget -q -S -O /dev/null -T 60 \
+    --header "Authorization: Basic $(printf 'railway:%s' "$5" | base64 | tr -d '\n')" \
+    --header 'Content-Type: application/json' \
+    --post-data "{\"operation\":\"$2\",\"newPassword\":\"$3\",\"currentPassword\":\"$4\"}" \
+    http://127.0.0.1:8080/credentials/rotate 2>&1 | awk '/^  HTTP\//{code=$2} END{print code+0}'
+}
+
+# rotate_step <operation> <new> <current> <member>... — one step on every
+# listed member, presenting the previous password and then the new one (a
+# member's pin moves at its own `member` step). Each member is asked for two
+# minutes: a member answers 503 while the group still lists the one that left.
+rotate_step() {
+  local op="$1" new="$2" current="$3"; shift 3
+  local m code auth deadline
+  for m in "$@"; do
+    deadline=$(($(date +%s) + 120)); code=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      for auth in "$current" "$new"; do
+        code="$(rotate_call "$m" "$op" "$new" "$current" "$auth")"
+        [ "$code" = "200" ] && break 2
+      done
+      sleep 3
+    done
+    [ "$code" = "200" ] || { echo "$op on $m answered $code"; return 1; }
+  done
+}
+
+# rotate_group_password <primary> <current> <new> <member>... — the control
+# plane's order on the members it can reach.
+rotate_group_password() {
+  local primary="$1" current="$2" new="$3"; shift 3
+  rotate_step preflight "$current" "$current" "$@" || return 1
+  rotate_step prepare "$new" "$current" "$@" || return 1
+  rotate_step database "$new" "$current" "$primary" || return 1
+  rotate_step member "$new" "$current" "$@" || return 1
+  rotate_step finalize "$new" "$current" "$primary" || return 1
+  rotate_step verify "$new" "$current" "$@" || return 1
+}
+
+# root_login <probe> <target> <password> — a password-authenticated root
+# login to <target>'s mysqld over TCP, from another member.
+root_login() {
+  [ "$(docker exec "$1" mysql -h "$2" --connect-timeout=5 -uroot -p"$3" --batch --skip-column-names -e "SELECT 1" 2>/dev/null)" = "1" ]
+}
+
+# run_returning_member_case <secondary|primary> — the member away during the
+# rotation is a secondary, or the primary itself (it comes back to a group
+# that elected another primary while it was gone).
+run_returning_member_case() {
+  local which="$1"
+  teardown_trio
+  local real_root="$ROOT_PW" real_repl="$REPL_PW" old="$ROOT_PW" new="rotated-while-away"
+  REPL_PW="$ROOT_PW"
+  start_trio
+  wait_until 300 "3 ONLINE members" group_is_fully_online mysql-1 \
+    || { REPL_PW="$real_repl"; bad "group never formed"; return; }
+  sql mysql-1 "CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.kv (k INT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t.kv VALUES (30,'before') ON DUPLICATE KEY UPDATE v='before';"
+
+  local primary away stay node
+  primary="$(current_primary mysql-2 mysql-1 mysql-2 mysql-3)" || { REPL_PW="$real_repl"; bad "no primary"; return; }
+  if [ "$which" = "primary" ]; then
+    away="$primary"
+  else
+    for away in mysql-1 mysql-2 mysql-3; do [ "$away" != "$primary" ] && break; done
+  fi
+  local reachable=()
+  for node in mysql-1 mysql-2 mysql-3; do [ "$node" != "$away" ] && reachable+=("$node"); done
+  stay="${reachable[0]}"
+
+  log "removing $away's container (its volume stays); rotating on ${reachable[*]}"
+  docker rm -f "$away" >/dev/null 2>&1
+  wait_until 120 "the group runs on the two members left" has_n_online "$stay" 2 \
+    || { REPL_PW="$real_repl"; bad "the group did not settle on two members"; return; }
+  if [ "$which" = "primary" ]; then
+    wait_until 60 "a new primary" exactly_one_primary "$stay" "${reachable[@]}" \
+      || { REPL_PW="$real_repl"; bad "no new primary after $away left"; return; }
+  fi
+  primary="$(current_primary "$stay" "${reachable[@]}")" || { REPL_PW="$real_repl"; bad "no primary among ${reachable[*]}"; return; }
+
+  local refusal
+  if ! refusal="$(rotate_group_password "$primary" "$old" "$new" "${reachable[@]}")"; then
+    REPL_PW="$real_repl"; bad "the rotation on the running members did not complete: $refusal"; return
+  fi
+  if root_login "$stay" "$primary" "$old" || ! root_login "$stay" "$primary" "$new"; then
+    REPL_PW="$real_repl"; bad "after the rotation $primary does not accept exactly the new password"; return
+  fi
+  ok "rotated on ${reachable[*]} while $away was away"
+  docker exec "$primary" mysql -uroot -p"$new" --batch -e "INSERT INTO t.kv VALUES (31,'while-away') ON DUPLICATE KEY UPDATE v='while-away';" 2>/dev/null
+
+  log "starting $away with the new password variable"
+  # From here on the harness's own logins (`sql`) use the password the group
+  # runs with.
+  ROOT_PW="$new"; REPL_PW="$new"
+  start_node "${away#mysql-}"
+
+  if ! wait_until 300 "$away rejoins (3 ONLINE)" group_is_fully_online "$stay"; then
+    bad "$away never rejoined the group after missing the rotation"
+    docker logs "$away" 2>&1 | grep -iE "join|recovery|password|denied|pin" | tail -20
+    ROOT_PW="$real_root"; REPL_PW="$real_repl"
+    return
+  fi
+  ok "$away rejoined ONLINE without a second redeploy"
+  [ "$(docker inspect -f '{{.RestartCount}}' "$away")" = "0" ] \
+    && ok "$away did not need a restart" \
+    || bad "$away restarted $(docker inspect -f '{{.RestartCount}}' "$away") time(s) to rejoin"
+  wait_until 60 "the write made while it was away reached $away" \
+    bash -c '[ "$(docker exec '"$away"' mysql -uroot -p'"$new"' --batch --skip-column-names -e "SELECT v FROM t.kv WHERE k=31" 2>/dev/null)" = "while-away" ]' \
+    && ok "the write made while $away was away arrived" \
+    || bad "the write made while $away was away never arrived"
+  wait_until 90 "$away's pin follows the new password" \
+    bash -c '[ "$(docker exec '"$away"' cat /var/lib/mysql/.railway_active_root_password 2>/dev/null)" = "'"$new"'" ]' \
+    && ok "$away pins the new password" \
+    || bad "$away's pin is not the new password"
+  if root_login "$stay" "$away" "$new" && ! root_login "$stay" "$away" "$old"; then
+    ok "$away accepts exactly the new password"
+  else
+    bad "$away does not accept exactly the new password"
+  fi
+  local peer_probe
+  peer_probe="$(docker exec "$stay" mysql -h "$away" --ssl-mode=REQUIRED --connect-timeout=5 -ugr_recovery -p"$new" --batch --skip-column-names -e "SELECT 1" 2>&1 | tail -1)"
+  [ "$peer_probe" = "1" ] \
+    && ok "$away's gr_recovery takes the password the group enforces" \
+    || bad "$away's gr_recovery refuses the group's password: ${peer_probe}"
+  [ "$(rotate_call "$away" preflight "$new" "$new" "$new")" = "200" ] \
+    && ok "$away answers a later rotation's preflight" \
+    || bad "$away refuses a later rotation's preflight"
+  ROOT_PW="$real_root"; REPL_PW="$real_repl"
+}
+
+t_returning_secondary_adopts_rotated_password() {
+  log "t_returning_secondary_adopts_rotated_password"
+  run_returning_member_case secondary
+}
+
+t_returning_primary_adopts_rotated_password() {
+  log "t_returning_primary_adopts_rotated_password"
+  run_returning_member_case primary
+}
+
 t_sigterm_primary_demotes_before_exit() {
   log "t_sigterm_primary_demotes_before_exit (planned shutdown = switchover, not timeout failover)"
   teardown_trio
@@ -5985,6 +6138,8 @@ ALL_TESTS=(
   t_first_seed_permanent_loss
   t_password_variable_edit_does_not_rotate
   t_coupled_password_edit_keeps_the_member_in_the_group
+  t_returning_secondary_adopts_rotated_password
+  t_returning_primary_adopts_rotated_password
   t_haproxy_stats_page_authenticates_remote_clients
   t_revert_to_standalone_drops_recovery_user
   t_sigterm_primary_demotes_before_exit

@@ -341,6 +341,34 @@ pub async fn probe_root_password(socket_path: &str, password: &str) -> RootPassw
     }
 }
 
+/// Whether `host`'s mysqld accepts `password` for root over TCP: `Some(false)`
+/// on ER_ACCESS_DENIED_ERROR, `None` when the login could not be tried.
+/// Encrypted, as the group's own connections are: after a password change
+/// the caching_sha2 cache is empty and the full exchange needs a secure
+/// channel.
+pub async fn peer_accepts_root(host: &str, port: u16, password: &str) -> Option<bool> {
+    let attempt = async {
+        let opts = OptsBuilder::default()
+            .ip_or_hostname(host)
+            .tcp_port(port)
+            .prefer_socket(false)
+            .ssl_opts(Some(
+                mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true),
+            ))
+            .user(Some("root"))
+            .pass(Some(password));
+        let mut conn = mysql_async::Conn::new(opts).await?;
+        conn.query_drop("SELECT 1").await?;
+        conn.disconnect().await?;
+        Ok::<_, mysql_async::Error>(())
+    };
+    match tokio::time::timeout(PASSWORD_PROBE_TIMEOUT, attempt).await {
+        Ok(Ok(())) => Some(true),
+        Ok(Err(mysql_async::Error::Server(e))) if e.code == 1045 => Some(false),
+        _ => None,
+    }
+}
+
 pub fn is_access_denied(error: &anyhow::Error) -> bool {
     matches!(error.downcast_ref::<mysql_async::Error>(),
         Some(mysql_async::Error::Server(server)) if server.code == 1045)
@@ -1173,6 +1201,41 @@ impl Sql {
             }
         }
         clone
+    }
+
+    /// Set the local recovery account's password on a member that is fenced
+    /// and outside the group. The account change is local metadata the group
+    /// authenticates inbound connections against; it is unlogged, so it
+    /// carries no transaction of its own. The fence is lifted only for the
+    /// statement, as for a clone: this node is not in the group and HAProxy
+    /// fails its /role closed, so no external write lands in the window.
+    pub async fn set_recovery_password_outside_group(
+        &self,
+        user: &str,
+        password: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn().await?;
+        conn.query_drop("SET SESSION sql_log_bin = 0").await?;
+        let changed = async {
+            conn.query_drop("SET GLOBAL super_read_only = OFF").await?;
+            conn.query_drop("SET GLOBAL read_only = OFF").await?;
+            conn.query_drop(format!(
+                "ALTER USER {}@'%' IDENTIFIED BY {}",
+                sql_string_literal(user),
+                sql_string_literal(password)
+            ))
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        let fenced = conn
+            .query_drop("SET GLOBAL super_read_only = ON")
+            .await
+            .context("restoring the write fence");
+        conn.query_drop("SET SESSION sql_log_bin = 1").await?;
+        changed?;
+        fenced?;
+        Ok(())
     }
 
     /// `@@version`, for the PITR full-backup meta record.

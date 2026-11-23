@@ -1808,6 +1808,21 @@ pub async fn orchestrate(
         if group_seen {
             safe_since = None;
 
+            // A member that was down while the group rotated its password
+            // presents the new one from here on (see rotated_password).
+            let live_peers: Vec<String> = answers
+                .iter()
+                .filter(|(_, a)| matches!(a, PeerAnswer::State(s) if s.group_active))
+                .map(|(host, _)| host.clone())
+                .collect();
+            crate::rotated_password::adopt_if_the_group_rotated(
+                &config,
+                &sql,
+                &telemetry,
+                &live_peers,
+            )
+            .await;
+
             // Identity collision: a live member already carries this node's
             // server_uuid — this datadir is a byte copy of that member's (a
             // volume backup of one node restored onto every data node). The
@@ -2179,7 +2194,8 @@ pub async fn orchestrate(
             // an image whose default had changed under a group already
             // formed on the old one). Adopt before joining; the local
             // my.cnf value is only the bootstrap default.
-            let root_password = crate::password_pin::read_pin(&config.data_dir)
+            let root_password = crate::rotated_password::adopted()
+                .or_else(|| crate::password_pin::read_pin(&config.data_dir))
                 .unwrap_or_else(|| active_root_password.clone());
             if let Err(error) =
                 resolve_peer_block_sizes(&mut answers, config.mysql_port, &root_password).await
@@ -2652,7 +2668,8 @@ async fn futures_join_all(
 
 /// Long-lived watchdogs must resolve the pin at the time of each attempt.
 pub fn current_recovery_credential(config: &Config, boot_password: &str) -> String {
-    let active = crate::password_pin::read_pin(&config.data_dir)
+    let active = crate::rotated_password::adopted()
+        .or_else(|| crate::password_pin::read_pin(&config.data_dir))
         .unwrap_or_else(|| boot_password.to_string());
     recovery_credential(
         config
