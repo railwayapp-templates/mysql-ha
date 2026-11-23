@@ -54,6 +54,7 @@ mod peers;
 mod pitr;
 mod process_manager;
 mod restore;
+mod rotated_password;
 mod s3;
 mod self_heal;
 mod sql;
